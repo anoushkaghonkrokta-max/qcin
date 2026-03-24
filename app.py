@@ -1853,12 +1853,14 @@ def manage_users():
           <td style="font-size:12px;color:#475569">{prog_cell or '—'}</td>
           <td style="font-size:11px;color:#64748b">{last_login_cell}</td>
           <td>
-            <button class="btn btn-sm btn-action btn-outline-secondary"
-              onclick="showResetPw({u['id']}, '{u['username']}')">Reset PW</button>
-            <button class="btn btn-sm btn-action btn-outline-primary ms-1"
-              onclick="showRemapPh({u['id']}, '{u['username']}', '{u['role']}')">Remap</button>
-            {"" if is_self else f'''<button class="btn btn-sm btn-action btn-outline-danger ms-1"
-              onclick="confirmDeleteUser({u['id']}, '{u['username']}')">Delete</button>'''}
+            <div class="d-flex flex-nowrap gap-1">
+              <button class="btn btn-sm btn-action btn-outline-secondary"
+                onclick="showResetPw({u['id']}, '{u['username']}')">Reset PW</button>
+              <button class="btn btn-sm btn-action btn-outline-primary"
+                onclick="showRemapPh({u['id']}, '{u['username']}', '{u['role']}')">Remap</button>
+              {"" if is_self else f'''<button class="btn btn-sm btn-action btn-outline-danger"
+                onclick="confirmDeleteUser({u['id']}, '{u['username']}')">Delete</button>'''}
+            </div>
           </td>
         </tr>"""
 
@@ -1951,7 +1953,7 @@ def manage_users():
           <input type="password" class="form-control" name="new_password" placeholder="New password" required>
         </div>
         <div class="modal-footer border-0">
-          <button class="btn btn-sm btn-outline-secondary" data-bs-dismiss="modal">Cancel</button>
+          <button type="button" class="btn btn-sm btn-outline-secondary" data-bs-dismiss="modal">Cancel</button>
           <button class="btn btn-sm btn-primary" type="submit">Update</button>
         </div>
       </form>
@@ -1977,7 +1979,7 @@ def manage_users():
           </select>
         </div>
         <div class="modal-footer border-0">
-          <button class="btn btn-sm btn-outline-secondary" data-bs-dismiss="modal">Cancel</button>
+          <button type="button" class="btn btn-sm btn-outline-secondary" data-bs-dismiss="modal">Cancel</button>
           <button class="btn btn-sm btn-success" type="submit">Save Mapping</button>
         </div>
       </form>
@@ -1997,7 +1999,7 @@ def manage_users():
         <input type="hidden" name="action" value="delete">
         <input type="hidden" name="user_id" id="delUserId">
         <div class="modal-footer border-0 justify-content-center gap-2">
-          <button class="btn btn-sm btn-outline-secondary" data-bs-dismiss="modal">Cancel</button>
+          <button type="button" class="btn btn-sm btn-outline-secondary" data-bs-dismiss="modal">Cancel</button>
           <button class="btn btn-sm btn-danger" type="submit">Delete</button>
         </div>
       </form>
@@ -2838,7 +2840,7 @@ def dashboard():
         <div style="font-size:13px;color:#64748b;margin-top:4px" id="deleteModalMsg"></div>
       </div>
       <div class="modal-footer border-0 pt-0 justify-content-center gap-2">
-        <button class="btn btn-sm btn-outline-secondary" data-bs-dismiss="modal">Cancel</button>
+        <button type="button" class="btn btn-sm btn-outline-secondary" data-bs-dismiss="modal">Cancel</button>
         <a id="deleteConfirmBtn" href="#" class="btn btn-sm btn-danger">Close Case</a>
       </div>
     </div>
@@ -2874,7 +2876,7 @@ def dashboard():
           </div>
         </div>
         <div class="modal-footer border-0">
-          <button class="btn btn-sm btn-outline-secondary" data-bs-dismiss="modal">Cancel</button>
+          <button type="button" class="btn btn-sm btn-outline-secondary" data-bs-dismiss="modal">Cancel</button>
           <button class="btn btn-sm btn-success" type="submit">
             <i class="bi bi-arrow-right-circle"></i> Advance Stage
           </button>
@@ -2904,7 +2906,7 @@ def dashboard():
           </select>
         </div>
         <div class="modal-footer border-0">
-          <button class="btn btn-sm btn-outline-secondary" data-bs-dismiss="modal">Cancel</button>
+          <button type="button" class="btn btn-sm btn-outline-secondary" data-bs-dismiss="modal">Cancel</button>
           <button class="btn btn-sm btn-primary" type="submit">Update Status</button>
         </div>
       </form>
@@ -2925,7 +2927,7 @@ def dashboard():
         <input type="text" class="form-control" id="filterNameInput" placeholder="e.g. My NABH Overdue">
       </div>
       <div class="modal-footer border-0">
-        <button class="btn btn-sm btn-outline-secondary" data-bs-dismiss="modal">Cancel</button>
+        <button type="button" class="btn btn-sm btn-outline-secondary" data-bs-dismiss="modal">Cancel</button>
         <button class="btn btn-sm btn-primary" onclick="confirmSaveFilter()">Save</button>
       </div>
     </div>
