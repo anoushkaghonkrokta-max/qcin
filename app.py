@@ -411,6 +411,11 @@ def init_db():
             error_msg       TEXT,
             board_id        INTEGER
         );
+        CREATE TABLE IF NOT EXISTS user_programme_map (
+            user_id      INTEGER NOT NULL REFERENCES users(id),
+            programme_id INTEGER NOT NULL REFERENCES programmes(id),
+            PRIMARY KEY (user_id, programme_id)
+        );
     """)
     # Migrate existing DBs: add columns if absent
     for sql in [
@@ -676,12 +681,36 @@ def seed_data():
     conn.close()
 
 
-# ── Board scoping helper ──────────────────────────────────────────────────────
+# ── Role constants ────────────────────────────────────────────────────────────
+ROLE_META = {
+    "super_admin":    ("Super Admin",    "#dbeafe", "#1d4ed8"),
+    "board_admin":    ("Board Admin",    "#ede9fe", "#7c3aed"),
+    "board_ceo":      ("Board CEO",      "#fef3c7", "#92400e"),
+    "program_head":   ("Programme Head", "#dcfce7", "#166534"),
+    "program_officer":("Program Officer","#f1f5f9", "#475569"),
+}
+
+# ── Board / programme scoping helpers ─────────────────────────────────────────
 def user_board_id():
     """Returns board_id from session, or None for super_admin (sees all)."""
     if session.get("role") == "super_admin":
         return None
     return session.get("board_id")
+
+
+def user_programme_names():
+    """Returns list of programme names for program_head; None means 'see all in scope'."""
+    if session.get("role") != "program_head":
+        return None
+    conn = get_db()
+    rows = conn.execute(
+        """SELECT p.programme_name FROM user_programme_map upm
+           JOIN programmes p ON p.id = upm.programme_id
+           WHERE upm.user_id=?""",
+        (session["user_id"],)
+    ).fetchall()
+    conn.close()
+    return [r[0] for r in rows]
 
 
 # ── Email helpers ─────────────────────────────────────────────────────────────
@@ -1200,6 +1229,15 @@ th{white-space:nowrap}
     </a>
     {% endif %}
     {% endif %}
+    {% if user_role in ('board_ceo', 'program_head') %}
+    <div class="nav-section" style="margin-top:8px">Analytics</div>
+    <a class="nav-link {{ 'active' if active_page=='reports' else '' }}" href="/reports">
+      <i class="bi bi-bar-chart-line"></i> Reports &amp; Analytics
+    </a>
+    <a class="nav-link {{ 'active' if active_page=='search' else '' }}" href="/search">
+      <i class="bi bi-search"></i> Search Cases
+    </a>
+    {% endif %}
   </nav>
   <div class="sidebar-footer">
     <div style="display:flex;align-items:center;gap:10px;margin-bottom:8px">
@@ -1212,6 +1250,8 @@ th{white-space:nowrap}
         <div style="color:rgba(255,255,255,.4);font-size:10px;text-transform:uppercase;letter-spacing:.5px">
           {% if user_role=='super_admin' %}Super Admin
           {% elif user_role=='board_admin' %}Board Admin · {{ board_name }}
+          {% elif user_role=='board_ceo' %}Board CEO · {{ board_name }}
+          {% elif user_role=='program_head' %}Programme Head · {{ board_name }}
           {% else %}Program Officer · {{ board_name }}{% endif %}
         </div>
       </div>
@@ -1512,6 +1552,20 @@ def manage_users():
                      board_id),
                 )
                 conn.commit()
+                new_user = conn.execute(
+                    "SELECT id FROM users WHERE username=?", (request.form["username"].strip(),)
+                ).fetchone()
+                if new_user and role == "program_head":
+                    prog_ids = request.form.getlist("programme_ids")
+                    for pid in prog_ids:
+                        try:
+                            conn.execute(
+                                "INSERT OR IGNORE INTO user_programme_map (user_id, programme_id) VALUES (?,?)",
+                                (new_user["id"], int(pid))
+                            )
+                        except Exception:
+                            pass
+                    conn.commit()
                 flash(f"User '{request.form['username']}' created.", "success")
             except Exception as e:
                 flash(f"Error: {e}", "error")
@@ -1538,26 +1592,37 @@ def manage_users():
            ORDER BY u.role, u.username"""
     ).fetchall()]
     boards = [dict(r) for r in conn.execute("SELECT * FROM boards ORDER BY board_name").fetchall()]
-    conn.close()
+    all_programmes = [dict(r) for r in conn.execute(
+        "SELECT p.*, b.board_name FROM programmes p JOIN boards b ON b.id=p.board_id ORDER BY b.board_name, p.programme_name"
+    ).fetchall()]
 
-    ROLE_LABELS = {
-        "super_admin": ("Super Admin", "#dbeafe", "#1d4ed8"),
-        "board_admin": ("Board Admin", "#ede9fe", "#7c3aed"),
-        "program_officer": ("Program Officer", "#f1f5f9", "#475569"),
-    }
+    # Build programme map per user (for program_head display)
+    ph_prog_map = {}
+    for row in conn.execute(
+        """SELECT upm.user_id, p.programme_name
+           FROM user_programme_map upm JOIN programmes p ON p.id=upm.programme_id"""
+    ).fetchall():
+        ph_prog_map.setdefault(row["user_id"], []).append(row["programme_name"])
+
+    conn.close()
 
     rows = ""
     for u in users:
-        rl, bg, fg = ROLE_LABELS.get(u["role"], (u["role"], "#f1f5f9", "#475569"))
+        rl, bg, fg = ROLE_META.get(u["role"], (u["role"], "#f1f5f9", "#475569"))
         role_pill = f'<span class="pill" style="background:{bg};color:{fg}">{rl}</span>'
         board_cell = u.get("board_name") or '<span style="color:#94a3b8">—</span>'
         is_self = u["id"] == session["user_id"]
+        prog_cell = ""
+        if u["role"] == "program_head":
+            progs = ph_prog_map.get(u["id"], [])
+            prog_cell = ", ".join(progs) if progs else '<span style="color:#f59e0b;font-size:11px">No programmes mapped</span>'
         rows += f"""<tr>
           <td style="font-weight:600">{u['username']}</td>
           <td>{u['full_name'] or '—'}</td>
           <td>{u['email'] or '—'}</td>
           <td>{role_pill}</td>
           <td>{board_cell}</td>
+          <td style="font-size:12px;color:#475569">{prog_cell or '—'}</td>
           <td>
             <button class="btn btn-sm btn-action btn-outline-secondary"
               onclick="showResetPw({u['id']}, '{u['username']}')">Reset PW</button>
@@ -1569,6 +1634,10 @@ def manage_users():
     board_opts = '<option value="">— None —</option>' + "".join(
         f'<option value="{b["id"]}">{b["board_name"]}</option>' for b in boards
     )
+    prog_opts_by_board = "".join(
+        f'<option value="{p["id"]}" data-board="{p["board_id"]}">[{p["board_name"]}] {p["programme_name"]}</option>'
+        for p in all_programmes
+    )
 
     content = f"""
 <div class="row g-4">
@@ -1577,7 +1646,7 @@ def manage_users():
       <div class="card-header">All Users</div>
       <div style="overflow-x:auto">
         <table class="data-table">
-          <thead><tr><th>Username</th><th>Full Name</th><th>Email</th><th>Role</th><th>Board</th><th>Actions</th></tr></thead>
+          <thead><tr><th>Username</th><th>Full Name</th><th>Email</th><th>Role</th><th>Board</th><th>Programmes</th><th>Actions</th></tr></thead>
           <tbody>{rows}</tbody>
         </table>
       </div>
@@ -1603,16 +1672,24 @@ def manage_users():
           </div>
           <div class="mb-3">
             <label class="form-label">Role</label>
-            <select class="form-select" name="role" id="roleSelect" onchange="toggleBoardField()">
+            <select class="form-select" name="role" id="roleSelect" onchange="toggleRoleFields()">
               <option value="program_officer">Program Officer</option>
+              <option value="program_head">Programme Head</option>
+              <option value="board_ceo">Board CEO</option>
               <option value="board_admin">Board Admin</option>
               <option value="super_admin">Super Admin</option>
             </select>
           </div>
           <div class="mb-3" id="boardField">
-            <label class="form-label">Board <span style="color:#94a3b8;font-size:11px">(required for PO / Board Admin)</span></label>
-            <select class="form-select" name="board_id">
+            <label class="form-label">Board <span style="color:#94a3b8;font-size:11px">(required for all except Super Admin)</span></label>
+            <select class="form-select" name="board_id" id="boardSelect">
               {board_opts}
+            </select>
+          </div>
+          <div class="mb-3" id="progField" style="display:none">
+            <label class="form-label">Programmes <span style="color:#94a3b8;font-size:11px">(Programme Head only — hold Ctrl/Cmd for multiple)</span></label>
+            <select class="form-select" name="programme_ids" id="progSelect" multiple size="5">
+              {prog_opts_by_board}
             </select>
           </div>
           <div class="mb-3">
@@ -1677,11 +1754,12 @@ function confirmDeleteUser(id, name){
   document.getElementById('delUserName').textContent = name;
   new bootstrap.Modal(document.getElementById('delUserModal')).show();
 }
-function toggleBoardField(){
+function toggleRoleFields(){
   var role = document.getElementById('roleSelect').value;
   document.getElementById('boardField').style.display = role === 'super_admin' ? 'none' : '';
+  document.getElementById('progField').style.display = role === 'program_head' ? '' : 'none';
 }
-toggleBoardField();
+toggleRoleFields();
 </script>"""
     return render_page(content, scripts, active_page="users", page_title="Manage Users")
 
@@ -1696,6 +1774,7 @@ def dashboard():
     sort         = request.args.get("sort", "elapsed_desc")
 
     bid = user_board_id()
+    ph_progs = user_programme_names()  # None unless program_head
     if bid is not None:
         programmes = [r[0] for r in conn.execute(
             "SELECT programme_name FROM programmes WHERE board_id=? ORDER BY programme_name", (bid,)
@@ -1708,6 +1787,16 @@ def dashboard():
         ).fetchall()]
         base_q = "SELECT * FROM case_tracking WHERE 1=1"
         base_params = []
+
+    # Restrict program_head to their mapped programmes
+    if ph_progs is not None:
+        programmes = [p for p in programmes if p in ph_progs]
+        if ph_progs:
+            placeholders = ",".join("?" * len(ph_progs))
+            base_q += f" AND programme_name IN ({placeholders})"
+            base_params.extend(ph_progs)
+        else:
+            base_q += " AND 1=0"  # no programmes mapped → no cases
 
     if prog_filter:
         base_q += " AND programme_name=?"
@@ -2928,6 +3017,83 @@ def settings():
                     except Exception as e:
                         flash(f"Error: {e}", "error")
 
+        elif action == "delete_board":
+            if session.get("role") != "super_admin":
+                flash("Only Super Admin can delete boards.", "error")
+            else:
+                bid_del = request.form.get("board_id")
+                if bid_del:
+                    prog_count = conn.execute(
+                        "SELECT COUNT(*) FROM programmes WHERE board_id=?", (bid_del,)
+                    ).fetchone()[0]
+                    if prog_count > 0:
+                        flash(f"Cannot delete board — {prog_count} programme(s) still exist. Delete them first.", "error")
+                    else:
+                        user_count = conn.execute(
+                            "SELECT COUNT(*) FROM users WHERE board_id=?", (bid_del,)
+                        ).fetchone()[0]
+                        if user_count > 0:
+                            flash(f"Cannot delete board — {user_count} user(s) are assigned to it. Reassign them first.", "error")
+                        else:
+                            conn.execute("DELETE FROM boards WHERE id=?", (bid_del,))
+                            conn.commit()
+                            flash("Board deleted.", "success")
+
+        elif action == "delete_programme":
+            pname_del = request.form.get("programme_name", "").strip()
+            if not pname_del:
+                flash("Programme name missing.", "error")
+            else:
+                prog_row = conn.execute(
+                    "SELECT board_id FROM programmes WHERE programme_name=?", (pname_del,)
+                ).fetchone()
+                if not prog_row:
+                    flash("Programme not found.", "error")
+                elif session.get("role") == "board_admin" and prog_row["board_id"] != session.get("board_id"):
+                    flash("Cannot delete a programme from another board.", "error")
+                else:
+                    case_count = conn.execute(
+                        "SELECT COUNT(*) FROM case_tracking WHERE programme_name=?", (pname_del,)
+                    ).fetchone()[0]
+                    if case_count > 0:
+                        flash(f"Cannot delete '{pname_del}' — {case_count} active case(s) exist. Close them first.", "error")
+                    else:
+                        conn.execute("DELETE FROM programme_config WHERE programme_name=?", (pname_del,))
+                        conn.execute("DELETE FROM email_templates WHERE programme_name=?", (pname_del,))
+                        conn.execute(
+                            "DELETE FROM user_programme_map WHERE programme_id IN "
+                            "(SELECT id FROM programmes WHERE programme_name=?)", (pname_del,)
+                        )
+                        conn.execute("DELETE FROM programmes WHERE programme_name=?", (pname_del,))
+                        conn.commit()
+                        flash(f"Programme '{pname_del}' and all its stages deleted.", "success")
+
+        elif action == "delete_stage":
+            pname_del = request.form.get("programme_name", "").strip()
+            sname_del = request.form.get("stage_name", "").strip()
+            if not pname_del or not sname_del:
+                flash("Programme or stage name missing.", "error")
+            else:
+                prog_row = conn.execute(
+                    "SELECT board_id FROM programmes WHERE programme_name=?", (pname_del,)
+                ).fetchone()
+                if session.get("role") == "board_admin" and prog_row and prog_row["board_id"] != session.get("board_id"):
+                    flash("Cannot delete stages from another board's programme.", "error")
+                else:
+                    case_count = conn.execute(
+                        "SELECT COUNT(*) FROM case_tracking WHERE programme_name=? AND current_stage=?",
+                        (pname_del, sname_del)
+                    ).fetchone()[0]
+                    if case_count > 0:
+                        flash(f"Cannot delete stage '{sname_del}' — {case_count} case(s) are currently at this stage.", "error")
+                    else:
+                        conn.execute(
+                            "DELETE FROM programme_config WHERE programme_name=? AND stage_name=?",
+                            (pname_del, sname_del)
+                        )
+                        conn.commit()
+                        flash(f"Stage '{sname_del}' deleted.", "success")
+
         elif action == "update_schedule":
             if session.get("role") != "super_admin":
                 flash("Only Super Admin can change the schedule.", "error")
@@ -3024,32 +3190,61 @@ def settings():
                 if sender_status else
                 '<span class="pill pill-warn" style="font-size:11px"><i class="bi bi-exclamation-circle"></i> No sender configured</span>'
             )
-            stages_rows = "".join(
-                f"""<tr>
-                  <td style="color:#94a3b8;font-size:12px">{s['stage_order']}</td>
-                  <td style="font-weight:500">{'<i class="bi bi-flag-fill" style="color:#7c3aed;font-size:11px"></i> ' if s['is_milestone'] else ''}{s['stage_name']}</td>
-                  <td style="text-align:center">{s['tat_days'] or '—'}</td>
-                  <td style="text-align:center;color:#2563eb">{s['reminder1_day'] or '—'}</td>
-                  <td style="text-align:center;color:#d97706">{s['reminder2_day'] or '—'}</td>
-                  <td>{s['owner_type'] or '—'}</td>
-                  <td style="text-align:center">{s['overdue_interval_days']}</td>
+            is_ba = session.get("role") in ("super_admin", "board_admin")
+            stages_rows = ""
+            for s in stages:
+                milestone_icon = '<i class="bi bi-flag-fill" style="color:#7c3aed;font-size:11px"></i> ' if s["is_milestone"] else ""
+                sname_js = s["stage_name"].replace("'", "\\'").replace('"', '&quot;')
+                if is_ba:
+                    del_stage_btn = (
+                        f'<form method="post" style="display:inline" '
+                        f'onsubmit="return confirm(\'Delete stage &quot;{sname_js}&quot;?\')">'
+                        f'<input type="hidden" name="action" value="delete_stage">'
+                        f'<input type="hidden" name="programme_name" value="{pname}">'
+                        f'<input type="hidden" name="stage_name" value="{s["stage_name"]}">'
+                        f'<button class="btn btn-sm btn-outline-danger py-0 px-1" style="font-size:11px">'
+                        f'<i class="bi bi-trash"></i></button></form>'
+                    )
+                else:
+                    del_stage_btn = ""
+                stages_rows += f"""<tr>
+                  <td style="color:#94a3b8;font-size:12px">{s["stage_order"]}</td>
+                  <td style="font-weight:500">{milestone_icon}{s["stage_name"]}</td>
+                  <td style="text-align:center">{s["tat_days"] or "—"}</td>
+                  <td style="text-align:center;color:#2563eb">{s["reminder1_day"] or "—"}</td>
+                  <td style="text-align:center;color:#d97706">{s["reminder2_day"] or "—"}</td>
+                  <td>{s["owner_type"] or "—"}</td>
+                  <td style="text-align:center">{s["overdue_interval_days"]}</td>
+                  <td>{del_stage_btn}</td>
                 </tr>"""
-                for s in stages
-            )
             th_center = 'style="text-align:center"'
+            del_col_header = '<th style="width:40px"></th>' if is_ba else ''
             if stages:
                 stages_table_html = (
                     '<div style="overflow-x:auto"><table class="data-table"><thead><tr>'
                     '<th>#</th><th>Stage Name</th>'
                     f'<th {th_center}>TAT</th><th {th_center}>R1 Day</th>'
                     f'<th {th_center}>R2 Day</th><th>Owner</th><th {th_center}>OD Interval</th>'
+                    + del_col_header +
                     '</tr></thead><tbody>' + stages_rows + '</tbody></table></div>'
                 )
             else:
                 stages_table_html = '<div style="padding:16px 20px;color:#94a3b8;font-size:13px">No stages configured yet.</div>'
 
+            del_prog_btn = ""
+            if is_ba:
+                del_prog_btn = f"""
+  <form method="post" style="position:absolute;right:48px;top:50%;transform:translateY(-50%);z-index:10"
+        onsubmit="return confirm('Delete programme &quot;{pname}&quot; and ALL its stages? This cannot be undone.')">
+    <input type="hidden" name="action" value="delete_programme">
+    <input type="hidden" name="programme_name" value="{pname}">
+    <button class="btn btn-sm btn-danger py-1 px-2" style="font-size:11px">
+      <i class="bi bi-trash"></i> Delete
+    </button>
+  </form>"""
             prog_inner += f"""
-<div class="accordion-item" style="border:1px solid #e2e8f0;border-radius:8px;margin-bottom:8px;overflow:hidden">
+<div class="accordion-item" style="border:1px solid #e2e8f0;border-radius:8px;margin-bottom:8px;overflow:hidden;position:relative">
+  {del_prog_btn}
   <h2 class="accordion-header">
     <button class="accordion-button collapsed py-2" type="button" data-bs-toggle="collapse"
             data-bs-target="#prog_{pid_safe}" style="background:#f8fafc;font-size:14px">
@@ -3103,8 +3298,20 @@ def settings():
   </div>
 </div>"""
 
+        del_board_btn = ""
+        if session.get("role") == "super_admin":
+            del_board_btn = f"""
+  <form method="post" style="position:absolute;right:52px;top:50%;transform:translateY(-50%);z-index:10"
+        onsubmit="return confirm('Delete board &quot;{b['board_name']}&quot;? All programmes must be deleted first.')">
+    <input type="hidden" name="action" value="delete_board">
+    <input type="hidden" name="board_id" value="{b['id']}">
+    <button class="btn btn-sm btn-danger py-1 px-2" style="font-size:12px">
+      <i class="bi bi-trash"></i> Delete Board
+    </button>
+  </form>"""
         board_sections += f"""
-<div class="accordion-item" style="border:2px solid #e2e8f0;border-radius:12px;margin-bottom:16px;overflow:hidden">
+<div class="accordion-item" style="border:2px solid #e2e8f0;border-radius:12px;margin-bottom:16px;overflow:hidden;position:relative">
+  {del_board_btn}
   <h2 class="accordion-header">
     <button class="accordion-button" type="button" data-bs-toggle="collapse"
             data-bs-target="#board_{bid_safe}" style="background:linear-gradient(135deg,#003356,#0094ca);color:#fff;font-weight:700;font-size:15px">
@@ -3934,6 +4141,7 @@ def quick_advance_post():
 def search():
     q = request.args.get("q", "").strip()
     bid = user_board_id()
+    ph_progs = user_programme_names()
     results = []
     if q:
         conn = get_db()
@@ -3943,6 +4151,13 @@ def search():
         if bid is not None:
             base += " AND board_id=?"
             params.append(bid)
+        if ph_progs is not None:
+            if ph_progs:
+                placeholders = ",".join("?" * len(ph_progs))
+                base += f" AND programme_name IN ({placeholders})"
+                params.extend(ph_progs)
+            else:
+                base += " AND 1=0"
         base += " LIMIT 50"
         results = [dict(r) for r in conn.execute(base, params).fetchall()]
         conn.close()
@@ -3999,15 +4214,30 @@ def search():
 def reports():
     conn = get_db()
     bid = user_board_id()
+    ph_progs = user_programme_names()
     today = date.today()
 
     if bid is not None:
-        cases = [dict(r) for r in conn.execute(
-            "SELECT * FROM case_tracking WHERE board_id=?", (bid,)
-        ).fetchall()]
-        history = [dict(r) for r in conn.execute(
-            "SELECT * FROM stage_history WHERE board_id=? ORDER BY timestamp DESC", (bid,)
-        ).fetchall()]
+        if ph_progs is not None:
+            # program_head: filter by mapped programmes within board
+            if ph_progs:
+                placeholders = ",".join("?" * len(ph_progs))
+                cases = [dict(r) for r in conn.execute(
+                    f"SELECT * FROM case_tracking WHERE board_id=? AND programme_name IN ({placeholders})",
+                    [bid] + ph_progs
+                ).fetchall()]
+                history = [dict(r) for r in conn.execute(
+                    "SELECT * FROM stage_history WHERE board_id=? ORDER BY timestamp DESC", (bid,)
+                ).fetchall()]
+            else:
+                cases, history = [], []
+        else:
+            cases = [dict(r) for r in conn.execute(
+                "SELECT * FROM case_tracking WHERE board_id=?", (bid,)
+            ).fetchall()]
+            history = [dict(r) for r in conn.execute(
+                "SELECT * FROM stage_history WHERE board_id=? ORDER BY timestamp DESC", (bid,)
+            ).fetchall()]
     else:
         cases = [dict(r) for r in conn.execute("SELECT * FROM case_tracking").fetchall()]
         history = [dict(r) for r in conn.execute(
