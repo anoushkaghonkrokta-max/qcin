@@ -696,17 +696,34 @@ def migrate_data():
 
 def seed_data():
     conn = get_db()
-    if conn.execute("SELECT COUNT(*) FROM users").fetchone()[0] == 0:
+    # Always ensure admin exists; if ADMIN_PASSWORD env var is set, force-reset password
+    _admin_pw = os.environ.get("ADMIN_PASSWORD", "admin123")
+    existing_admin = conn.execute("SELECT id FROM users WHERE username='admin'").fetchone()
+    if not existing_admin:
         conn.execute(
             "INSERT INTO users (username, password_hash, role, full_name) VALUES (?,?,?,?)",
-            ("admin", generate_password_hash("admin123"), "super_admin", "Super Administrator"),
+            ("admin", generate_password_hash(_admin_pw), "super_admin", "Super Administrator"),
         )
+        conn.commit()
+        log.info("seed_data: admin user created (DB_PATH=%s)", DB_PATH)
+    elif os.environ.get("ADMIN_PASSWORD"):
+        # Force-reset password if env var explicitly set
+        conn.execute(
+            "UPDATE users SET password_hash=? WHERE username='admin'",
+            (generate_password_hash(_admin_pw),)
+        )
+        conn.commit()
+        log.info("seed_data: admin password reset from ADMIN_PASSWORD env var")
+
+    if conn.execute("SELECT COUNT(*) FROM users WHERE username='officer'").fetchone()[0] == 0:
         nabh = conn.execute("SELECT id FROM boards WHERE board_name='NABH'").fetchone()
         conn.execute(
             "INSERT INTO users (username, password_hash, role, full_name, board_id) VALUES (?,?,?,?,?)",
             ("officer", generate_password_hash("po123"), "program_officer", "Program Officer",
              nabh[0] if nabh else None),
         )
+        conn.commit()
+
     if conn.execute("SELECT COUNT(*) FROM programme_config").fetchone()[0] == 0:
         nabh = conn.execute("SELECT id FROM boards WHERE board_name='NABH'").fetchone()
         nabh_id = nabh[0] if nabh else None
@@ -6013,6 +6030,24 @@ def export_dashboard():
         mimetype="text/csv",
         headers={"Content-Disposition": f"attachment;filename=qci_dashboard_{today}.csv"}
     )
+
+
+@app.route("/healthz")
+def healthz():
+    """Public health-check — shows DB path and user count for diagnosis."""
+    try:
+        conn = get_db()
+        user_count = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+        admin_exists = conn.execute("SELECT 1 FROM users WHERE username='admin'").fetchone() is not None
+        conn.close()
+        return jsonify({
+            "status": "ok",
+            "db_path": DB_PATH,
+            "user_count": user_count,
+            "admin_exists": admin_exists,
+        })
+    except Exception as e:
+        return jsonify({"status": "error", "detail": str(e)}), 500
 
 
 @app.route("/run-check")
