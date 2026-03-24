@@ -19,6 +19,7 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from functools import wraps
 
+import pytz
 from apscheduler.schedulers.background import BackgroundScheduler
 from cryptography.fernet import Fernet
 from flask import (Flask, flash, jsonify, redirect, render_template_string,
@@ -483,6 +484,7 @@ def init_db():
         "ALTER TABLE case_tracking ADD COLUMN suppress_until TEXT",
         "ALTER TABLE case_tracking ADD COLUMN status TEXT NOT NULL DEFAULT 'Active'",
         "ALTER TABLE email_templates ADD COLUMN board_id INTEGER",
+        "ALTER TABLE holidays ADD COLUMN board_id INTEGER",
     ]:
         try:
             conn.execute(sql)
@@ -851,10 +853,15 @@ def send_notification(programme: str, ntype: str, to_email: str, cc_email: str,
 
 
 # ── Core daily check ─────────────────────────────────────────────────────────
-def run_daily_check() -> dict:
+def run_daily_check(board_id=None) -> dict:
     today = date.today()
     conn  = get_db()
-    cases = [dict(r) for r in conn.execute("SELECT * FROM case_tracking").fetchall()]
+    if board_id is not None:
+        cases = [dict(r) for r in conn.execute(
+            "SELECT * FROM case_tracking WHERE board_id=?", (board_id,)
+        ).fetchall()]
+    else:
+        cases = [dict(r) for r in conn.execute("SELECT * FROM case_tracking").fetchall()]
     summary = {"r1": 0, "r2": 0, "overdue": 0, "followup": 0,
                "skipped_milestone": 0, "errors": []}
 
@@ -1377,6 +1384,34 @@ body{background:var(--bg);margin:0}
 .accordion-button:focus{box-shadow:0 0 0 3px rgba(0,148,202,.12)}
 
 th{white-space:nowrap}
+
+/* ── Responsive ── */
+#sidebar-overlay{display:none;position:fixed;inset:0;background:rgba(0,0,0,.45);z-index:99}
+.hamburger{display:none;background:none;border:none;cursor:pointer;padding:4px 8px;color:var(--navy);font-size:20px}
+@media(max-width:991px){
+  #sidebar{transform:translateX(-100%);transition:transform .25s ease;z-index:200}
+  #sidebar.open{transform:translateX(0)}
+  #sidebar-overlay.open{display:block}
+  #main{margin-left:0}
+  .hamburger{display:flex;align-items:center}
+  .topbar{padding:0 16px}
+  .page-body{padding:16px}
+}
+@media(max-width:575px){
+  .stat-card .stat-val{font-size:24px}
+  .page-body{padding:12px 10px}
+  .topbar-title{font-size:13px}
+  .data-table th,.data-table td{padding:8px 10px;font-size:12px}
+  .card-header{font-size:13px;padding:12px 14px}
+  .btn-sm{font-size:11px;padding:4px 9px}
+  .modal-dialog{margin:10px}
+}
+@media(min-width:1600px){
+  #sidebar{width:240px}
+  #main{margin-left:240px}
+  .page-body{padding:28px 36px}
+  .stat-card .stat-val{font-size:34px}
+}
 </style>
 </head>
 <body>
@@ -1409,11 +1444,19 @@ th{white-space:nowrap}
       <i class="bi bi-fast-forward-fill"></i> Bulk Advance
     </a>
     <div class="nav-section" style="margin-top:8px">Reports</div>
+    {% if user_role == 'board_ceo' %}
+    <a class="nav-link {{ 'active' if active_page=='ceo_dashboard' else '' }}" href="/ceo-dashboard">
+      <i class="bi bi-speedometer2"></i> CEO Dashboard
+    </a>
+    {% endif %}
     <a class="nav-link {{ 'active' if active_page=='reports' else '' }}" href="/reports">
       <i class="bi bi-graph-up"></i> Analytics
     </a>
-    <a class="nav-link" href="/export-excel">
-      <i class="bi bi-file-earmark-excel"></i> Export Excel
+    <a class="nav-link {{ 'active' if active_page=='export_excel' else '' }}" href="/export-excel">
+      <i class="bi bi-file-earmark-excel"></i> Export Report
+    </a>
+    <a class="nav-link {{ 'active' if active_page=='search' else '' }}" href="/search">
+      <i class="bi bi-search"></i> Search Cases
     </a>
     {% if user_role in ('super_admin', 'board_admin') %}
     <div class="nav-section" style="margin-top:8px">Admin</div>
@@ -1443,23 +1486,6 @@ th{white-space:nowrap}
       <i class="bi bi-download"></i> Backup DB
     </a>
     {% endif %}
-    {% endif %}
-    {% if user_role in ('board_ceo', 'program_head') %}
-    <div class="nav-section" style="margin-top:8px">Analytics</div>
-    {% if user_role == 'board_ceo' %}
-    <a class="nav-link {{ 'active' if active_page=='ceo_dashboard' else '' }}" href="/ceo-dashboard">
-      <i class="bi bi-speedometer2"></i> CEO Dashboard
-    </a>
-    {% endif %}
-    <a class="nav-link {{ 'active' if active_page=='reports' else '' }}" href="/reports">
-      <i class="bi bi-bar-chart-line"></i> Reports &amp; Analytics
-    </a>
-    <a class="nav-link" href="/export-excel">
-      <i class="bi bi-file-earmark-excel"></i> Export Excel
-    </a>
-    <a class="nav-link {{ 'active' if active_page=='search' else '' }}" href="/search">
-      <i class="bi bi-search"></i> Search Cases
-    </a>
     {% endif %}
   </nav>
   <div class="sidebar-footer">
@@ -1493,11 +1519,17 @@ th{white-space:nowrap}
 </div>
 
 <!-- Main -->
+<div id="sidebar-overlay" onclick="closeSidebar()"></div>
 <div id="main">
   <div class="topbar">
-    <div>
-      <div class="topbar-title">{{ page_title }}</div>
-      {% if page_crumb %}<div class="page-crumb">{{ page_crumb | safe }}</div>{% endif %}
+    <div class="d-flex align-items-center gap-2">
+      <button class="hamburger" onclick="openSidebar()" title="Menu">
+        <i class="bi bi-list"></i>
+      </button>
+      <div>
+        <div class="topbar-title">{{ page_title }}</div>
+        {% if page_crumb %}<div class="page-crumb">{{ page_crumb | safe }}</div>{% endif %}
+      </div>
     </div>
     <div class="d-flex align-items-center gap-2">
       {{ topbar_actions | safe }}
@@ -1527,6 +1559,21 @@ th{white-space:nowrap}
 // Auto-dismiss toasts after 5s
 document.querySelectorAll('.toast.show').forEach(function(el){
   setTimeout(function(){ var t=bootstrap.Toast.getOrCreateInstance(el); t.hide(); }, 5000);
+});
+// Mobile sidebar
+function openSidebar(){
+  document.getElementById('sidebar').classList.add('open');
+  document.getElementById('sidebar-overlay').classList.add('open');
+  document.body.style.overflow='hidden';
+}
+function closeSidebar(){
+  document.getElementById('sidebar').classList.remove('open');
+  document.getElementById('sidebar-overlay').classList.remove('open');
+  document.body.style.overflow='';
+}
+// Close sidebar on nav link click (mobile)
+document.querySelectorAll('#sidebar .nav-link').forEach(function(a){
+  a.addEventListener('click', function(){ if(window.innerWidth<992) closeSidebar(); });
 });
 // Dark mode
 function toggleDark(){
@@ -2129,9 +2176,28 @@ def bulk_users():
         conn = get_db()
         boards = {r["board_name"].lower(): r["id"] for r in conn.execute("SELECT id, board_name FROM boards").fetchall()}
         try:
-            content_bytes = f.read().decode("utf-8-sig")
-            reader = csv.DictReader(io.StringIO(content_bytes))
-            for i, row in enumerate(reader, 2):
+            fname_u = (f.filename or "").lower()
+            if fname_u.endswith(".xlsx") or fname_u.endswith(".xls"):
+                if not HAS_XLSX:
+                    flash("openpyxl not installed — cannot read Excel files.", "error")
+                    return redirect(url_for("bulk_users"))
+                wb_u = openpyxl.load_workbook(io.BytesIO(f.read()))
+                ws_u = wb_u.active
+                all_u_rows = list(ws_u.iter_rows(values_only=True))
+                if not all_u_rows:
+                    flash("The uploaded file is empty.", "error")
+                    return redirect(url_for("bulk_users"))
+                hdrs_u = [str(h).strip() if h else "" for h in all_u_rows[0]]
+                row_dicts_u = [
+                    {hdrs_u[j]: (str(v).strip() if v is not None else "")
+                     for j, v in enumerate(r) if j < len(hdrs_u)}
+                    for r in all_u_rows[1:]
+                ]
+                reader_iter = iter(row_dicts_u)
+            else:
+                content_bytes = f.read().decode("utf-8-sig")
+                reader_iter = csv.DictReader(io.StringIO(content_bytes))
+            for i, row in enumerate(reader_iter, 2):
                 uname = (row.get("username") or "").strip()
                 if not uname:
                     errors.append(f"Row {i}: username missing")
@@ -2170,16 +2236,16 @@ def bulk_users():
 <div class="row g-4">
   <div class="col-lg-7">
     <div class="card">
-      <div class="card-header"><i class="bi bi-upload" style="color:var(--accent)"></i> Bulk User Import via CSV</div>
+      <div class="card-header"><i class="bi bi-upload" style="color:var(--accent)"></i> Bulk User Import</div>
       <div class="card-body p-4">
-        <p style="font-size:13px;color:#64748b">Upload a CSV with columns: <code>username</code>, <code>full_name</code>, <code>email</code>, <code>role</code>, <code>board_name</code>, <code>password</code>.</p>
+        <p style="font-size:13px;color:#64748b">Upload a <strong>CSV or Excel (.xlsx)</strong> with columns: <code>username</code>, <code>full_name</code>, <code>email</code>, <code>role</code>, <code>board_name</code>, <code>password</code>.</p>
         <form method="post" enctype="multipart/form-data">
           <div class="upload-zone mb-3" onclick="document.getElementById('userCsvFile').click()">
             <i class="bi bi-file-earmark-person" style="font-size:32px;color:#94a3b8"></i>
-            <div style="font-size:13px;color:#64748b;margin-top:8px">Click to select CSV file</div>
+            <div style="font-size:13px;color:#64748b;margin-top:8px">Click to select CSV or Excel file</div>
             <div id="csvFileName" style="font-size:12px;color:var(--accent);margin-top:4px"></div>
           </div>
-          <input type="file" id="userCsvFile" name="csv_file" accept=".csv" style="display:none"
+          <input type="file" id="userCsvFile" name="csv_file" accept=".csv,.xlsx,.xls" style="display:none"
                  onchange="document.getElementById('csvFileName').textContent=this.files[0].name">
           <button type="submit" class="btn btn-primary w-100">
             <i class="bi bi-upload"></i> Import Users
@@ -3976,6 +4042,32 @@ def settings():
             conn.commit()
             flash(f"Sender credentials updated for {prog}.", "success")
 
+        elif action == "add_board_holiday":
+            _hbid = user_board_id()
+            hdate = request.form.get("holiday_date", "").strip()
+            hname = request.form.get("holiday_name", "").strip()
+            if hdate and hname:
+                try:
+                    conn.execute(
+                        "INSERT OR IGNORE INTO holidays (holiday_date, name, board_id) VALUES (?,?,?)",
+                        (hdate, hname, _hbid)
+                    )
+                    conn.commit()
+                    flash(f"Holiday '{hname}' added.", "success")
+                except Exception as e:
+                    flash(f"Error: {e}", "error")
+
+        elif action == "delete_board_holiday":
+            _hbid = user_board_id()
+            hid = request.form.get("holiday_id")
+            if hid:
+                conn.execute(
+                    "DELETE FROM holidays WHERE id=? AND (board_id=? OR board_id IS NULL)",
+                    (hid, _hbid)
+                )
+                conn.commit()
+                flash("Holiday removed.", "success")
+
     # Build Board → Programme → Stage hierarchy
     bid = user_board_id()
     all_boards = [dict(r) for r in conn.execute(
@@ -4009,6 +4101,17 @@ def settings():
             p["sender_email"] = first[0]["sender_email"] if first else None
             p["smtp_host"] = first[0].get("smtp_host", "smtp.gmail.com") if first else "smtp.gmail.com"
             p["smtp_port"] = first[0].get("smtp_port", 587) if first else 587
+
+    # Load board-specific holidays
+    if bid is not None:
+        _board_holidays = [dict(r) for r in conn.execute(
+            "SELECT * FROM holidays WHERE board_id=? OR board_id IS NULL ORDER BY holiday_date",
+            (bid,)
+        ).fetchall()]
+    else:
+        _board_holidays = [dict(r) for r in conn.execute(
+            "SELECT * FROM holidays ORDER BY holiday_date"
+        ).fetchall()]
 
     conn.close()
 
@@ -4187,39 +4290,121 @@ def settings():
     )
 
     is_super = session.get("role") == "super_admin"
+    is_board_admin = session.get("role") in ("board_admin", "super_admin")
+    _settings_bid = user_board_id()
 
-    # Current schedule for display
-    cur_hour   = int(get_app_setting("scheduler_hour",   "8"))
-    cur_minute = int(get_app_setting("scheduler_minute", "0"))
-    cur_time_val = f"{cur_hour:02d}:{cur_minute:02d}"
+    # Per-board scheduler setting (used by board admins)
+    if request.method == "POST" and request.form.get("action") == "save_board_schedule":
+        if _settings_bid and is_board_admin:
+            _bh = request.form.get("board_sched_hour", "8")
+            _bm = request.form.get("board_sched_minute", "0")
+            upsert_app_setting(f"sched_hour_board_{_settings_bid}", _bh)
+            upsert_app_setting(f"sched_minute_board_{_settings_bid}", _bm)
+            flash("Board notification schedule updated.", "success")
 
-    scheduler_html = f"""
+    _board_sched_hour = int(get_app_setting(
+        f"sched_hour_board_{_settings_bid}" if _settings_bid else "scheduler_hour",
+        get_app_setting("scheduler_hour", "8")
+    ))
+    _board_sched_minute = int(get_app_setting(
+        f"sched_minute_board_{_settings_bid}" if _settings_bid else "scheduler_minute",
+        get_app_setting("scheduler_minute", "0")
+    ))
+    _bsh_opts = "".join(
+        f'<option value="{h}" {"selected" if h==_board_sched_hour else ""}>{h:02d}:00</option>'
+        for h in range(24)
+    )
+    _bsm_opts = "".join(
+        f'<option value="{m}" {"selected" if m==_board_sched_minute else ""}>{m:02d}</option>'
+        for m in [0, 15, 30, 45]
+    )
+
+    board_schedule_html = f"""
       <div class="card mb-3">
         <div class="card-header d-flex justify-content-between align-items-center" style="cursor:pointer"
-             onclick="togglePanel('schedBody')">
-          <span><i class="bi bi-clock" style="color:#0891b2"></i> Scheduler Settings</span>
+             onclick="togglePanel('boardSchedBody')">
+          <span><i class="bi bi-clock" style="color:#0891b2"></i> Board Notification Schedule</span>
           <i class="bi bi-chevron-down" style="color:#94a3b8"></i>
         </div>
-        <div id="schedBody" style="display:none">
+        <div id="boardSchedBody" style="display:none">
           <div class="card-body p-3">
             <form method="post">
-              <input type="hidden" name="action" value="update_schedule">
-              <div class="mb-2">
-                <label class="form-label" style="font-size:12px">
-                  Daily run time <span style="color:#94a3b8">(IST, 24-hr)</span>
-                </label>
-                <input type="time" class="form-control form-control-sm"
-                       name="schedule_time" value="{cur_time_val}" required>
+              <input type="hidden" name="action" value="save_board_schedule">
+              <div class="row g-2 mb-2">
+                <div class="col-6">
+                  <label class="form-label" style="font-size:12px">Hour (IST)</label>
+                  <select class="form-select form-select-sm" name="board_sched_hour">{_bsh_opts}</select>
+                </div>
+                <div class="col-6">
+                  <label class="form-label" style="font-size:12px">Minute</label>
+                  <select class="form-select form-select-sm" name="board_sched_minute">{_bsm_opts}</select>
+                </div>
               </div>
               <div style="font-size:11px;color:#94a3b8;margin-bottom:10px">
-                Currently set to <strong>{cur_hour:02d}:{cur_minute:02d} IST</strong>.
-                Change takes effect immediately — no restart needed.
+                Currently: <strong>{_board_sched_hour:02d}:{_board_sched_minute:02d} IST</strong>.
+                Notifications for this board will run at this time daily.
               </div>
-              <button class="btn btn-sm btn-primary w-100" type="submit">Update Schedule</button>
+              <button class="btn btn-sm btn-primary w-100" type="submit">Save Schedule</button>
             </form>
           </div>
         </div>
-      </div>""" if is_super else ""
+      </div>""" if is_board_admin else ""
+
+    scheduler_html = ""  # Removed — managed in System Settings (super admin only)
+
+    # Board holiday calendar card
+    _hol_rows = ""
+    for h in _board_holidays:
+        scope = '<span style="font-size:10px;color:#94a3b8">(global)</span>' if not h.get("board_id") else ""
+        _hol_rows += f"""<tr>
+  <td style="font-size:12px">{h['holiday_date']}</td>
+  <td style="font-size:12px">{h['name']} {scope}</td>
+  <td>
+    <form method="post" style="display:inline">
+      <input type="hidden" name="action" value="delete_board_holiday">
+      <input type="hidden" name="holiday_id" value="{h['id']}">
+      <button type="submit" class="btn btn-xs btn-outline-danger" style="font-size:10px;padding:1px 6px"
+              onclick="return confirm('Remove holiday?')"><i class="bi bi-trash"></i></button>
+    </form>
+  </td>
+</tr>"""
+    if not _hol_rows:
+        _hol_rows = '<tr><td colspan="3" style="text-align:center;color:#94a3b8;padding:16px;font-size:12px">No holidays added yet.</td></tr>'
+
+    board_holiday_html = f"""
+      <div class="card mb-3">
+        <div class="card-header d-flex justify-content-between align-items-center" style="cursor:pointer"
+             onclick="togglePanel('boardHolBody')">
+          <span><i class="bi bi-calendar3-event" style="color:#d97706"></i> Holiday Calendar</span>
+          <i class="bi bi-chevron-down" style="color:#94a3b8"></i>
+        </div>
+        <div id="boardHolBody" style="display:none">
+          <div class="card-body p-3">
+            <form method="post" class="row g-2 mb-3">
+              <input type="hidden" name="action" value="add_board_holiday">
+              <div class="col-5">
+                <input type="date" class="form-control form-control-sm" name="holiday_date" required>
+              </div>
+              <div class="col-5">
+                <input type="text" class="form-control form-control-sm" name="holiday_name"
+                       placeholder="e.g. Diwali" required>
+              </div>
+              <div class="col-2">
+                <button class="btn btn-sm btn-success w-100" type="submit">Add</button>
+              </div>
+            </form>
+            <div style="max-height:180px;overflow-y:auto">
+              <table class="data-table">
+                <thead><tr><th>Date</th><th>Name</th><th style="width:40px"></th></tr></thead>
+                <tbody>{_hol_rows}</tbody>
+              </table>
+            </div>
+            <div style="font-size:10px;color:#94a3b8;margin-top:6px">
+              TAT calculation skips these dates + all weekends.
+            </div>
+          </div>
+        </div>
+      </div>""" if is_board_admin else ""
 
     add_board_html = f"""
       <div class="card mb-3">
@@ -4249,7 +4434,8 @@ def settings():
 <div class="row g-4">
   <div class="col-lg-4">
     <!-- Action panels -->
-    {scheduler_html}
+    {board_schedule_html}
+    {board_holiday_html}
     {add_board_html}
 
     <div class="card mb-3">
@@ -5419,21 +5605,246 @@ def reports():
     return render_page(content, active_page="reports", page_title="Analytics & Reports")
 
 
-# ── Multi-sheet Excel Export ──────────────────────────────────────────────────
-@app.route("/export-excel")
-@login_required
-def export_excel():
-    if not HAS_XLSX:
-        flash("openpyxl not installed.", "error")
-        return redirect(url_for("dashboard"))
+def _export_csv_filtered():
+    """CSV export helper called from export_excel when fmt=csv."""
     conn = get_db()
     bid = user_board_id()
+    ph_progs = user_programme_names()
+    today = date.today()
+    prog_filter = request.form.getlist("prog_filter")
+    case_status_f = request.form.get("case_status", "")
+    date_from = request.form.get("date_from", "")
+    date_to = request.form.get("date_to", "")
+    q = "SELECT * FROM case_tracking WHERE 1=1"
+    params = []
+    if bid is not None:
+        q += " AND board_id=?"; params.append(bid)
+    if case_status_f:
+        q += " AND (status=? OR (status IS NULL AND ?='Active'))"; params += [case_status_f, case_status_f]
+    if date_from:
+        q += " AND stage_start_date >= ?"; params.append(date_from)
+    if date_to:
+        q += " AND stage_start_date <= ?"; params.append(date_to)
+    cases = [dict(r) for r in conn.execute(q, params).fetchall()]
+    conn.close()
+    if prog_filter:
+        cases = [c for c in cases if c["programme_name"] in prog_filter]
+    if ph_progs is not None:
+        cases = [c for c in cases if c["programme_name"] in ph_progs]
+    output = io.StringIO()
+    w = csv.writer(output)
+    w.writerow(["Application ID","Organisation","Programme","Stage","Owner Type",
+                "Action Owner","Email","Stage Start","TAT Days","Days Elapsed",
+                "SLA Status","Case Status","R1 Sent","R2 Sent","Overdue Sent","Follow-ups"])
+    for c in cases:
+        elapsed = working_days_elapsed(c["stage_start_date"], today)
+        tat = c["tat_days"]
+        if c["is_milestone"]: sla = "Milestone"
+        elif tat > 0 and elapsed >= tat: sla = "Overdue"
+        elif tat > 0 and elapsed >= c.get("reminder2_day", 0): sla = "At Risk"
+        else: sla = "On Track"
+        w.writerow([c["application_id"], c["organisation_name"], c["programme_name"],
+                    c["current_stage"], c["owner_type"] or "", c["action_owner_name"] or "",
+                    c["action_owner_email"] or "", c["stage_start_date"], tat, elapsed,
+                    sla, c.get("status","Active"),
+                    "Yes" if c["r1_sent"] else "No", "Yes" if c["r2_sent"] else "No",
+                    "Yes" if c["overdue_sent"] else "No", c["overdue_count"]])
+    return Response(output.getvalue(), mimetype="text/csv",
+                    headers={"Content-Disposition": f"attachment;filename=qci_report_{today}.csv"})
+
+
+# ── Export Report Config Page ─────────────────────────────────────────────────
+@app.route("/export-excel", methods=["GET"])
+@login_required
+def export_excel_page():
+    """Show export configuration form."""
+    conn = get_db()
+    bid = user_board_id()
+    ph_progs = user_programme_names()
+    if bid is not None:
+        programmes = [r[0] for r in conn.execute(
+            "SELECT DISTINCT programme_name FROM programmes WHERE board_id=? ORDER BY programme_name", (bid,)
+        ).fetchall()]
+        stages = [r[0] for r in conn.execute(
+            "SELECT DISTINCT stage_name FROM programme_config WHERE board_id=? ORDER BY stage_name", (bid,)
+        ).fetchall()]
+    else:
+        programmes = [r[0] for r in conn.execute(
+            "SELECT DISTINCT programme_name FROM programmes ORDER BY programme_name"
+        ).fetchall()]
+        stages = [r[0] for r in conn.execute(
+            "SELECT DISTINCT stage_name FROM programme_config ORDER BY stage_name"
+        ).fetchall()]
+    if ph_progs is not None:
+        programmes = [p for p in programmes if p in ph_progs]
+    conn.close()
+
+    prog_checkboxes = "".join(
+        f'<div class="form-check"><input class="form-check-input" type="checkbox" name="prog_filter" value="{p}" id="p_{i}" checked>'
+        f'<label class="form-check-label" for="p_{i}" style="font-size:12px">{p}</label></div>'
+        for i, p in enumerate(programmes)
+    )
+    status_opts = "".join(
+        f'<div class="form-check"><input class="form-check-input" type="checkbox" name="status_filter" value="{s}" checked>'
+        f'<label class="form-check-label" style="font-size:12px">{s}</label></div>'
+        for s in ["Active", "Closed", "Withdrawn", "Suspended", "All"]
+    )
+
+    col_opts = ""
+    for col_id, col_label in [
+        ("app_id","Application ID"),("org","Organisation"),("programme","Programme"),
+        ("stage","Current Stage"),("owner_type","Owner Type"),("owner_name","Action Owner"),
+        ("owner_email","Owner Email"),("po_email","PO Email"),("stage_start","Stage Start"),
+        ("tat","TAT Days"),("elapsed","Days Elapsed"),("sla_status","SLA Status"),
+        ("r1","R1 Sent"),("r2","R2 Sent"),("overdue","Overdue Sent"),("followups","Follow-ups"),
+        ("case_status","Case Status"),
+    ]:
+        col_opts += (f'<div class="form-check form-check-inline">'
+                     f'<input class="form-check-input" type="checkbox" name="cols" value="{col_id}" id="c_{col_id}" checked>'
+                     f'<label class="form-check-label" for="c_{col_id}" style="font-size:12px">{col_label}</label></div>')
+
+    content = f"""
+<div class="row g-4">
+  <div class="col-lg-8">
+    <form method="post" action="/export-excel/download">
+      <div class="card mb-4">
+        <div class="card-header"><i class="bi bi-funnel" style="color:var(--accent)"></i> Filter Data</div>
+        <div class="card-body p-4">
+          <div class="row g-3">
+            <div class="col-md-6">
+              <label class="form-label">Date Range (Stage Start)</label>
+              <div class="d-flex gap-2">
+                <input type="date" class="form-control form-control-sm" name="date_from" placeholder="From">
+                <input type="date" class="form-control form-control-sm" name="date_to" placeholder="To">
+              </div>
+            </div>
+            <div class="col-md-3">
+              <label class="form-label">Case Status</label>
+              <select class="form-select form-select-sm" name="case_status">
+                <option value="">All</option>
+                <option>Active</option><option>Closed</option>
+                <option>Withdrawn</option><option>Suspended</option>
+              </select>
+            </div>
+            <div class="col-md-3">
+              <label class="form-label">SLA Status</label>
+              <select class="form-select form-select-sm" name="sla_status">
+                <option value="">All</option>
+                <option>On Track</option><option>At Risk</option>
+                <option>Overdue</option><option>Milestone</option>
+              </select>
+            </div>
+          </div>
+          <div class="mt-3">
+            <label class="form-label">Programmes
+              <button type="button" class="btn btn-xs ms-2" style="font-size:10px;padding:1px 6px;border:1px solid #cbd5e1"
+                      onclick="document.querySelectorAll('[name=prog_filter]').forEach(c=>c.checked=true)">All</button>
+              <button type="button" class="btn btn-xs ms-1" style="font-size:10px;padding:1px 6px;border:1px solid #cbd5e1"
+                      onclick="document.querySelectorAll('[name=prog_filter]').forEach(c=>c.checked=false)">None</button>
+            </label>
+            <div class="row g-1">{prog_checkboxes or '<span style="color:#94a3b8;font-size:12px">No programmes available.</span>'}</div>
+          </div>
+        </div>
+      </div>
+
+      <div class="card mb-4">
+        <div class="card-header"><i class="bi bi-table" style="color:#7c3aed"></i> Columns to Include</div>
+        <div class="card-body p-4">
+          <button type="button" class="btn btn-xs mb-2" style="font-size:11px;padding:2px 8px;border:1px solid #cbd5e1"
+                  onclick="document.querySelectorAll('[name=cols]').forEach(c=>c.checked=true)">Select All</button>
+          <button type="button" class="btn btn-xs mb-2 ms-1" style="font-size:11px;padding:2px 8px;border:1px solid #cbd5e1"
+                  onclick="document.querySelectorAll('[name=cols]').forEach(c=>c.checked=false)">Deselect All</button>
+          <div>{col_opts}</div>
+        </div>
+      </div>
+
+      <div class="card mb-4">
+        <div class="card-header"><i class="bi bi-file-earmark-excel" style="color:#059669"></i> Export Format</div>
+        <div class="card-body p-4">
+          <div class="d-flex gap-3">
+            <div class="form-check">
+              <input class="form-check-input" type="radio" name="fmt" value="xlsx" id="fmtXlsx" checked>
+              <label class="form-check-label" for="fmtXlsx">Excel (.xlsx) — multi-sheet with formatting</label>
+            </div>
+            <div class="form-check">
+              <input class="form-check-input" type="radio" name="fmt" value="csv" id="fmtCsv">
+              <label class="form-check-label" for="fmtCsv">CSV — simple flat file</label>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <button type="submit" class="btn btn-primary px-5">
+        <i class="bi bi-download"></i> Generate &amp; Download Report
+      </button>
+    </form>
+  </div>
+
+  <div class="col-lg-4">
+    <div class="card" style="position:sticky;top:72px">
+      <div class="card-header"><i class="bi bi-info-circle" style="color:#0891b2"></i> About This Export</div>
+      <div class="card-body p-4" style="font-size:13px;color:#475569">
+        <p>Select the filters and columns you need, then click <strong>Generate &amp; Download</strong>.</p>
+        <ul style="font-size:12px">
+          <li><strong>Excel (.xlsx)</strong> — includes Active Cases, Stage History, and Audit Log sheets with colour-coded headers.</li>
+          <li><strong>CSV</strong> — flat file, easy to open in any spreadsheet tool.</li>
+          <li>Data is scoped to your board/programmes.</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+</div>"""
+    return render_page(content, active_page="export_excel", page_title="Export Report")
+
+
+# ── Multi-sheet Excel Export (download) ───────────────────────────────────────
+@app.route("/export-excel/download", methods=["POST"])
+@login_required
+def export_excel():
+    """Handles parameterised export — filters applied from POST form."""
+    fmt = request.form.get("fmt", "xlsx")
+    if fmt == "csv":
+        return _export_csv_filtered()
+
+    if not HAS_XLSX:
+        flash("openpyxl not installed.", "error")
+        return redirect(url_for("export_excel_page"))
+    conn = get_db()
+    bid = user_board_id()
+    ph_progs = user_programme_names()
     today = date.today()
 
+    # Build filter conditions from POST params
+    prog_filter = request.form.getlist("prog_filter")
+    case_status_f = request.form.get("case_status", "")
+    sla_status_f = request.form.get("sla_status", "")
+    date_from = request.form.get("date_from", "")
+    date_to = request.form.get("date_to", "")
+    selected_cols = set(request.form.getlist("cols")) or {
+        "app_id","org","programme","stage","owner_type","owner_name",
+        "stage_start","tat","elapsed","sla_status","case_status"
+    }
+
+    q = "SELECT * FROM case_tracking WHERE 1=1"
+    params = []
     if bid is not None:
-        cases = [dict(r) for r in conn.execute(
-            "SELECT * FROM case_tracking WHERE board_id=?", (bid,)
-        ).fetchall()]
+        q += " AND board_id=?"; params.append(bid)
+    if case_status_f:
+        q += " AND (status=? OR (status IS NULL AND ?='Active'))"; params += [case_status_f, case_status_f]
+    if date_from:
+        q += " AND stage_start_date >= ?"; params.append(date_from)
+    if date_to:
+        q += " AND stage_start_date <= ?"; params.append(date_to)
+
+    cases = [dict(r) for r in conn.execute(q, params).fetchall()]
+
+    # Filter by programme
+    if prog_filter:
+        cases = [c for c in cases if c["programme_name"] in prog_filter]
+    if ph_progs is not None:
+        cases = [c for c in cases if c["programme_name"] in ph_progs]
+
+    if bid is not None:
         history = [dict(r) for r in conn.execute(
             "SELECT * FROM stage_history WHERE board_id=? ORDER BY timestamp DESC LIMIT 2000", (bid,)
         ).fetchall()]
@@ -5441,7 +5852,6 @@ def export_excel():
             "SELECT * FROM audit_log WHERE board_id=? ORDER BY id DESC LIMIT 2000", (bid,)
         ).fetchall()]
     else:
-        cases = [dict(r) for r in conn.execute("SELECT * FROM case_tracking").fetchall()]
         history = [dict(r) for r in conn.execute(
             "SELECT * FROM stage_history ORDER BY timestamp DESC LIMIT 2000"
         ).fetchall()]
@@ -5462,6 +5872,10 @@ def export_excel():
             c["status"] = "At Risk"
         else:
             c["status"] = "On Track"
+
+    # Apply SLA status filter
+    if sla_status_f:
+        cases = [c for c in cases if c.get("status") == sla_status_f]
 
     wb = openpyxl.Workbook()
 
@@ -6059,9 +6473,33 @@ def run_check():
 
 # ── Scheduler ─────────────────────────────────────────────────────────────────
 def _scheduled_job():
-    log.info("Scheduled daily check running…")
-    result = run_daily_check()
-    log.info("Daily check complete: %s", result)
+    """Runs every hour — dispatches per-board based on each board's configured run hour."""
+    now_ist = datetime.now(pytz.timezone("Asia/Kolkata"))
+    cur_hour = now_ist.hour
+    global_hour = int(get_app_setting("scheduler_hour", "8"))
+
+    try:
+        conn = get_db()
+        boards = [dict(r) for r in conn.execute("SELECT id, board_name FROM boards").fetchall()]
+        conn.close()
+    except Exception:
+        boards = []
+
+    if not boards:
+        # Fallback: run globally if no boards configured
+        if cur_hour == global_hour:
+            log.info("Scheduled daily check (global) running…")
+            result = run_daily_check()
+            log.info("Daily check complete: %s", result)
+        return
+
+    for board in boards:
+        bid = board["id"]
+        board_hour = int(get_app_setting(f"sched_hour_board_{bid}", str(global_hour)))
+        if cur_hour == board_hour:
+            log.info("Scheduled daily check for board %s (%s)…", bid, board["board_name"])
+            result = run_daily_check(board_id=bid)
+            log.info("Board %s check complete: %s", bid, result)
 
 
 def _weekly_digest_job():
@@ -6082,7 +6520,7 @@ with app.app_context():
     _sched_minute = int(get_app_setting("scheduler_minute", "0"))
 
 scheduler.add_job(_scheduled_job, "cron",
-                  hour=_sched_hour, minute=_sched_minute, id="daily_check")
+                  hour="*", minute=0, id="daily_check")
 scheduler.add_job(_weekly_digest_job, "cron",
                   day_of_week="mon", hour=8, minute=0, id="weekly_digest")
 
