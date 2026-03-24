@@ -1,0 +1,25 @@
+# Database files (contain live data — never commit)
+*.db
+*.db-shm
+*.db-wal
+
+# Encryption & secret keys (must never be in version control)
+fernet.key
+secret.key
+*.key
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Environment files
+.env
+.env.*
+
+# Claude project config (local only)
+.claude/
+
+# OS junk
+.DS_Store
