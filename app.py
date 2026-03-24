@@ -1624,10 +1624,24 @@ _LOGIN_PAGE = """<!doctype html>
     {% endif %}
     <button type="submit" class="btn-login">Sign In</button>
   </form>
-  <div class="creds-hint">
-    <strong>Default credentials</strong><br>
-    Admin: <code>admin</code> / <code>admin123</code><br>
-    Program Officer: <code>officer</code> / <code>po123</code>
+  <div class="creds-hint" style="padding:14px 16px">
+    <div style="font-size:11px;font-weight:700;letter-spacing:.5px;color:#94a3b8;margin-bottom:10px">DEFAULT CREDENTIALS</div>
+    <table style="width:100%;font-size:12px;border-collapse:collapse">
+      <thead>
+        <tr style="color:#94a3b8;border-bottom:1px solid #e2e8f0">
+          <th style="text-align:left;padding-bottom:6px;font-weight:600">Role</th>
+          <th style="text-align:left;padding-bottom:6px;font-weight:600">Username</th>
+          <th style="text-align:left;padding-bottom:6px;font-weight:600">Password</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr><td style="padding:4px 0;color:#1e293b">Super Admin</td><td><code>admin</code></td><td><code>admin123</code></td></tr>
+        <tr><td style="padding:4px 0;color:#1e293b">Program Officer</td><td><code>officer</code></td><td><code>po123</code></td></tr>
+      </tbody>
+    </table>
+    <div style="font-size:10px;color:#94a3b8;margin-top:10px;border-top:1px solid #e2e8f0;padding-top:8px">
+      Board Admin, Board CEO &amp; Programme Head accounts are created by Super Admin.
+    </div>
   </div>
 </div>
 <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/js/bootstrap.bundle.min.js"></script>
@@ -1767,7 +1781,7 @@ def manage_users():
                 new_user = conn.execute(
                     "SELECT id FROM users WHERE username=?", (request.form["username"].strip(),)
                 ).fetchone()
-                if new_user and role == "program_head":
+                if new_user and role in ("program_head", "program_officer", "board_ceo"):
                     prog_ids = request.form.getlist("programme_ids")
                     for pid in prog_ids:
                         try:
@@ -1839,27 +1853,48 @@ def manage_users():
         role_pill = f'<span class="pill" style="background:{bg};color:{fg}">{rl}</span>'
         board_cell = u.get("board_name") or '<span style="color:#94a3b8">—</span>'
         is_self = u["id"] == session["user_id"]
+        _REMAP_ROLES = {"program_officer", "program_head", "board_ceo"}
         prog_cell = ""
-        if u["role"] == "program_head":
+        if u["role"] in _REMAP_ROLES:
             progs = ph_prog_map.get(u["id"], [])
-            prog_cell = ", ".join(progs) if progs else '<span style="color:#f59e0b;font-size:11px">No programmes mapped</span>'
+            if progs:
+                prog_cell = " ".join(
+                    f'<span style="background:#ede9fe;color:#7c3aed;font-size:10px;padding:1px 6px;border-radius:10px;white-space:nowrap">{p}</span>'
+                    for p in progs
+                )
+            else:
+                prog_cell = '<span style="color:#f59e0b;font-size:11px">None mapped</span>'
         last_login_cell = u.get("last_login") or '<span style="color:#94a3b8;font-size:11px">Never</span>'
+        _uid = u["id"]
+        _uname = u["username"]
+        _urole = u["role"]
+        remap_btn = (
+            '<button class="btn btn-sm btn-action btn-outline-primary" style="font-size:11px;padding:2px 7px" '
+            'onclick="showRemapPh(' + str(_uid) + ', \'' + _uname + '\', \'' + _urole + '\')">'
+            '<i class="bi bi-diagram-3"></i> Map</button>'
+            if _urole in _REMAP_ROLES else ""
+        )
+        del_btn = (
+            '<button class="btn btn-sm btn-action btn-outline-danger" style="font-size:11px;padding:2px 7px" '
+            'onclick="confirmDeleteUser(' + str(_uid) + ', \'' + _uname + '\')">'
+            '<i class="bi bi-trash"></i></button>'
+            if not is_self else ""
+        )
         rows += f"""<tr>
           <td style="font-weight:600">{u['username']}</td>
           <td>{u['full_name'] or '—'}</td>
           <td>{u['email'] or '—'}</td>
           <td>{role_pill}</td>
           <td>{board_cell}</td>
-          <td style="font-size:12px;color:#475569">{prog_cell or '—'}</td>
+          <td style="font-size:12px;color:#475569;max-width:180px">{prog_cell or '<span style="color:#94a3b8">—</span>'}</td>
           <td style="font-size:11px;color:#64748b">{last_login_cell}</td>
           <td>
-            <div class="d-flex flex-nowrap gap-1">
-              <button class="btn btn-sm btn-action btn-outline-secondary"
-                onclick="showResetPw({u['id']}, '{u['username']}')">Reset PW</button>
-              <button class="btn btn-sm btn-action btn-outline-primary"
-                onclick="showRemapPh({u['id']}, '{u['username']}', '{u['role']}')">Remap</button>
-              {"" if is_self else f'''<button class="btn btn-sm btn-action btn-outline-danger"
-                onclick="confirmDeleteUser({u['id']}, '{u['username']}')">Delete</button>'''}
+            <div class="d-flex flex-nowrap gap-1 align-items-center">
+              <button class="btn btn-sm btn-action btn-outline-secondary" style="font-size:11px;padding:2px 7px"
+                onclick="showResetPw({u['id']}, '{u['username']}')">
+                <i class="bi bi-key"></i> PW</button>
+              {remap_btn}
+              {del_btn}
             </div>
           </td>
         </tr>"""
@@ -1876,14 +1911,19 @@ def manage_users():
 <div class="row g-4">
   <div class="col-lg-8">
     <div class="card">
-      <div class="card-header d-flex justify-content-between align-items-center">
+      <div class="card-header d-flex justify-content-between align-items-center flex-wrap gap-2">
         <span>All Users</span>
-        <a href="/bulk-users" class="btn btn-sm btn-outline-primary">
-          <i class="bi bi-upload"></i> Bulk Import CSV
-        </a>
+        <div class="d-flex gap-2 align-items-center">
+          <input type="text" id="userSearch" class="form-control form-control-sm"
+                 placeholder="Search users..." oninput="filterUsers(this.value)"
+                 style="max-width:200px;font-size:12px">
+          <a href="/bulk-users" class="btn btn-sm btn-outline-primary">
+            <i class="bi bi-upload"></i> Bulk Import
+          </a>
+        </div>
       </div>
       <div style="overflow-x:auto">
-        <table class="data-table">
+        <table class="data-table" id="userTable">
           <thead><tr><th>Username</th><th>Full Name</th><th>Email</th><th>Role</th><th>Board</th><th>Programmes</th><th>Last Login</th><th>Actions</th></tr></thead>
           <tbody>{rows}</tbody>
         </table>
@@ -1920,15 +1960,16 @@ def manage_users():
           </div>
           <div class="mb-3" id="boardField">
             <label class="form-label">Board <span style="color:#94a3b8;font-size:11px">(required for all except Super Admin)</span></label>
-            <select class="form-select" name="board_id" id="boardSelect">
+            <select class="form-select" name="board_id" id="boardSelect" onchange="filterProgsByBoard()">
               {board_opts}
             </select>
           </div>
           <div class="mb-3" id="progField" style="display:none">
-            <label class="form-label">Programmes <span style="color:#94a3b8;font-size:11px">(Programme Head only — hold Ctrl/Cmd for multiple)</span></label>
+            <label class="form-label">Programmes <span style="color:#94a3b8;font-size:11px">(hold Ctrl/Cmd for multiple)</span></label>
             <select class="form-select" name="programme_ids" id="progSelect" multiple size="5">
               {prog_opts_by_board}
             </select>
+            <div style="font-size:11px;color:#94a3b8;margin-top:4px">Only programmes for the selected board are shown.</div>
           </div>
           <div class="mb-3">
             <label class="form-label">Password</label>
@@ -1987,27 +2028,31 @@ def manage_users():
   </div>
 </div>
 
-<!-- Delete user modal -->
+<!-- Delete user modal — form lives outside -->
 <div class="modal fade" id="delUserModal" tabindex="-1">
   <div class="modal-dialog modal-dialog-centered modal-sm">
     <div class="modal-content">
       <div class="modal-body text-center p-4">
         <i class="bi bi-person-x" style="font-size:32px;color:#dc2626"></i>
-        <div style="font-weight:600;margin-top:10px">Delete user <span id="delUserName"></span>?</div>
+        <div style="font-weight:600;margin-top:10px">Delete <span id="delUserName"></span>?</div>
+        <div style="font-size:12px;color:#94a3b8;margin-top:6px">This cannot be undone.</div>
       </div>
-      <form method="post">
-        <input type="hidden" name="action" value="delete">
-        <input type="hidden" name="user_id" id="delUserId">
-        <div class="modal-footer border-0 justify-content-center gap-2">
-          <button type="button" class="btn btn-sm btn-outline-secondary" data-bs-dismiss="modal">Cancel</button>
-          <button class="btn btn-sm btn-danger" type="submit">Delete</button>
-        </div>
-      </form>
+      <div class="modal-footer border-0 justify-content-center gap-2">
+        <button type="button" class="btn btn-sm btn-outline-secondary" data-bs-dismiss="modal">Cancel</button>
+        <button type="button" class="btn btn-sm btn-danger" onclick="submitDeleteUser()">Delete</button>
+      </div>
     </div>
   </div>
 </div>
+<!-- Hidden delete form — outside modal so Cancel cannot accidentally submit it -->
+<form method="post" id="deleteUserForm" style="display:none">
+  <input type="hidden" name="action" value="delete">
+  <input type="hidden" name="user_id" id="delUserId">
+</form>
 """
     scripts = """<script>
+var _PROG_ROLES = ['program_officer', 'program_head', 'board_ceo'];
+
 function showResetPw(id, name){
   document.getElementById('rpUserId').value = id;
   document.getElementById('rpUser').textContent = name;
@@ -2018,16 +2063,36 @@ function confirmDeleteUser(id, name){
   document.getElementById('delUserName').textContent = name;
   new bootstrap.Modal(document.getElementById('delUserModal')).show();
 }
+function submitDeleteUser(){
+  document.getElementById('deleteUserForm').submit();
+}
+function filterProgsByBoard(){
+  var bid = document.getElementById('boardSelect').value;
+  var opts = document.getElementById('progSelect').options;
+  for(var i=0; i<opts.length; i++){
+    var show = !bid || opts[i].dataset.board == bid;
+    opts[i].style.display = show ? '' : 'none';
+    if(bid && opts[i].dataset.board != bid) opts[i].selected = false;
+  }
+}
 function toggleRoleFields(){
   var role = document.getElementById('roleSelect').value;
   document.getElementById('boardField').style.display = role === 'super_admin' ? 'none' : '';
-  document.getElementById('progField').style.display = role === 'program_head' ? '' : 'none';
+  var showProg = _PROG_ROLES.indexOf(role) >= 0;
+  document.getElementById('progField').style.display = showProg ? '' : 'none';
+  if(showProg) filterProgsByBoard();
 }
 toggleRoleFields();
 function showRemapPh(id, name, role){
   document.getElementById('remapPhUserId').value = id;
   document.getElementById('remapPhUser').textContent = name + ' (' + role + ')';
   new bootstrap.Modal(document.getElementById('remapPhModal')).show();
+}
+function filterUsers(q){
+  q = q.toLowerCase();
+  document.querySelectorAll('#userTable tbody tr').forEach(function(row){
+    row.style.display = row.textContent.toLowerCase().includes(q) ? '' : 'none';
+  });
 }
 </script>"""
     return render_page(content, scripts, active_page="users", page_title="Manage Users")
