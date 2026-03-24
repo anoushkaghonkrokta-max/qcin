@@ -180,14 +180,25 @@ def totp_provisioning_uri(secret: str, username: str) -> str:
 def queue_email(programme_name: str, notification_type: str, to_email: str,
                 cc_email: str, sender_email: str, sender_password_enc: str,
                 ph: dict, smtp_host: str, smtp_port: int,
-                application_id: str = None, board_id: int = None):
-    """Resolve template + placeholders and add to email_queue."""
+                application_id: str = None, board_id: int = None,
+                stage_name: str = None):
+    """Resolve template + placeholders and add to email_queue.
+    Per-stage overrides take priority over programme-level templates."""
     conn = get_db()
-    tmpl = conn.execute(
-        "SELECT subject_line, email_body FROM email_templates "
-        "WHERE programme_name=? AND notification_type=?",
-        (programme_name, notification_type)
-    ).fetchone()
+    # Check per-stage override first
+    tmpl = None
+    if stage_name:
+        tmpl = conn.execute(
+            "SELECT subject_line, email_body FROM stage_email_override "
+            "WHERE programme_name=? AND stage_name=? AND notification_type=?",
+            (programme_name, stage_name, notification_type)
+        ).fetchone()
+    if not tmpl:
+        tmpl = conn.execute(
+            "SELECT subject_line, email_body FROM email_templates "
+            "WHERE programme_name=? AND notification_type=?",
+            (programme_name, notification_type)
+        ).fetchone()
     if not tmpl:
         conn.close()
         return
@@ -282,15 +293,33 @@ _HOLIDAYS = {
 }
 
 
+def _get_all_holidays():
+    """Return combined set of hardcoded + DB holidays."""
+    holidays = set(_HOLIDAYS)
+    try:
+        conn = get_db()
+        rows = conn.execute("SELECT holiday_date FROM holidays").fetchall()
+        conn.close()
+        for r in rows:
+            try:
+                holidays.add(date.fromisoformat(r[0]))
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return holidays
+
+
 def working_days_elapsed(start: str, end_d=None) -> int:
     """Working days from start (inclusive) to end (inclusive, default today)."""
     if end_d is None:
         end_d = date.today()
     s = datetime.strptime(start, "%Y-%m-%d").date() if isinstance(start, str) else start
+    all_holidays = _get_all_holidays()
     count = 0
     cur = s
     while cur <= end_d:
-        if cur.weekday() < 5 and cur not in _HOLIDAYS:
+        if cur.weekday() < 5 and cur not in all_holidays:
             count += 1
         cur += timedelta(days=1)
     return max(0, count - 1)  # days elapsed after start date
@@ -416,6 +445,29 @@ def init_db():
             programme_id INTEGER NOT NULL REFERENCES programmes(id),
             PRIMARY KEY (user_id, programme_id)
         );
+        CREATE TABLE IF NOT EXISTS holidays (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            holiday_date TEXT NOT NULL UNIQUE,
+            name         TEXT NOT NULL,
+            description  TEXT
+        );
+        CREATE TABLE IF NOT EXISTS saved_filters (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id     INTEGER NOT NULL REFERENCES users(id),
+            filter_name TEXT NOT NULL,
+            filter_json TEXT NOT NULL,
+            created_at  TEXT NOT NULL,
+            UNIQUE(user_id, filter_name)
+        );
+        CREATE TABLE IF NOT EXISTS stage_email_override (
+            id                INTEGER PRIMARY KEY AUTOINCREMENT,
+            programme_name    TEXT NOT NULL,
+            stage_name        TEXT NOT NULL,
+            notification_type TEXT NOT NULL,
+            subject_line      TEXT NOT NULL,
+            email_body        TEXT NOT NULL,
+            UNIQUE(programme_name, stage_name, notification_type)
+        );
     """)
     # Migrate existing DBs: add columns if absent
     for sql in [
@@ -425,9 +477,11 @@ def init_db():
         "ALTER TABLE users ADD COLUMN board_id INTEGER",
         "ALTER TABLE users ADD COLUMN force_password_reset INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE users ADD COLUMN totp_secret TEXT",
+        "ALTER TABLE users ADD COLUMN last_login TEXT",
         "ALTER TABLE case_tracking ADD COLUMN board_id INTEGER",
         "ALTER TABLE case_tracking ADD COLUMN cc_emails TEXT",
         "ALTER TABLE case_tracking ADD COLUMN suppress_until TEXT",
+        "ALTER TABLE case_tracking ADD COLUMN status TEXT NOT NULL DEFAULT 'Active'",
         "ALTER TABLE email_templates ADD COLUMN board_id INTEGER",
     ]:
         try:
@@ -788,6 +842,10 @@ def run_daily_check() -> dict:
                "skipped_milestone": 0, "errors": []}
 
     for case in cases:
+        # Skip closed/withdrawn/suspended cases
+        case_status = case.get("status", "Active")
+        if case_status and case_status != "Active":
+            continue
         if case["is_milestone"]:
             summary["skipped_milestone"] += 1
             continue
@@ -849,10 +907,58 @@ def run_daily_check() -> dict:
                 case["action_owner_email"], cc,
                 sender_email, sender_pw_enc, ph,
                 smtp_host, smtp_port,
-                case["application_id"], case.get("board_id")
+                case["application_id"], case.get("board_id"),
+                stage_name=case["current_stage"]
             )
             fire_webhook(f"notification_{ntype.lower()}", {**webhook_ph, "type": ntype})
             return True
+
+        def _escalate_to_ph():
+            """Email all Programme Heads mapped to this programme if TAT severely breached."""
+            escalation_threshold = int(get_app_setting("ph_escalation_days", "5"))
+            days_overdue = elapsed - tat
+            if days_overdue < escalation_threshold:
+                return
+            prog_row = conn.execute(
+                "SELECT id FROM programmes WHERE programme_name=?",
+                (case["programme_name"],)
+            ).fetchone()
+            if not prog_row:
+                return
+            ph_users = conn.execute(
+                """SELECT u.email, u.full_name FROM users u
+                   JOIN user_programme_map upm ON upm.user_id = u.id
+                   WHERE upm.programme_id=? AND u.role='program_head' AND u.email IS NOT NULL""",
+                (prog_row["id"],)
+            ).fetchall()
+            for ph_user in ph_users:
+                if not ph_user["email"]:
+                    continue
+                esc_ph = {**ph,
+                          "Action_Owner_Name": ph_user["full_name"] or ph_user["email"],
+                          "Days_Overdue": days_overdue}
+                subj = f"[ESCALATION] {case['organisation_name']} overdue {days_overdue}d — {case['current_stage']}"
+                body = (f"Dear {ph_user['full_name'] or 'Programme Head'},\n\n"
+                        f"This is an escalation notice.\n\n"
+                        f"Case: {case['organisation_name']} ({case['application_id']})\n"
+                        f"Programme: {case['programme_name']}\n"
+                        f"Stage: {case['current_stage']}\n"
+                        f"Days overdue: {days_overdue}\n\n"
+                        f"Immediate intervention may be required.\n\nQCI Notification Engine")
+                if sender_email:
+                    try:
+                        msg = MIMEMultipart()
+                        msg["From"] = sender_email
+                        msg["To"] = ph_user["email"]
+                        msg["Subject"] = subj
+                        msg.attach(MIMEText(body, "plain"))
+                        pw = decrypt_str(sender_pw_enc) if sender_pw_enc else ""
+                        with smtplib.SMTP(smtp_host, smtp_port, timeout=15) as s:
+                            s.starttls()
+                            s.login(sender_email, pw)
+                            s.sendmail(sender_email, [ph_user["email"]], msg.as_string())
+                    except Exception as e:
+                        log.warning("PH escalation failed: %s", e)
 
         # R1
         if r1_day > 0 and elapsed >= r1_day and not case["r1_sent"]:
@@ -891,12 +997,104 @@ def run_daily_check() -> dict:
                 conn.commit()
                 summary["followup"] += 1
 
+        # Escalation to Programme Head if severely overdue
+        if tat > 0 and elapsed > tat and case["overdue_sent"]:
+            _escalate_to_ph()
+
     conn.close()
     # Process queued emails
     q_result = process_email_queue()
     summary["emails_sent"] = q_result["sent"]
     summary["email_failures"] = q_result["failed"]
     return summary
+
+
+# ── Weekly digest ────────────────────────────────────────────────────────────
+def run_weekly_digest():
+    """Send a weekly summary email to board_ceo and board_admin users."""
+    conn = get_db()
+    today = date.today()
+    recipients = [dict(r) for r in conn.execute(
+        "SELECT u.*, b.board_name FROM users u LEFT JOIN boards b ON b.id=u.board_id "
+        "WHERE u.role IN ('board_ceo','board_admin','super_admin') AND u.email IS NOT NULL"
+    ).fetchall()]
+
+    for user in recipients:
+        bid = user["board_id"]
+        if user["role"] == "super_admin":
+            cases = [dict(r) for r in conn.execute(
+                "SELECT * FROM case_tracking WHERE (status='Active' OR status IS NULL)"
+            ).fetchall()]
+        else:
+            cases = [dict(r) for r in conn.execute(
+                "SELECT * FROM case_tracking WHERE board_id=? AND (status='Active' OR status IS NULL)", (bid,)
+            ).fetchall()]
+
+        if not cases:
+            continue
+
+        total = len(cases)
+        overdue = sum(1 for c in cases if not c["is_milestone"] and c["tat_days"] > 0
+                      and working_days_elapsed(c["stage_start_date"], today) >= c["tat_days"])
+        at_risk = sum(1 for c in cases if not c["is_milestone"] and c["tat_days"] > 0
+                      and working_days_elapsed(c["stage_start_date"], today) >= c["reminder2_day"]
+                      and working_days_elapsed(c["stage_start_date"], today) < c["tat_days"])
+        compliant = total - overdue - at_risk
+
+        body = (f"Weekly QCI Notification Engine Digest — {today.strftime('%d %b %Y')}\n\n"
+                f"Board: {user.get('board_name') or 'All Boards'}\n"
+                f"{'='*40}\n\n"
+                f"Total Active Cases  : {total}\n"
+                f"Overdue             : {overdue}\n"
+                f"At Risk             : {at_risk}\n"
+                f"On Track / Compliant: {compliant}\n\n")
+
+        # Top 5 most overdue
+        overdue_cases = [c for c in cases if not c["is_milestone"] and c["tat_days"] > 0
+                         and working_days_elapsed(c["stage_start_date"], today) >= c["tat_days"]]
+        overdue_cases.sort(key=lambda x: working_days_elapsed(x["stage_start_date"], today), reverse=True)
+        if overdue_cases:
+            body += "Top Overdue Cases:\n"
+            for c in overdue_cases[:5]:
+                days_late = working_days_elapsed(c["stage_start_date"], today) - c["tat_days"]
+                body += f"  • {c['organisation_name']} ({c['application_id']}) — {c['current_stage']} — {days_late}d late\n"
+            body += "\n"
+
+        body += "Log in to QCI Notify for full details.\n\nQCI Notification Engine (automated digest)"
+
+        # Get sender credentials from any programme in scope
+        cfg = None
+        if bid:
+            cfg = conn.execute(
+                "SELECT sender_email, sender_password, smtp_host, smtp_port "
+                "FROM programme_config WHERE board_id=? AND sender_email IS NOT NULL LIMIT 1", (bid,)
+            ).fetchone()
+        if not cfg:
+            cfg = conn.execute(
+                "SELECT sender_email, sender_password, smtp_host, smtp_port "
+                "FROM programme_config WHERE sender_email IS NOT NULL LIMIT 1"
+            ).fetchone()
+        if not cfg or not cfg["sender_email"]:
+            continue
+
+        try:
+            msg = MIMEMultipart()
+            msg["From"] = cfg["sender_email"]
+            msg["To"] = user["email"]
+            msg["Subject"] = f"[QCI Digest] Weekly Summary — {today.strftime('%d %b %Y')}"
+            msg.attach(MIMEText(body, "plain"))
+            pw = decrypt_str(cfg["sender_password"]) if cfg["sender_password"] else ""
+            smtp_host = cfg["smtp_host"] or "smtp.gmail.com"
+            smtp_port = cfg["smtp_port"] or 587
+            with smtplib.SMTP(smtp_host, smtp_port, timeout=15) as s:
+                s.starttls()
+                s.login(cfg["sender_email"], pw)
+                s.sendmail(cfg["sender_email"], [user["email"]], msg.as_string())
+            log.info("Weekly digest sent to %s", user["email"])
+        except Exception as e:
+            log.warning("Weekly digest failed for %s: %s", user["email"], e)
+
+    conn.close()
 
 
 # ── Case upsert helper ───────────────────────────────────────────────────────
@@ -1231,8 +1429,16 @@ th{white-space:nowrap}
     {% endif %}
     {% if user_role in ('board_ceo', 'program_head') %}
     <div class="nav-section" style="margin-top:8px">Analytics</div>
+    {% if user_role == 'board_ceo' %}
+    <a class="nav-link {{ 'active' if active_page=='ceo_dashboard' else '' }}" href="/ceo-dashboard">
+      <i class="bi bi-speedometer2"></i> CEO Dashboard
+    </a>
+    {% endif %}
     <a class="nav-link {{ 'active' if active_page=='reports' else '' }}" href="/reports">
       <i class="bi bi-bar-chart-line"></i> Reports &amp; Analytics
+    </a>
+    <a class="nav-link" href="/export-excel">
+      <i class="bi bi-file-earmark-excel"></i> Export Excel
     </a>
     <a class="nav-link {{ 'active' if active_page=='search' else '' }}" href="/search">
       <i class="bi bi-search"></i> Search Cases
@@ -1452,6 +1658,12 @@ def login():
                     flash("Invalid 2FA code.", "error")
                     return render_template_string(_LOGIN_PAGE, get_flashed_messages=gfm,
                                                   show_totp=True, prefill_user=username)
+            # Record last login
+            conn3 = get_db()
+            conn3.execute("UPDATE users SET last_login=? WHERE id=?",
+                         (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), user["id"]))
+            conn3.commit()
+            conn3.close()
             session["user_id"]   = user["id"]
             session["username"]  = user["username"]
             session["role"]      = user["role"]
@@ -1585,6 +1797,21 @@ def manage_users():
                              (generate_password_hash(new_pw), uid))
                 conn.commit()
                 flash("Password updated.", "success")
+        elif action == "remap_ph":
+            uid = request.form.get("remap_user_id")
+            if uid:
+                conn.execute("DELETE FROM user_programme_map WHERE user_id=?", (uid,))
+                prog_ids = request.form.getlist("programme_ids")
+                for pid in prog_ids:
+                    try:
+                        conn.execute(
+                            "INSERT OR IGNORE INTO user_programme_map (user_id, programme_id) VALUES (?,?)",
+                            (int(uid), int(pid))
+                        )
+                    except Exception:
+                        pass
+                conn.commit()
+                flash("Programme mapping updated.", "success")
 
     users = [dict(r) for r in conn.execute(
         """SELECT u.*, b.board_name FROM users u
@@ -1616,6 +1843,7 @@ def manage_users():
         if u["role"] == "program_head":
             progs = ph_prog_map.get(u["id"], [])
             prog_cell = ", ".join(progs) if progs else '<span style="color:#f59e0b;font-size:11px">No programmes mapped</span>'
+        last_login_cell = u.get("last_login") or '<span style="color:#94a3b8;font-size:11px">Never</span>'
         rows += f"""<tr>
           <td style="font-weight:600">{u['username']}</td>
           <td>{u['full_name'] or '—'}</td>
@@ -1623,9 +1851,12 @@ def manage_users():
           <td>{role_pill}</td>
           <td>{board_cell}</td>
           <td style="font-size:12px;color:#475569">{prog_cell or '—'}</td>
+          <td style="font-size:11px;color:#64748b">{last_login_cell}</td>
           <td>
             <button class="btn btn-sm btn-action btn-outline-secondary"
               onclick="showResetPw({u['id']}, '{u['username']}')">Reset PW</button>
+            <button class="btn btn-sm btn-action btn-outline-primary ms-1"
+              onclick="showRemapPh({u['id']}, '{u['username']}', '{u['role']}')">Remap</button>
             {"" if is_self else f'''<button class="btn btn-sm btn-action btn-outline-danger ms-1"
               onclick="confirmDeleteUser({u['id']}, '{u['username']}')">Delete</button>'''}
           </td>
@@ -1643,10 +1874,15 @@ def manage_users():
 <div class="row g-4">
   <div class="col-lg-8">
     <div class="card">
-      <div class="card-header">All Users</div>
+      <div class="card-header d-flex justify-content-between align-items-center">
+        <span>All Users</span>
+        <a href="/bulk-users" class="btn btn-sm btn-outline-primary">
+          <i class="bi bi-upload"></i> Bulk Import CSV
+        </a>
+      </div>
       <div style="overflow-x:auto">
         <table class="data-table">
-          <thead><tr><th>Username</th><th>Full Name</th><th>Email</th><th>Role</th><th>Board</th><th>Programmes</th><th>Actions</th></tr></thead>
+          <thead><tr><th>Username</th><th>Full Name</th><th>Email</th><th>Role</th><th>Board</th><th>Programmes</th><th>Last Login</th><th>Actions</th></tr></thead>
           <tbody>{rows}</tbody>
         </table>
       </div>
@@ -1723,6 +1959,32 @@ def manage_users():
   </div>
 </div>
 
+<!-- Programme Head Re-mapping Modal -->
+<div class="modal fade" id="remapPhModal" tabindex="-1">
+  <div class="modal-dialog modal-dialog-centered">
+    <div class="modal-content">
+      <div class="modal-header border-0">
+        <h6 class="modal-title"><i class="bi bi-diagram-3-fill" style="color:#166534"></i> Re-map Programmes — <span id="remapPhUser"></span></h6>
+        <button class="btn-close" data-bs-dismiss="modal"></button>
+      </div>
+      <form method="post">
+        <input type="hidden" name="action" value="remap_ph">
+        <input type="hidden" name="remap_user_id" id="remapPhUserId">
+        <div class="modal-body pt-0">
+          <p style="font-size:12px;color:#64748b">Select all programmes this user should have access to (hold Ctrl/Cmd for multiple):</p>
+          <select class="form-select" name="programme_ids" id="remapProgSelect" multiple size="7">
+            {prog_opts_by_board}
+          </select>
+        </div>
+        <div class="modal-footer border-0">
+          <button class="btn btn-sm btn-outline-secondary" data-bs-dismiss="modal">Cancel</button>
+          <button class="btn btn-sm btn-success" type="submit">Save Mapping</button>
+        </div>
+      </form>
+    </div>
+  </div>
+</div>
+
 <!-- Delete user modal -->
 <div class="modal fade" id="delUserModal" tabindex="-1">
   <div class="modal-dialog modal-dialog-centered modal-sm">
@@ -1760,18 +2022,348 @@ function toggleRoleFields(){
   document.getElementById('progField').style.display = role === 'program_head' ? '' : 'none';
 }
 toggleRoleFields();
+function showRemapPh(id, name, role){
+  document.getElementById('remapPhUserId').value = id;
+  document.getElementById('remapPhUser').textContent = name + ' (' + role + ')';
+  new bootstrap.Modal(document.getElementById('remapPhModal')).show();
+}
 </script>"""
     return render_page(content, scripts, active_page="users", page_title="Manage Users")
+
+
+@app.route("/bulk-users", methods=["GET", "POST"])
+@admin_required
+def bulk_users():
+    """Bulk import users from CSV. Columns: username, full_name, email, role, board_name, password"""
+    errors = []
+    created = 0
+    if request.method == "POST":
+        f = request.files.get("csv_file")
+        if not f:
+            flash("No file uploaded.", "error")
+            return redirect(url_for("bulk_users"))
+        conn = get_db()
+        boards = {r["board_name"].lower(): r["id"] for r in conn.execute("SELECT id, board_name FROM boards").fetchall()}
+        try:
+            content_bytes = f.read().decode("utf-8-sig")
+            reader = csv.DictReader(io.StringIO(content_bytes))
+            for i, row in enumerate(reader, 2):
+                uname = (row.get("username") or "").strip()
+                if not uname:
+                    errors.append(f"Row {i}: username missing")
+                    continue
+                role = (row.get("role") or "program_officer").strip()
+                if role not in ROLE_META:
+                    errors.append(f"Row {i} ({uname}): invalid role '{role}'")
+                    continue
+                board_name = (row.get("board_name") or "").strip().lower()
+                board_id = boards.get(board_name) if board_name else None
+                pw = (row.get("password") or "").strip() or secrets.token_hex(8)
+                try:
+                    conn.execute(
+                        "INSERT INTO users (username, password_hash, role, full_name, email, board_id) VALUES (?,?,?,?,?,?)",
+                        (uname, generate_password_hash(pw), role,
+                         (row.get("full_name") or "").strip(),
+                         (row.get("email") or "").strip() or None,
+                         board_id)
+                    )
+                    created += 1
+                except Exception as e:
+                    errors.append(f"Row {i} ({uname}): {e}")
+            conn.commit()
+        except Exception as e:
+            errors.append(f"File error: {e}")
+        conn.close()
+        if created:
+            flash(f"{created} user(s) imported successfully.", "success")
+        for err in errors[:10]:
+            flash(err, "error")
+        return redirect(url_for("bulk_users"))
+
+    # Build CSV template download
+    template_csv = "username,full_name,email,role,board_name,password\njohn_doe,John Doe,john@org.com,program_officer,NABH,changeme123\n"
+    content = f"""
+<div class="row g-4">
+  <div class="col-lg-7">
+    <div class="card">
+      <div class="card-header"><i class="bi bi-upload" style="color:var(--accent)"></i> Bulk User Import via CSV</div>
+      <div class="card-body p-4">
+        <p style="font-size:13px;color:#64748b">Upload a CSV with columns: <code>username</code>, <code>full_name</code>, <code>email</code>, <code>role</code>, <code>board_name</code>, <code>password</code>.</p>
+        <form method="post" enctype="multipart/form-data">
+          <div class="upload-zone mb-3" onclick="document.getElementById('userCsvFile').click()">
+            <i class="bi bi-file-earmark-person" style="font-size:32px;color:#94a3b8"></i>
+            <div style="font-size:13px;color:#64748b;margin-top:8px">Click to select CSV file</div>
+            <div id="csvFileName" style="font-size:12px;color:var(--accent);margin-top:4px"></div>
+          </div>
+          <input type="file" id="userCsvFile" name="csv_file" accept=".csv" style="display:none"
+                 onchange="document.getElementById('csvFileName').textContent=this.files[0].name">
+          <button type="submit" class="btn btn-primary w-100">
+            <i class="bi bi-upload"></i> Import Users
+          </button>
+        </form>
+      </div>
+    </div>
+  </div>
+  <div class="col-lg-5">
+    <div class="card">
+      <div class="card-header">Valid Roles &amp; Boards</div>
+      <div class="card-body p-4" style="font-size:13px">
+        <strong>Roles:</strong> <code>super_admin</code>, <code>board_admin</code>, <code>board_ceo</code>, <code>program_head</code>, <code>program_officer</code><br><br>
+        <strong>Boards:</strong> NABH, NABL, NABCB, NABET (or any board you have added)<br><br>
+        <strong>Notes:</strong>
+        <ul style="font-size:12px;color:#64748b">
+          <li>If password is blank, a random password is set. Ask users to reset on first login.</li>
+          <li>Duplicate usernames will be skipped with an error.</li>
+          <li>Programme mappings for programme_head must be done separately via Remap.</li>
+        </ul>
+        <a href="data:text/csv;charset=utf-8,{template_csv}" download="user_import_template.csv"
+           class="btn btn-sm btn-outline-secondary w-100 mt-2">
+          <i class="bi bi-download"></i> Download Template CSV
+        </a>
+      </div>
+    </div>
+  </div>
+</div>"""
+    return render_page(content, active_page="users", page_title="Bulk User Import",
+                       page_crumb='<a href="/users">Manage Users</a> / Bulk Import')
+
+
+@app.route("/ceo-dashboard")
+@login_required
+def ceo_dashboard():
+    """Board CEO / super_admin high-level KPI dashboard."""
+    if session.get("role") not in ("board_ceo", "super_admin", "board_admin"):
+        return redirect(url_for("dashboard"))
+    conn = get_db()
+    bid = user_board_id()
+    today = date.today()
+
+    if bid is not None:
+        cases = [dict(r) for r in conn.execute(
+            "SELECT * FROM case_tracking WHERE board_id=? AND (status='Active' OR status IS NULL)", (bid,)
+        ).fetchall()]
+        programmes = [dict(r) for r in conn.execute(
+            "SELECT * FROM programmes WHERE board_id=? ORDER BY programme_name", (bid,)
+        ).fetchall()]
+    else:
+        cases = [dict(r) for r in conn.execute(
+            "SELECT * FROM case_tracking WHERE (status='Active' OR status IS NULL)"
+        ).fetchall()]
+        programmes = [dict(r) for r in conn.execute(
+            "SELECT p.*, b.board_name FROM programmes p JOIN boards b ON b.id=p.board_id ORDER BY b.board_name, p.programme_name"
+        ).fetchall()]
+    conn.close()
+
+    for c in cases:
+        c["days_elapsed"] = working_days_elapsed(c["stage_start_date"], today)
+
+    total_cases = len(cases)
+    overdue = [c for c in cases if not c["is_milestone"] and c["tat_days"] > 0 and c["days_elapsed"] >= c["tat_days"]]
+    at_risk  = [c for c in cases if not c["is_milestone"] and c["tat_days"] > 0
+                and c["days_elapsed"] >= c["reminder2_day"] and c["days_elapsed"] < c["tat_days"]]
+    sla_eligible = [c for c in cases if not c["is_milestone"] and c["tat_days"] > 0]
+    sla_within = len([c for c in sla_eligible if c["days_elapsed"] < c["tat_days"]])
+    sla_pct = int(sla_within / len(sla_eligible) * 100) if sla_eligible else 100
+    sla_color = "#00984C" if sla_pct >= 80 else ("#d97706" if sla_pct >= 60 else "#dc2626")
+    avg_elapsed = int(sum(c["days_elapsed"] for c in sla_eligible) / len(sla_eligible)) if sla_eligible else 0
+
+    # Per-programme SLA scorecard
+    prog_sla = {}
+    for c in cases:
+        pn = c["programme_name"]
+        if pn not in prog_sla:
+            prog_sla[pn] = {"total": 0, "overdue": 0, "at_risk": 0, "on_track": 0, "eligible": 0, "within": 0}
+        prog_sla[pn]["total"] += 1
+        if c["is_milestone"] or c["tat_days"] == 0:
+            continue
+        prog_sla[pn]["eligible"] += 1
+        if c["days_elapsed"] >= c["tat_days"]:
+            prog_sla[pn]["overdue"] += 1
+        elif c["days_elapsed"] >= c["reminder2_day"]:
+            prog_sla[pn]["at_risk"] += 1
+        else:
+            prog_sla[pn]["on_track"] += 1
+            prog_sla[pn]["within"] += 1
+        if c["days_elapsed"] < c["tat_days"]:
+            prog_sla[pn]["within"] += 0  # already counted above via on_track
+
+    # Fix within count (should be on_track)
+    for pn in prog_sla:
+        prog_sla[pn]["within"] = prog_sla[pn]["on_track"]
+
+    scorecard_rows = ""
+    chart_labels = []
+    chart_sla = []
+    chart_overdue = []
+    for pn, ps in sorted(prog_sla.items()):
+        pct = int(ps["within"] / ps["eligible"] * 100) if ps["eligible"] else 100
+        pct_color = "#00984C" if pct >= 80 else ("#d97706" if pct >= 60 else "#dc2626")
+        chart_labels.append(pn[:30])
+        chart_sla.append(pct)
+        chart_overdue.append(ps["overdue"])
+        scorecard_rows += f"""<tr>
+  <td style="font-weight:600;font-size:12.5px">{pn}</td>
+  <td class="text-center">{ps['total']}</td>
+  <td class="text-center" style="color:#00984C;font-weight:600">{ps['on_track']}</td>
+  <td class="text-center" style="color:#d97706;font-weight:600">{ps['at_risk']}</td>
+  <td class="text-center" style="color:#dc2626;font-weight:600">{ps['overdue']}</td>
+  <td>
+    <div class="d-flex align-items-center gap-2">
+      <div style="flex:1;height:8px;background:#f1f5f9;border-radius:4px;overflow:hidden">
+        <div style="width:{pct}%;height:100%;background:{pct_color};border-radius:4px"></div>
+      </div>
+      <span style="font-size:12px;font-weight:700;color:{pct_color};width:36px">{pct}%</span>
+    </div>
+  </td>
+</tr>"""
+
+    # Monthly trend (last 6 months cases created)
+    # Use stage_history first_entry as proxy for case creation
+    monthly_labels = []
+    monthly_new = []
+    for i in range(5, -1, -1):
+        d = today.replace(day=1) - timedelta(days=i * 28)
+        monthly_labels.append(d.strftime("%b %Y"))
+        ym = d.strftime("%Y-%m")
+        cnt = sum(1 for c in cases if c["stage_start_date"] and c["stage_start_date"][:7] == ym)
+        monthly_new.append(cnt)
+
+    # Assessor delay analysis
+    owner_delay = {}
+    for c in cases:
+        if not c["is_milestone"] and c["tat_days"] > 0 and c["days_elapsed"] >= c["tat_days"]:
+            ot = c.get("owner_type") or "Unassigned"
+            owner_delay[ot] = owner_delay.get(ot, 0) + 1
+
+    delay_rows = "".join(
+        f'<tr><td style="font-weight:500">{ot}</td>'
+        f'<td class="text-center"><span class="pill pill-danger">{cnt}</span></td></tr>'
+        for ot, cnt in sorted(owner_delay.items(), key=lambda x: -x[1])
+    ) or '<tr><td colspan="2" style="text-align:center;color:#94a3b8;padding:20px">No overdue cases</td></tr>'
+
+    chart_labels_json = json.dumps(chart_labels)
+    chart_sla_json = json.dumps(chart_sla)
+    chart_overdue_json = json.dumps(chart_overdue)
+    monthly_labels_json = json.dumps(monthly_labels)
+    monthly_new_json = json.dumps(monthly_new)
+
+    content = f"""
+<div class="row g-3 mb-4">
+  <div class="col-6 col-md-3">
+    <div class="stat-card">
+      <div class="d-flex justify-content-between">
+        <div><div class="stat-val">{total_cases}</div><div class="stat-label">Total Active Cases</div></div>
+        <div class="stat-icon" style="background:#e1eef8;color:#003356"><i class="bi bi-folder2-open"></i></div>
+      </div>
+    </div>
+  </div>
+  <div class="col-6 col-md-3">
+    <div class="stat-card">
+      <div class="d-flex justify-content-between">
+        <div><div class="stat-val" style="color:{sla_color}">{sla_pct}%</div><div class="stat-label">Overall SLA Compliance</div></div>
+        <div class="stat-icon" style="background:{sla_color}15;color:{sla_color}"><i class="bi bi-shield-check"></i></div>
+      </div>
+    </div>
+  </div>
+  <div class="col-6 col-md-3">
+    <div class="stat-card">
+      <div class="d-flex justify-content-between">
+        <div><div class="stat-val" style="color:#dc2626">{len(overdue)}</div><div class="stat-label">Overdue Cases</div></div>
+        <div class="stat-icon" style="background:#fee2e2;color:#dc2626"><i class="bi bi-exclamation-triangle-fill"></i></div>
+      </div>
+    </div>
+  </div>
+  <div class="col-6 col-md-3">
+    <div class="stat-card">
+      <div class="d-flex justify-content-between">
+        <div><div class="stat-val" style="color:var(--accent)">{avg_elapsed}d</div><div class="stat-label">Avg Days in Stage</div></div>
+        <div class="stat-icon" style="background:#d0f0ff;color:var(--accent)"><i class="bi bi-clock-history"></i></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="row g-3 mb-4">
+  <div class="col-lg-7">
+    <div class="card">
+      <div class="card-header"><i class="bi bi-shield-fill-check" style="color:var(--accent)"></i> Per-Programme SLA Scorecard</div>
+      <div style="overflow-x:auto">
+        <table class="data-table">
+          <thead><tr><th>Programme</th><th style="text-align:center">Cases</th>
+            <th style="text-align:center">On Track</th><th style="text-align:center">At Risk</th>
+            <th style="text-align:center">Overdue</th><th>SLA %</th></tr></thead>
+          <tbody>{scorecard_rows if scorecard_rows else '<tr><td colspan="6" style="text-align:center;color:#94a3b8;padding:20px">No data</td></tr>'}</tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+  <div class="col-lg-5">
+    <div class="card h-100">
+      <div class="card-header"><i class="bi bi-bar-chart-fill" style="color:#7c3aed"></i> Overdue by Owner Type</div>
+      <div class="card-body">
+        <table class="data-table">
+          <thead><tr><th>Owner Type</th><th style="text-align:center">Overdue Cases</th></tr></thead>
+          <tbody>{delay_rows}</tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="row g-3">
+  <div class="col-lg-8">
+    <div class="card">
+      <div class="card-header"><i class="bi bi-bar-chart-line" style="color:var(--accent)"></i> Programme SLA Compliance (%)</div>
+      <div class="card-body"><canvas id="slaChart" height="180"></canvas></div>
+    </div>
+  </div>
+  <div class="col-lg-4">
+    <div class="card">
+      <div class="card-header"><i class="bi bi-graph-up" style="color:#00984C"></i> Monthly New Cases (6 mo)</div>
+      <div class="card-body"><canvas id="trendChart" height="180"></canvas></div>
+    </div>
+  </div>
+</div>
+"""
+    scripts = f"""
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+<script>
+(function(){{
+  var labels = {chart_labels_json};
+  var slaData = {chart_sla_json};
+  var colors = slaData.map(v => v>=80?'#00984C':v>=60?'#d97706':'#dc2626');
+  new Chart(document.getElementById('slaChart'), {{
+    type: 'bar',
+    data: {{ labels: labels, datasets: [{{
+      label: 'SLA %', data: slaData, backgroundColor: colors, borderRadius: 5
+    }}]}},
+    options: {{ plugins: {{ legend: {{ display: false }} }}, scales: {{ y: {{ min:0, max:100 }} }},
+      responsive: true }}
+  }});
+  var mLabels = {monthly_labels_json};
+  var mData = {monthly_new_json};
+  new Chart(document.getElementById('trendChart'), {{
+    type: 'line',
+    data: {{ labels: mLabels, datasets: [{{
+      label: 'New Cases', data: mData, borderColor:'#0094ca', backgroundColor:'rgba(0,148,202,.1)',
+      fill:true, tension:0.3, pointRadius:4
+    }}]}},
+    options: {{ plugins: {{ legend: {{ display: false }} }}, responsive: true }}
+  }});
+}})();
+</script>"""
+    return render_page(content, scripts, active_page="ceo_dashboard", page_title="CEO Dashboard")
 
 
 @app.route("/")
 @login_required
 def dashboard():
     conn = get_db()
-    prog_filter  = request.args.get("programme", "")
-    owner_filter = request.args.get("owner_type", "")
-    my_cases     = request.args.get("my_cases", "")
-    sort         = request.args.get("sort", "elapsed_desc")
+    prog_filter   = request.args.get("programme", "")
+    owner_filter  = request.args.get("owner_type", "")
+    my_cases      = request.args.get("my_cases", "")
+    sort          = request.args.get("sort", "elapsed_desc")
+    status_filter = request.args.get("status", "Active")  # default: only Active
 
     bid = user_board_id()
     ph_progs = user_programme_names()  # None unless program_head
@@ -1798,6 +2390,9 @@ def dashboard():
         else:
             base_q += " AND 1=0"  # no programmes mapped → no cases
 
+    if status_filter and status_filter != "All":
+        base_q += " AND (status=? OR (status IS NULL AND ?='Active'))"
+        base_params.extend([status_filter, status_filter])
     if prog_filter:
         base_q += " AND programme_name=?"
         base_params.append(prog_filter)
@@ -1867,8 +2462,13 @@ def dashboard():
             bg = colors.get(c["owner_type"], "#64748b")
             owner_type_badge = f'<span style="font-size:10px;padding:1px 7px;border-radius:4px;background:{bg}22;color:{bg};font-weight:600">{c["owner_type"]}</span> '
 
+        case_st = c.get("status") or "Active"
+        st_colors = {"Active": ("#00984C", "#d8f5e7"), "Closed": ("#64748b", "#f1f5f9"),
+                     "Withdrawn": ("#d97706", "#fef3c7"), "Suspended": ("#dc2626", "#fee2e2")}
+        st_fg, st_bg = st_colors.get(case_st, ("#64748b", "#f1f5f9"))
+        case_status_badge = f'<span style="font-size:10px;padding:1px 7px;border-radius:4px;background:{st_bg};color:{st_fg};font-weight:600">{case_st}</span>'
         rows_html += f"""<tr class="{tr_cls}">
-          <td class="id-cell">{c['application_id']}</td>
+          <td class="id-cell">{c['application_id']}<br>{case_status_badge}</td>
           <td><div style="font-weight:500;color:#1e293b">{c['organisation_name']}</div>
               <div style="font-size:11px;color:#94a3b8">{c['programme_name']}</div></td>
           <td><div style="font-size:13px">{c['current_stage']}</div>
@@ -1887,8 +2487,11 @@ def dashboard():
                onclick="openQuickAdvance({c['id']}, '{c['application_id']}', '{c['programme_name']}')">
                <i class="bi bi-arrow-right-circle"></i></button>
             <a href="/edit-case/{c['id']}" class="btn btn-sm btn-action btn-outline-primary me-1">Edit</a>
+            <button class="btn btn-sm btn-action btn-outline-warning me-1" title="Change Status"
+               onclick="openStatusModal({c['id']}, '{c['application_id']}', '{case_st}')">
+               <i class="bi bi-toggles"></i></button>
             <button class="btn btn-sm btn-action btn-outline-danger"
-              onclick="confirmDelete('/delete-case/{c['id']}', '{c['application_id']}')">Close</button>
+              onclick="confirmDelete('/delete-case/{c['id']}', '{c['application_id']}')">Delete</button>
           </td>
         </tr>"""
 
@@ -2142,15 +2745,43 @@ def dashboard():
   <a href="/?owner_type=Program+Officer">View PO</a>
 </div>"""
 
+    # Load saved filters for current user
+    conn2 = get_db()
+    saved_filters_list = [dict(r) for r in conn2.execute(
+        "SELECT id, filter_name, filter_json FROM saved_filters WHERE user_id=? ORDER BY filter_name",
+        (session["user_id"],)
+    ).fetchall()]
+    conn2.close()
+    saved_filter_opts = "".join(
+        f'<option value=\'{f["filter_json"]}\'>{f["filter_name"]} '
+        f'<a data-id="{f["id"]}" onclick="deleteFilter({f["id"]})">×</a></option>'
+        for f in saved_filters_list
+    )
+    saved_filter_btns = "".join(
+        f'<a href="/?{json.loads(f["filter_json"]).get("qs","")}" '
+        f'class="btn btn-sm btn-outline-secondary" style="font-size:12px">'
+        f'<i class="bi bi-bookmark-fill" style="color:#7c3aed"></i> {f["filter_name"]}</a>'
+        for f in saved_filters_list
+    )
+
     content = f"""
 {overdue_banner_html}
 {stat_cards}
 {analytics_section}
 
 <div class="card">
-  <div class="card-header d-flex justify-content-between align-items-center">
-    <span>Active Cases <span style="font-size:12px;font-weight:400;color:#94a3b8;margin-left:6px">{len(cases)} total</span></span>
-    <form method="get" class="d-flex gap-2 align-items-center flex-wrap">
+  <div class="card-header d-flex justify-content-between align-items-center flex-wrap gap-2">
+    <span>Cases <span style="font-size:12px;font-weight:400;color:#94a3b8;margin-left:6px">{len(cases)} shown</span>
+    {"&nbsp;" + saved_filter_btns if saved_filter_btns else ""}
+    </span>
+    <form method="get" class="d-flex gap-2 align-items-center flex-wrap" id="filterForm">
+      <select name="status" class="form-select form-select-sm" style="width:auto">
+        <option value="Active" {"selected" if status_filter=="Active" else ""}>Active</option>
+        <option value="Closed" {"selected" if status_filter=="Closed" else ""}>Closed</option>
+        <option value="Withdrawn" {"selected" if status_filter=="Withdrawn" else ""}>Withdrawn</option>
+        <option value="Suspended" {"selected" if status_filter=="Suspended" else ""}>Suspended</option>
+        <option value="All" {"selected" if status_filter=="All" else ""}>All Statuses</option>
+      </select>
       <select name="programme" class="form-select form-select-sm" style="width:auto">
         <option value="">All Programmes</option>
         {opt_programmes}
@@ -2168,7 +2799,10 @@ def dashboard():
         <option value="org_asc"      {"selected" if sort=="org_asc" else ""}>Organisation</option>
       </select>
       <button class="btn btn-sm btn-primary" type="submit">Filter</button>
-      {"" if not (prog_filter or owner_filter) else '<a class="btn btn-sm btn-outline-secondary" href="/">Clear</a>'}
+      <button type="button" class="btn btn-sm btn-outline-secondary" onclick="saveCurrentFilter()" title="Save this filter">
+        <i class="bi bi-bookmark-plus"></i>
+      </button>
+      {"" if not (prog_filter or owner_filter or status_filter not in ("Active","")) else '<a class="btn btn-sm btn-outline-secondary" href="/">Clear</a>'}
     </form>
   </div>
   <div style="overflow-x:auto">
@@ -2250,6 +2884,54 @@ def dashboard():
   </div>
 </div>
 
+<!-- Case Status Change Modal -->
+<div class="modal fade" id="statusModal" tabindex="-1">
+  <div class="modal-dialog modal-dialog-centered modal-sm">
+    <div class="modal-content">
+      <div class="modal-header border-0">
+        <h6 class="modal-title"><i class="bi bi-toggles" style="color:#7c3aed"></i> Change Case Status</h6>
+        <button class="btn-close" data-bs-dismiss="modal"></button>
+      </div>
+      <form method="post" action="/update-case-status">
+        <input type="hidden" name="case_id" id="sc_case_id">
+        <div class="modal-body pt-0">
+          <div style="font-size:13px;color:#64748b;margin-bottom:12px">Case: <strong id="sc_app_id"></strong></div>
+          <select class="form-select" name="new_status" id="sc_status_select">
+            <option value="Active">Active</option>
+            <option value="Closed">Closed</option>
+            <option value="Withdrawn">Withdrawn</option>
+            <option value="Suspended">Suspended</option>
+          </select>
+        </div>
+        <div class="modal-footer border-0">
+          <button class="btn btn-sm btn-outline-secondary" data-bs-dismiss="modal">Cancel</button>
+          <button class="btn btn-sm btn-primary" type="submit">Update Status</button>
+        </div>
+      </form>
+    </div>
+  </div>
+</div>
+
+<!-- Save Filter Modal -->
+<div class="modal fade" id="saveFilterModal" tabindex="-1">
+  <div class="modal-dialog modal-dialog-centered modal-sm">
+    <div class="modal-content">
+      <div class="modal-header border-0">
+        <h6 class="modal-title"><i class="bi bi-bookmark-plus" style="color:#7c3aed"></i> Save Filter</h6>
+        <button class="btn-close" data-bs-dismiss="modal"></button>
+      </div>
+      <div class="modal-body pt-0">
+        <label class="form-label">Filter name</label>
+        <input type="text" class="form-control" id="filterNameInput" placeholder="e.g. My NABH Overdue">
+      </div>
+      <div class="modal-footer border-0">
+        <button class="btn btn-sm btn-outline-secondary" data-bs-dismiss="modal">Cancel</button>
+        <button class="btn btn-sm btn-primary" onclick="confirmSaveFilter()">Save</button>
+      </div>
+    </div>
+  </div>
+</div>
+
 <!-- Run check result toast -->
 <div id="runToast" class="toast qci-toast" role="alert" style="position:fixed;bottom:24px;right:24px;z-index:9999;min-width:320px">
   <div class="toast-header">
@@ -2273,9 +2955,35 @@ def dashboard():
 
     scripts = """<script>
 function confirmDelete(url, appId){
-  document.getElementById('deleteModalMsg').textContent = 'This will close case ' + appId + '.';
+  document.getElementById('deleteModalMsg').textContent = 'Delete case ' + appId + '? This cannot be undone.';
   document.getElementById('deleteConfirmBtn').href = url;
   new bootstrap.Modal(document.getElementById('deleteModal')).show();
+}
+function openStatusModal(caseId, appId, currentStatus){
+  document.getElementById('sc_case_id').value = caseId;
+  document.getElementById('sc_app_id').textContent = appId;
+  document.getElementById('sc_status_select').value = currentStatus;
+  new bootstrap.Modal(document.getElementById('statusModal')).show();
+}
+function saveCurrentFilter(){
+  new bootstrap.Modal(document.getElementById('saveFilterModal')).show();
+}
+function confirmSaveFilter(){
+  var name = document.getElementById('filterNameInput').value.trim();
+  if(!name){ alert('Please enter a name.'); return; }
+  var form = document.getElementById('filterForm');
+  var data = new FormData(form);
+  var qs = new URLSearchParams(data).toString();
+  fetch('/save-filter', {method:'POST',headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({name: name, qs: qs})
+  }).then(r=>r.json()).then(d=>{
+    if(d.ok){ bootstrap.Modal.getInstance(document.getElementById('saveFilterModal')).hide(); location.reload(); }
+    else { alert(d.error || 'Error saving filter'); }
+  });
+}
+function deleteFilter(id){
+  if(!confirm('Delete this saved filter?')) return;
+  fetch('/delete-filter/'+id, {method:'POST'}).then(()=>location.reload());
 }
 document.getElementById('runBtn').addEventListener('click', function(){
   var btn = this;
@@ -2940,6 +3648,58 @@ def delete_case(case_id):
     return redirect(url_for("dashboard"))
 
 
+@app.route("/update-case-status", methods=["POST"])
+@login_required
+def update_case_status():
+    case_id = request.form.get("case_id")
+    new_status = request.form.get("new_status", "Active")
+    if new_status not in ("Active", "Closed", "Withdrawn", "Suspended"):
+        flash("Invalid status.", "error")
+        return redirect(url_for("dashboard"))
+    conn = get_db()
+    row = conn.execute("SELECT application_id FROM case_tracking WHERE id=?", (case_id,)).fetchone()
+    if row:
+        conn.execute("UPDATE case_tracking SET status=? WHERE id=?", (new_status, case_id))
+        conn.commit()
+        log_audit("status_change", row["application_id"], f"Status → {new_status}",
+                  session.get("full_name") or session.get("username", ""), user_board_id())
+        flash(f"Case {row['application_id']} status updated to {new_status}.", "success")
+    conn.close()
+    return redirect(url_for("dashboard"))
+
+
+@app.route("/save-filter", methods=["POST"])
+@login_required
+def save_filter():
+    data = request.get_json()
+    if not data or not data.get("name"):
+        return jsonify({"ok": False, "error": "Name required"})
+    conn = get_db()
+    try:
+        conn.execute(
+            "INSERT OR REPLACE INTO saved_filters (user_id, filter_name, filter_json, created_at) VALUES (?,?,?,?)",
+            (session["user_id"], data["name"][:60],
+             json.dumps({"qs": data.get("qs", "")}),
+             datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+        )
+        conn.commit()
+        conn.close()
+        return jsonify({"ok": True})
+    except Exception as e:
+        conn.close()
+        return jsonify({"ok": False, "error": str(e)})
+
+
+@app.route("/delete-filter/<int:filter_id>", methods=["POST"])
+@login_required
+def delete_filter(filter_id):
+    conn = get_db()
+    conn.execute("DELETE FROM saved_filters WHERE id=? AND user_id=?", (filter_id, session["user_id"]))
+    conn.commit()
+    conn.close()
+    return jsonify({"ok": True})
+
+
 @app.route("/settings", methods=["GET", "POST"])
 @board_admin_required
 def settings():
@@ -3542,6 +4302,20 @@ def email_templates_page():
                 )
             conn.commit()
             flash("Template saved.", "success")
+        elif action == "save_stage_override":
+            conn.execute(
+                "INSERT OR REPLACE INTO stage_email_override "
+                "(programme_name, stage_name, notification_type, subject_line, email_body) VALUES (?,?,?,?,?)",
+                (request.form["programme_name"], request.form["stage_name"],
+                 request.form["notification_type"],
+                 request.form["subject_line"], request.form["email_body"]),
+            )
+            conn.commit()
+            flash(f"Stage override saved for '{request.form['stage_name']}'.", "success")
+        elif action == "delete_stage_override":
+            conn.execute("DELETE FROM stage_email_override WHERE id=?", (request.form["override_id"],))
+            conn.commit()
+            flash("Stage override deleted.", "success")
 
     et_bid = user_board_id()
     if et_bid is not None:
@@ -3553,6 +4327,18 @@ def email_templates_page():
             "SELECT programme_name FROM programmes WHERE board_id=? ORDER BY programme_name",
             (et_bid,)
         ).fetchall()]
+        stage_overrides = [dict(r) for r in conn.execute(
+            "SELECT seo.* FROM stage_email_override seo "
+            "JOIN programmes p ON seo.programme_name = p.programme_name "
+            "WHERE p.board_id=? ORDER BY seo.programme_name, seo.stage_name",
+            (et_bid,)
+        ).fetchall()]
+        stages_rows = conn.execute(
+            "SELECT DISTINCT programme_name, stage_name FROM programme_config "
+            "WHERE programme_name IN (SELECT programme_name FROM programmes WHERE board_id=?) "
+            "ORDER BY programme_name, stage_order",
+            (et_bid,)
+        ).fetchall()
     else:
         templates = [dict(r) for r in conn.execute(
             "SELECT * FROM email_templates ORDER BY programme_name, notification_type"
@@ -3560,7 +4346,18 @@ def email_templates_page():
         programmes = [r[0] for r in conn.execute(
             "SELECT DISTINCT programme_name FROM programme_config ORDER BY programme_name"
         ).fetchall()]
+        stage_overrides = [dict(r) for r in conn.execute(
+            "SELECT * FROM stage_email_override ORDER BY programme_name, stage_name"
+        ).fetchall()]
+        stages_rows = conn.execute(
+            "SELECT DISTINCT programme_name, stage_name FROM programme_config ORDER BY programme_name, stage_order"
+        ).fetchall()
     conn.close()
+
+    stages_by_prog = {}
+    for _r in stages_rows:
+        stages_by_prog.setdefault(_r[0], []).append(_r[1])
+    stages_json = json.dumps(stages_by_prog)
 
     PLACEHOLDER_HELP = (
         "{{Organisation_Name}}, {{Stage_Name}}, {{Action_Owner_Name}}, "
@@ -3614,6 +4411,32 @@ def email_templates_page():
 
     prog_opts = "".join(f'<option value="{p}">{p}</option>' for p in programmes)
 
+    # ── Stage override rows ────────────────────────────────────────────────────
+    sov_rows = ""
+    for sov in stage_overrides:
+        safe_subj = sov['subject_line'].replace('"', '&quot;')
+        sov_rows += f"""<tr>
+  <td style="font-weight:500">{sov['programme_name']}</td>
+  <td>{sov['stage_name']}</td>
+  <td><span class="badge" style="background:#ede9fe;color:#7c3aed">{sov['notification_type']}</span></td>
+  <td style="font-size:12px;max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{sov['subject_line']}</td>
+  <td>
+    <button class="btn btn-xs btn-outline-primary" style="font-size:11px;padding:2px 8px"
+            onclick="editOverride({sov['id']},'{sov['programme_name'].replace(chr(39),'&#39;')}','{sov['stage_name'].replace(chr(39),'&#39;')}','{sov['notification_type']}','{safe_subj}',this)">
+      <i class="bi bi-pencil"></i>
+    </button>
+    <form method="post" style="display:inline" onsubmit="return confirm('Delete this stage override?')">
+      <input type="hidden" name="action" value="delete_stage_override">
+      <input type="hidden" name="override_id" value="{sov['id']}">
+      <button type="submit" class="btn btn-xs btn-outline-danger" style="font-size:11px;padding:2px 8px">
+        <i class="bi bi-trash"></i>
+      </button>
+    </form>
+  </td>
+</tr>"""
+    if not sov_rows:
+        sov_rows = '<tr><td colspan="5" style="text-align:center;color:#94a3b8;padding:24px">No stage-specific overrides yet.</td></tr>'
+
     ph_chips = " ".join(
         f'<span class="ph-chip" onclick="insertPH(this.textContent)">{{{{{p}}}}}</span>'
         for p in ["Organisation_Name","Stage_Name","Action_Owner_Name","Days_Remaining",
@@ -3621,6 +4444,82 @@ def email_templates_page():
     )
 
     content = f"""
+<!-- ── Stage-level overrides ─────────────────────────────────────────────── -->
+<div class="card mb-4">
+  <div class="card-header d-flex justify-content-between align-items-center">
+    <span><i class="bi bi-layers" style="color:#7c3aed"></i> Per-Stage Template Overrides
+      <span style="font-size:12px;color:#94a3b8;font-weight:400;margin-left:8px">
+        — override a programme template for a specific stage</span>
+    </span>
+    <button class="btn btn-sm btn-outline-primary" data-bs-toggle="collapse"
+            data-bs-target="#stageOverrideForm">
+      <i class="bi bi-plus-circle"></i> Add Override
+    </button>
+  </div>
+
+  <!-- Add/Edit form (collapsed by default) -->
+  <div id="stageOverrideForm" class="collapse">
+    <div class="card-body border-bottom" style="background:#f8fafc">
+      <form method="post" id="overrideForm">
+        <input type="hidden" name="action" value="save_stage_override">
+        <input type="hidden" name="override_edit_id" id="overrideEditId" value="">
+        <div class="row g-3">
+          <div class="col-md-3">
+            <label class="form-label">Programme</label>
+            <select class="form-select form-select-sm" name="programme_name" id="sovProg" onchange="loadSovStages()" required>
+              <option value="">— select —</option>
+              {prog_opts}
+            </select>
+          </div>
+          <div class="col-md-3">
+            <label class="form-label">Stage</label>
+            <select class="form-select form-select-sm" name="stage_name" id="sovStage" required>
+              <option value="">— select programme first —</option>
+            </select>
+          </div>
+          <div class="col-md-2">
+            <label class="form-label">Notification Type</label>
+            <select class="form-select form-select-sm" name="notification_type" required>
+              <option value="R1">R1 — Reminder 1</option>
+              <option value="R2">R2 — Reminder 2</option>
+              <option value="Overdue">Overdue</option>
+              <option value="Followup">Followup</option>
+            </select>
+          </div>
+          <div class="col-md-4">
+            <label class="form-label">Subject Line</label>
+            <input type="text" class="form-control form-control-sm" name="subject_line" id="sovSubject" required>
+          </div>
+          <div class="col-12">
+            <label class="form-label">Email Body</label>
+            <textarea class="form-control form-control-sm" name="email_body" id="sovBody"
+                      rows="8" style="font-family:monospace;font-size:12px" required></textarea>
+          </div>
+          <div class="col-12">
+            <button type="submit" class="btn btn-sm btn-primary">
+              <i class="bi bi-save"></i> Save Stage Override
+            </button>
+            <button type="button" class="btn btn-sm btn-outline-secondary ms-2"
+                    onclick="document.getElementById('overrideForm').reset();document.getElementById('stageOverrideForm').classList.remove('show')">
+              Cancel
+            </button>
+          </div>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- Existing overrides table -->
+  <div style="overflow-x:auto">
+    <table class="data-table">
+      <thead><tr>
+        <th>Programme</th><th>Stage</th><th>Type</th><th>Subject</th><th>Actions</th>
+      </tr></thead>
+      <tbody>{sov_rows}</tbody>
+    </table>
+  </div>
+</div>
+
 <div class="row g-4">
   <div class="col-xl-8">
 
@@ -3673,17 +4572,44 @@ def email_templates_page():
   </div>
 </div>
 """
-    scripts = """<script>
-function insertPH(text){
-  navigator.clipboard.writeText(text).then(function(){
+    scripts = f"""<script>
+var _STAGES_BY_PROG = {stages_json};
+
+function insertPH(text){{
+  navigator.clipboard.writeText(text).then(function(){{
     var t = document.createElement('div');
     t.className = 'toast qci-toast show align-items-center text-white bg-primary border-0';
     t.style.cssText = 'position:fixed;bottom:24px;right:24px;z-index:9999;min-width:220px';
     t.innerHTML = '<div class="d-flex"><div class="toast-body">Copied: '+text+'</div></div>';
     document.body.appendChild(t);
-    setTimeout(function(){ t.remove(); }, 2000);
-  });
-}
+    setTimeout(function(){{ t.remove(); }}, 2000);
+  }});
+}}
+
+function loadSovStages(){{
+  var prog = document.getElementById('sovProg').value;
+  var sel = document.getElementById('sovStage');
+  sel.innerHTML = '';
+  var stages = _STAGES_BY_PROG[prog] || [];
+  if(!stages.length){{ sel.innerHTML='<option value="">— no stages —</option>'; return; }}
+  stages.forEach(function(s){{
+    var o = document.createElement('option'); o.value=s; o.textContent=s; sel.appendChild(o);
+  }});
+}}
+
+function editOverride(id, prog, stage, notifType, subject, btn){{
+  // populate form and expand
+  document.getElementById('overrideEditId').value = id;
+  document.getElementById('sovProg').value = prog;
+  loadSovStages();
+  document.getElementById('sovStage').value = stage;
+  document.querySelector('#overrideForm select[name=notification_type]').value = notifType;
+  document.getElementById('sovSubject').value = subject;
+  // expand panel
+  var panel = document.getElementById('stageOverrideForm');
+  panel.classList.add('show');
+  panel.scrollIntoView({{behavior:'smooth', block:'nearest'}});
+}}
 </script>"""
     return render_page(content, scripts, active_page="templates",
                        page_title="Email Templates")
@@ -4672,12 +5598,46 @@ def system_settings():
             conn.close()
             flash("User will be required to reset password on next login.", "success")
 
+        elif action == "add_holiday":
+            hdate = request.form.get("holiday_date", "").strip()
+            hname = request.form.get("holiday_name", "").strip()
+            if hdate and hname:
+                conn = get_db()
+                try:
+                    conn.execute("INSERT INTO holidays (holiday_date, name) VALUES (?,?)", (hdate, hname))
+                    conn.commit()
+                    flash(f"Holiday '{hname}' on {hdate} added.", "success")
+                except Exception as e:
+                    flash(f"Error: {e}", "error")
+                conn.close()
+
+        elif action == "delete_holiday":
+            hid = request.form.get("holiday_id")
+            conn = get_db()
+            conn.execute("DELETE FROM holidays WHERE id=?", (hid,))
+            conn.commit()
+            conn.close()
+            flash("Holiday removed.", "success")
+
+        elif action == "save_digest":
+            set_app_setting("digest_enabled", "1" if request.form.get("digest_enabled") else "0")
+            set_app_setting("ph_escalation_days", request.form.get("ph_escalation_days", "5"))
+            flash("Notification settings saved.", "success")
+            try:
+                scheduler.reschedule_job("weekly_digest", trigger="cron",
+                                         day_of_week="mon", hour=8, minute=0)
+            except Exception:
+                pass
+
     sched_hour   = int(get_app_setting("sched_hour", "8"))
     sched_minute = int(get_app_setting("sched_minute", "0"))
     webhook_url  = get_app_setting("webhook_url", "")
+    digest_enabled = get_app_setting("digest_enabled", "1") == "1"
+    ph_escalation_days = get_app_setting("ph_escalation_days", "5")
 
     conn = get_db()
     users = [dict(r) for r in conn.execute("SELECT id, username, totp_secret, force_password_reset FROM users ORDER BY username").fetchall()]
+    holidays_list = [dict(r) for r in conn.execute("SELECT * FROM holidays ORDER BY holiday_date").fetchall()]
     conn.close()
 
     user_rows = ""
@@ -4713,6 +5673,16 @@ def system_settings():
         for h in range(24)
     )
 
+    holiday_rows = "".join(
+        f'<tr><td style="font-size:13px">{h["holiday_date"]}</td><td style="font-size:13px">{h["name"]}</td>'
+        f'<td><form method="post" class="d-inline">'
+        f'<input type="hidden" name="action" value="delete_holiday">'
+        f'<input type="hidden" name="holiday_id" value="{h["id"]}">'
+        f'<button class="btn btn-sm btn-action btn-outline-danger" type="submit"><i class="bi bi-trash"></i></button>'
+        f'</form></td></tr>'
+        for h in holidays_list
+    ) or '<tr><td colspan="3" style="text-align:center;color:#94a3b8;padding:16px;font-size:13px">No custom holidays added (built-in Indian holidays are always applied)</td></tr>'
+
     content = f"""
 <div class="row g-4">
   <div class="col-lg-5">
@@ -4739,6 +5709,36 @@ def system_settings():
       </div>
     </div>
 
+    <div class="card mb-4">
+      <div class="card-header"><i class="bi bi-envelope-at" style="color:#00984C"></i> Notifications &amp; Digest</div>
+      <div class="card-body p-4">
+        <form method="post">
+          <input type="hidden" name="action" value="save_digest">
+          <div class="mb-3 d-flex align-items-center gap-3">
+            <div class="form-check form-switch mb-0">
+              <input class="form-check-input" type="checkbox" name="digest_enabled"
+                     {"checked" if digest_enabled else ""} id="digestSwitch">
+              <label class="form-check-label" for="digestSwitch" style="font-size:13px">
+                Weekly Digest Email (Board CEO &amp; Admin — every Monday)
+              </label>
+            </div>
+          </div>
+          <div class="mb-3">
+            <label class="form-label" style="font-size:12px">
+              Programme Head Escalation Threshold (days overdue)
+            </label>
+            <input type="number" class="form-control" name="ph_escalation_days"
+                   value="{ph_escalation_days}" min="1" max="30"
+                   style="width:100px">
+            <div style="font-size:11px;color:#94a3b8;margin-top:4px">
+              Email Programme Head when a case is this many days past TAT.
+            </div>
+          </div>
+          <button class="btn btn-primary w-100" type="submit">Save Settings</button>
+        </form>
+      </div>
+    </div>
+
     <div class="card">
       <div class="card-header"><i class="bi bi-send-arrow-up" style="color:#7c3aed"></i> Outbound Webhook</div>
       <div class="card-body p-4">
@@ -4760,6 +5760,53 @@ def system_settings():
   </div>
 
   <div class="col-lg-7">
+    <div class="card mb-4">
+      <div class="card-header d-flex justify-content-between align-items-center">
+        <span><i class="bi bi-calendar3-event" style="color:#d97706"></i> Holiday Calendar</span>
+        <span style="font-size:11px;color:#94a3b8">TAT calculation skips these + weekends</span>
+      </div>
+      <div class="card-body p-4">
+        <form method="post" class="row g-2 mb-3">
+          <input type="hidden" name="action" value="add_holiday">
+          <div class="col-5">
+            <input type="date" class="form-control form-control-sm" name="holiday_date" required>
+          </div>
+          <div class="col-5">
+            <input type="text" class="form-control form-control-sm" name="holiday_name"
+                   placeholder="e.g. Diwali" required>
+          </div>
+          <div class="col-2">
+            <button class="btn btn-sm btn-success w-100" type="submit">Add</button>
+          </div>
+        </form>
+        <div style="max-height:220px;overflow-y:auto">
+          <table class="data-table">
+            <thead><tr><th>Date</th><th>Name</th><th style="width:40px"></th></tr></thead>
+            <tbody>{holiday_rows}</tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
+    <div class="card mb-4">
+      <div class="card-header"><i class="bi bi-plug-fill" style="color:#0094ca"></i> SMTP Connection Test</div>
+      <div class="card-body p-4">
+        <div class="row g-2 mb-2">
+          <div class="col-6"><input type="email" class="form-control form-control-sm" id="test_smtp_user" placeholder="sender@gmail.com"></div>
+          <div class="col-6"><input type="password" class="form-control form-control-sm" id="test_smtp_pass" placeholder="App password"></div>
+        </div>
+        <div class="row g-2 mb-3">
+          <div class="col-5"><input type="text" class="form-control form-control-sm" id="test_smtp_host" value="smtp.gmail.com"></div>
+          <div class="col-3"><input type="number" class="form-control form-control-sm" id="test_smtp_port" value="587"></div>
+          <div class="col-4"><input type="email" class="form-control form-control-sm" id="test_smtp_to" placeholder="Test recipient"></div>
+        </div>
+        <button class="btn btn-primary btn-sm" onclick="testSmtp()" id="smtpTestBtn">
+          <i class="bi bi-send"></i> Send Test Email
+        </button>
+        <div id="smtpTestResult" style="font-size:13px;margin-top:10px"></div>
+      </div>
+    </div>
+
     <div class="card">
       <div class="card-header"><i class="bi bi-shield-lock-fill" style="color:#7c3aed"></i> User Security</div>
       <div style="overflow-x:auto">
@@ -4771,7 +5818,71 @@ def system_settings():
     </div>
   </div>
 </div>"""
-    return render_page(content, active_page="system", page_title="System Settings")
+    scripts = """<script>
+function testSmtp(){
+  var btn = document.getElementById('smtpTestBtn');
+  btn.innerHTML = '<span class="spinner-border spinner-border-sm"></span> Testing…';
+  btn.disabled = true;
+  fetch('/test-smtp', {
+    method: 'POST',
+    headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({
+      email: document.getElementById('test_smtp_user').value,
+      password: document.getElementById('test_smtp_pass').value,
+      host: document.getElementById('test_smtp_host').value,
+      port: parseInt(document.getElementById('test_smtp_port').value),
+      to: document.getElementById('test_smtp_to').value
+    })
+  }).then(r=>r.json()).then(d=>{
+    var res = document.getElementById('smtpTestResult');
+    if(d.ok){
+      res.innerHTML = '<span style="color:#00984C"><i class="bi bi-check-circle-fill"></i> Test email sent successfully!</span>';
+    } else {
+      res.innerHTML = '<span style="color:#dc2626"><i class="bi bi-x-circle-fill"></i> Failed: ' + (d.error||'Unknown error') + '</span>';
+    }
+    btn.innerHTML = '<i class="bi bi-send"></i> Send Test Email';
+    btn.disabled = false;
+  }).catch(e=>{
+    document.getElementById('smtpTestResult').innerHTML = '<span style="color:#dc2626">Network error: '+e+'</span>';
+    btn.innerHTML = '<i class="bi bi-send"></i> Send Test Email';
+    btn.disabled = false;
+  });
+}
+</script>"""
+    return render_page(content, scripts, active_page="system", page_title="System Settings")
+
+
+@app.route("/test-smtp", methods=["POST"])
+@admin_required
+def test_smtp():
+    data = request.get_json()
+    if not data:
+        return jsonify({"ok": False, "error": "No data"})
+    sender = data.get("email", "").strip()
+    password = data.get("password", "").strip()
+    host = data.get("host", "smtp.gmail.com").strip()
+    port = int(data.get("port", 587))
+    to = data.get("to", "").strip() or sender
+    if not sender or not password:
+        return jsonify({"ok": False, "error": "Sender email and password required"})
+    try:
+        msg = MIMEMultipart()
+        msg["From"] = sender
+        msg["To"] = to
+        msg["Subject"] = "QCI Notify — SMTP Test"
+        msg.attach(MIMEText("This is a test email from QCI Notification Engine. SMTP is working correctly.", "plain"))
+        if port == 465:
+            with smtplib.SMTP_SSL(host, 465, timeout=15) as s:
+                s.login(sender, password)
+                s.sendmail(sender, [to], msg.as_string())
+        else:
+            with smtplib.SMTP(host, port, timeout=15) as s:
+                s.starttls()
+                s.login(sender, password)
+                s.sendmail(sender, [to], msg.as_string())
+        return jsonify({"ok": True})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)[:200]})
 
 
 # ── Database Backup ───────────────────────────────────────────────────────────
@@ -4851,6 +5962,12 @@ def _scheduled_job():
     log.info("Daily check complete: %s", result)
 
 
+def _weekly_digest_job():
+    log.info("Weekly digest running…")
+    run_weekly_digest()
+    log.info("Weekly digest complete.")
+
+
 scheduler = BackgroundScheduler(timezone="Asia/Kolkata")
 
 # ── App startup ───────────────────────────────────────────────────────────────
@@ -4864,6 +5981,8 @@ with app.app_context():
 
 scheduler.add_job(_scheduled_job, "cron",
                   hour=_sched_hour, minute=_sched_minute, id="daily_check")
+scheduler.add_job(_weekly_digest_job, "cron",
+                  day_of_week="mon", hour=8, minute=0, id="weekly_digest")
 
 scheduler.start()
 
