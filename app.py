@@ -108,16 +108,43 @@ def set_app_setting(key: str, value: str):
 
 def log_audit(event_type: str, application_id: str = None, detail: str = "",
               user_name: str = None, board_id: int = None):
-    """Write a row to the audit_log table."""
+    """Write a tamper-evident row to audit_log. Each entry hashes previous entry + payload."""
     conn = get_db()
+    # Get previous hash for chain
+    prev_row = conn.execute(
+        "SELECT entry_hash FROM audit_log ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+    prev_hash = prev_row["entry_hash"] if prev_row and prev_row["entry_hash"] else "GENESIS"
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    # Compute chain hash
+    raw = f"{prev_hash}|{timestamp}|{event_type}|{application_id}|{detail}|{user_name}"
+    entry_hash = hashlib.sha256(raw.encode()).hexdigest()
     conn.execute(
-        "INSERT INTO audit_log (timestamp, application_id, event_type, detail, user_name, board_id) "
-        "VALUES (?,?,?,?,?,?)",
-        (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), application_id, event_type,
-         detail[:500] if detail else "", user_name, board_id)
+        "INSERT INTO audit_log (timestamp, application_id, event_type, detail, user_name, board_id, entry_hash) "
+        "VALUES (?,?,?,?,?,?,?)",
+        (timestamp, application_id, event_type,
+         detail[:500] if detail else "", user_name, board_id, entry_hash)
     )
     conn.commit()
     conn.close()
+
+
+def _verify_api_key(request) -> dict:
+    """Check X-API-Key header. Returns api_key row or None."""
+    raw = request.headers.get("X-API-Key", "").strip()
+    if not raw:
+        return None
+    key_hash = hashlib.sha256(raw.encode()).hexdigest()
+    conn = get_db()
+    row = conn.execute(
+        "SELECT * FROM api_keys WHERE key_hash=? AND is_active=1", (key_hash,)
+    ).fetchone()
+    if row:
+        conn.execute("UPDATE api_keys SET last_used=? WHERE id=?",
+                     (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), row["id"]))
+        conn.commit()
+    conn.close()
+    return dict(row) if row else None
 
 
 def log_stage_transition(application_id: str, from_stage: str, to_stage: str,
@@ -222,45 +249,85 @@ def queue_email(programme_name: str, notification_type: str, to_email: str,
 
 
 def process_email_queue(max_retries: int = 3) -> dict:
-    """Process pending email_queue items. Returns counts."""
+    """Process pending email_queue items. Groups by sender credentials to reuse SMTP connections."""
     conn = get_db()
     pending = [dict(r) for r in conn.execute(
         "SELECT * FROM email_queue WHERE status='pending' AND attempts < ?", (max_retries,)
     ).fetchall()]
-    sent = failed = 0
+    conn.close()
+
+    if not pending:
+        return {"sent": 0, "failed": 0}
+
+    # Group by (sender_email, smtp_host, smtp_port, sender_password)
+    from collections import defaultdict
+    groups = defaultdict(list)
     for item in pending:
+        key = (item["sender_email"], item["smtp_host"], item["smtp_port"], item.get("sender_password",""))
+        groups[key].append(item)
+
+    sent = failed = 0
+    conn = get_db()
+
+    for (sender_email, smtp_host, smtp_port, sender_password_enc), items in groups.items():
+        pw = decrypt_str(sender_password_enc) if sender_password_enc else ""
+        smtp_conn = None
         try:
-            msg = MIMEMultipart("alternative")
-            msg["Subject"] = item["subject"] or ""
-            msg["From"] = item["sender_email"]
-            msg["To"] = item["to_email"]
-            recipients = [item["to_email"]]
-            if item.get("cc_email"):
-                for cc in item["cc_email"].split(","):
-                    cc = cc.strip()
-                    if cc:
-                        msg["Cc"] = cc
-                        recipients.append(cc)
-            msg.attach(MIMEText(item["body"] or "", "plain"))
-            pw = decrypt_str(item["sender_password"]) if item.get("sender_password") else ""
-            with smtplib.SMTP(item["smtp_host"], item["smtp_port"], timeout=15) as s:
-                s.starttls()
-                s.login(item["sender_email"], pw)
-                s.sendmail(item["sender_email"], recipients, msg.as_string())
-            conn.execute(
-                "UPDATE email_queue SET status='sent', last_attempt=? WHERE id=?",
-                (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), item["id"])
-            )
-            sent += 1
-        except Exception as e:
-            attempts = item["attempts"] + 1
-            new_status = "failed" if attempts >= max_retries else "pending"
-            conn.execute(
-                "UPDATE email_queue SET status=?, attempts=?, last_attempt=?, error_msg=? WHERE id=?",
-                (new_status, attempts, datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                 str(e)[:300], item["id"])
-            )
-            failed += 1
+            if smtp_port == 465:
+                smtp_conn = smtplib.SMTP_SSL(smtp_host, 465, timeout=20)
+            else:
+                smtp_conn = smtplib.SMTP(smtp_host, smtp_port, timeout=20)
+                smtp_conn.starttls()
+            smtp_conn.login(sender_email, pw)
+
+            for item in items:
+                try:
+                    msg = MIMEMultipart("alternative")
+                    msg["Subject"] = item["subject"] or ""
+                    msg["From"]    = sender_email
+                    msg["To"]      = item["to_email"]
+                    recipients     = [item["to_email"]]
+                    if item.get("cc_email"):
+                        for cc in item["cc_email"].split(","):
+                            cc = cc.strip()
+                            if cc:
+                                msg["Cc"] = cc
+                                recipients.append(cc)
+                    msg.attach(MIMEText(item["body"] or "", "plain"))
+                    smtp_conn.sendmail(sender_email, recipients, msg.as_string())
+                    conn.execute(
+                        "UPDATE email_queue SET status='sent', last_attempt=? WHERE id=?",
+                        (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), item["id"])
+                    )
+                    sent += 1
+                except Exception as e:
+                    attempts = item["attempts"] + 1
+                    new_status = "failed" if attempts >= max_retries else "pending"
+                    conn.execute(
+                        "UPDATE email_queue SET status=?, attempts=?, last_attempt=?, error_msg=? WHERE id=?",
+                        (new_status, attempts, datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                         str(e)[:300], item["id"])
+                    )
+                    failed += 1
+        except Exception as conn_err:
+            # Connection-level failure — mark all items in group as failed
+            log.error("SMTP connection failed for %s: %s", sender_email, conn_err)
+            for item in items:
+                attempts = item["attempts"] + 1
+                new_status = "failed" if attempts >= max_retries else "pending"
+                conn.execute(
+                    "UPDATE email_queue SET status=?, attempts=?, last_attempt=?, error_msg=? WHERE id=?",
+                    (new_status, attempts, datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                     str(conn_err)[:300], item["id"])
+                )
+                failed += 1
+        finally:
+            if smtp_conn:
+                try:
+                    smtp_conn.quit()
+                except Exception:
+                    pass
+
     conn.commit()
     conn.close()
     return {"sent": sent, "failed": failed}
@@ -311,8 +378,8 @@ def _get_all_holidays():
     return holidays
 
 
-def working_days_elapsed(start: str, end_d=None) -> int:
-    """Working days from start (inclusive) to end (inclusive, default today)."""
+def working_days_elapsed(start: str, end_d=None, hold_days: int = 0) -> int:
+    """Working days from start (inclusive) to end (inclusive, default today), minus hold_days."""
     if end_d is None:
         end_d = date.today()
     s = datetime.strptime(start, "%Y-%m-%d").date() if isinstance(start, str) else start
@@ -323,7 +390,7 @@ def working_days_elapsed(start: str, end_d=None) -> int:
         if cur.weekday() < 5 and cur not in all_holidays:
             count += 1
         cur += timedelta(days=1)
-    return max(0, count - 1)  # days elapsed after start date
+    return max(0, count - 1 - hold_days)  # days elapsed after start date, minus hold
 
 
 # ── Database helpers ─────────────────────────────────────────────────────────
@@ -469,6 +536,20 @@ def init_db():
             email_body        TEXT NOT NULL,
             UNIQUE(programme_name, stage_name, notification_type)
         );
+        CREATE TABLE IF NOT EXISTS scheduler_locks (
+            lock_name  TEXT PRIMARY KEY,
+            locked_at  TEXT NOT NULL,
+            worker_pid INTEGER
+        );
+        CREATE TABLE IF NOT EXISTS api_keys (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            key_hash   TEXT NOT NULL UNIQUE,
+            name       TEXT NOT NULL,
+            board_id   INTEGER,
+            created_at TEXT NOT NULL,
+            last_used  TEXT,
+            is_active  INTEGER NOT NULL DEFAULT 1
+        );
     """)
     # Migrate existing DBs: add columns if absent
     for sql in [
@@ -485,6 +566,9 @@ def init_db():
         "ALTER TABLE case_tracking ADD COLUMN status TEXT NOT NULL DEFAULT 'Active'",
         "ALTER TABLE email_templates ADD COLUMN board_id INTEGER",
         "ALTER TABLE holidays ADD COLUMN board_id INTEGER",
+        "ALTER TABLE case_tracking ADD COLUMN hold_days INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE case_tracking ADD COLUMN hold_start_date TEXT",
+        "ALTER TABLE audit_log ADD COLUMN entry_hash TEXT",
     ]:
         try:
             conn.execute(sql)
@@ -866,15 +950,15 @@ def run_daily_check(board_id=None) -> dict:
                "skipped_milestone": 0, "errors": []}
 
     for case in cases:
-        # Skip closed/withdrawn/suspended cases
+        # Skip closed/withdrawn/suspended/on-hold cases
         case_status = case.get("status", "Active")
-        if case_status and case_status != "Active":
+        if case_status and case_status not in ("Active", None, ""):
             continue
         if case["is_milestone"]:
             summary["skipped_milestone"] += 1
             continue
 
-        elapsed = working_days_elapsed(case["stage_start_date"], today)
+        elapsed = working_days_elapsed(case["stage_start_date"], today, hold_days=case.get("hold_days", 0))
         tat     = case["tat_days"]
         r1_day  = case["reminder1_day"]
         r2_day  = case["reminder2_day"]
@@ -1142,6 +1226,29 @@ def upsert_case(data: dict) -> str:
     if existing:
         old_stage = existing["current_stage"]
         new_stage = data["stage_name"]
+        # Stage order validation (skip for API calls, super_admin, board_admin, or same stage)
+        try:
+            _caller_role = session.get("role", "")
+        except Exception:
+            _caller_role = ""
+        if (old_stage != new_stage
+                and not data.get("_force_advance")
+                and _caller_role not in ("super_admin", "board_admin")):
+            old_cfg = conn.execute(
+                "SELECT stage_order FROM programme_config WHERE programme_name=? AND stage_name=?",
+                (data["programme_name"], old_stage)
+            ).fetchone()
+            new_cfg_order = conn.execute(
+                "SELECT stage_order FROM programme_config WHERE programme_name=? AND stage_name=?",
+                (data["programme_name"], new_stage)
+            ).fetchone()
+            if old_cfg and new_cfg_order:
+                if new_cfg_order["stage_order"] < old_cfg["stage_order"]:
+                    conn.close()
+                    raise ValueError(
+                        f"Stage '{new_stage}' (order {new_cfg_order['stage_order']}) comes before "
+                        f"'{old_stage}' (order {old_cfg['stage_order']}). Use force advance to skip."
+                    )
         conn.execute(
             """UPDATE case_tracking SET
                programme_name=?, organisation_name=?, current_stage=?, stage_start_date=?,
@@ -1412,6 +1519,25 @@ th{white-space:nowrap}
   .page-body{padding:28px 36px}
   .stat-card .stat-val{font-size:34px}
 }
+/* ── Responsive (additional) ─────────────────────────────────────────────── */
+@media (max-width: 768px) {
+  .sidebar { transform: translateX(-260px); transition: transform .25s ease; position: fixed; z-index: 1050; height: 100vh; }
+  .sidebar.open { transform: translateX(0); }
+  .main-content { margin-left: 0 !important; padding: 16px 12px; }
+  .topbar { left: 0 !important; }
+  .mobile-menu-btn { display: flex !important; }
+  .stat-card { min-width: 140px; }
+  .data-table th, .data-table td { padding: 10px 8px; font-size: 12px; }
+  .card-header { font-size: 13px; }
+  .hide-mobile { display: none !important; }
+}
+@media (min-width: 769px) {
+  .mobile-menu-btn { display: none !important; }
+  .sidebar-overlay { display: none !important; }
+}
+@media (min-width: 1400px) {
+  .main-content { max-width: 1600px; }
+}
 </style>
 </head>
 <body>
@@ -1481,6 +1607,9 @@ th{white-space:nowrap}
     </a>
     <a class="nav-link {{ 'active' if active_page=='system' else '' }}" href="/system-settings">
       <i class="bi bi-gear"></i> System Settings
+    </a>
+    <a class="nav-link {{ 'active' if active_page=='api_keys' else '' }}" href="/api-keys">
+      <i class="bi bi-key-fill"></i> API Keys
     </a>
     <a class="nav-link" href="/backup">
       <i class="bi bi-download"></i> Backup DB
@@ -1933,13 +2062,13 @@ def manage_users():
         _uname = u["username"]
         _urole = u["role"]
         remap_btn = (
-            '<button class="btn btn-sm btn-action btn-outline-primary" style="font-size:11px;padding:2px 7px" '
+            '<button class="btn btn-sm btn-outline-primary" style="font-size:12px;padding:3px 8px" title="Map Programmes" '
             'onclick="showRemapPh(' + str(_uid) + ', \'' + _uname + '\', \'' + _urole + '\')">'
-            '<i class="bi bi-diagram-3"></i> Map</button>'
+            '<i class="bi bi-diagram-3"></i></button>'
             if _urole in _REMAP_ROLES else ""
         )
         del_btn = (
-            '<button class="btn btn-sm btn-action btn-outline-danger" style="font-size:11px;padding:2px 7px" '
+            '<button class="btn btn-sm btn-outline-danger" style="font-size:12px;padding:3px 8px" title="Delete User" '
             'onclick="confirmDeleteUser(' + str(_uid) + ', \'' + _uname + '\')">'
             '<i class="bi bi-trash"></i></button>'
             if not is_self else ""
@@ -1953,10 +2082,10 @@ def manage_users():
           <td style="font-size:12px;color:#475569;max-width:180px">{prog_cell or '<span style="color:#94a3b8">—</span>'}</td>
           <td style="font-size:11px;color:#64748b">{last_login_cell}</td>
           <td>
-            <div class="d-flex flex-nowrap gap-1 align-items-center">
-              <button class="btn btn-sm btn-action btn-outline-secondary" style="font-size:11px;padding:2px 7px"
+            <div class="d-flex gap-1 align-items-center" style="white-space:nowrap">
+              <button class="btn btn-sm btn-outline-secondary" style="font-size:12px;padding:3px 8px" title="Reset Password"
                 onclick="showResetPw({u['id']}, '{u['username']}')">
-                <i class="bi bi-key"></i> PW</button>
+                <i class="bi bi-key"></i></button>
               {remap_btn}
               {del_btn}
             </div>
@@ -2562,7 +2691,7 @@ def dashboard():
 
     today = date.today()
     for c in cases:
-        c["days_elapsed"] = working_days_elapsed(c["stage_start_date"], today)
+        c["days_elapsed"] = working_days_elapsed(c["stage_start_date"], today, hold_days=c.get("hold_days", 0))
 
     reverse = sort.endswith("_desc")
     key = sort.replace("_desc", "").replace("_asc", "")
@@ -2570,7 +2699,7 @@ def dashboard():
     sort_key = key_map.get(key, "days_elapsed")
     cases.sort(key=lambda x: (x.get(sort_key) or 0), reverse=reverse)
 
-    # Compute stat card counts
+    # Compute stat card counts (on full set)
     n_total    = len(cases)
     n_overdue  = sum(1 for c in cases if not c["is_milestone"] and c["tat_days"] > 0 and c["days_elapsed"] >= c["tat_days"])
     n_at_risk  = sum(1 for c in cases if not c["is_milestone"] and c["tat_days"] > 0
@@ -2578,8 +2707,19 @@ def dashboard():
     n_ok       = n_total - n_overdue - n_at_risk - sum(1 for c in cases if c["is_milestone"])
     n_milestone= sum(1 for c in cases if c["is_milestone"])
 
+    # Paginate
+    PAGE_SIZE = 50
+    page = max(1, int(request.args.get("page", 1)))
+    total_count = n_total
+    start_idx = (page - 1) * PAGE_SIZE
+    page_cases = cases[start_idx : start_idx + PAGE_SIZE]
+    total_pages = max(1, (total_count + PAGE_SIZE - 1) // PAGE_SIZE)
+    page = min(page, total_pages)
+    start_idx = (page - 1) * PAGE_SIZE
+    page_cases = cases[start_idx : start_idx + PAGE_SIZE]
+
     rows_html = ""
-    for c in cases:
+    for c in page_cases:
         elapsed = c["days_elapsed"]
         tat     = c["tat_days"]
 
@@ -2613,7 +2753,8 @@ def dashboard():
             owner_type_badge = f'<span style="font-size:10px;padding:1px 7px;border-radius:4px;background:{bg}22;color:{bg};font-weight:600">{c["owner_type"]}</span> '
 
         case_st = c.get("status") or "Active"
-        st_colors = {"Active": ("#00984C", "#d8f5e7"), "Closed": ("#64748b", "#f1f5f9"),
+        st_colors = {"Active": ("#00984C", "#d8f5e7"), "On Hold": ("#7c3aed", "#ede9fe"),
+                     "Closed": ("#64748b", "#f1f5f9"),
                      "Withdrawn": ("#d97706", "#fef3c7"), "Suspended": ("#dc2626", "#fee2e2")}
         st_fg, st_bg = st_colors.get(case_st, ("#64748b", "#f1f5f9"))
         case_status_badge = f'<span style="font-size:10px;padding:1px 7px;border-radius:4px;background:{st_bg};color:{st_fg};font-weight:600">{case_st}</span>'
@@ -2914,6 +3055,21 @@ def dashboard():
         for f in saved_filters_list
     )
 
+    # Build pagination HTML
+    if total_pages > 1:
+        prev_page = max(1, page - 1)
+        next_page = min(total_pages, page + 1)
+        def page_url(p):
+            args = request.args.to_dict()
+            args["page"] = p
+            return url_for("dashboard", **args)
+        _pagination_html = f'<div class="d-flex justify-content-between align-items-center mt-3 px-1"><div style="font-size:12px;color:#94a3b8">Showing {start_idx+1}–{min(start_idx+PAGE_SIZE, total_count)} of {total_count} cases</div><nav><ul class="pagination pagination-sm mb-0"><li class="page-item {"disabled" if page==1 else ""}"><a class="page-link" href="{page_url(prev_page)}">&#8249; Prev</a></li>'
+        for _p in range(max(1, page-2), min(total_pages+1, page+3)):
+            _pagination_html += f'<li class="page-item {"active" if _p==page else ""}"><a class="page-link" href="{page_url(_p)}">{_p}</a></li>'
+        _pagination_html += f'<li class="page-item {"disabled" if page==total_pages else ""}"><a class="page-link" href="{page_url(next_page)}">Next &#8250;</a></li></ul></nav></div>'
+    else:
+        _pagination_html = ""
+
     content = f"""
 {overdue_banner_html}
 {stat_cards}
@@ -2921,12 +3077,13 @@ def dashboard():
 
 <div class="card">
   <div class="card-header d-flex justify-content-between align-items-center flex-wrap gap-2">
-    <span>Cases <span style="font-size:12px;font-weight:400;color:#94a3b8;margin-left:6px">{len(cases)} shown</span>
+    <span>Cases <span style="font-size:12px;font-weight:400;color:#94a3b8;margin-left:6px">{total_count} total</span>
     {"&nbsp;" + saved_filter_btns if saved_filter_btns else ""}
     </span>
     <form method="get" class="d-flex gap-2 align-items-center flex-wrap" id="filterForm">
       <select name="status" class="form-select form-select-sm" style="width:auto">
         <option value="Active" {"selected" if status_filter=="Active" else ""}>Active</option>
+        <option value="On Hold" {"selected" if status_filter=="On Hold" else ""}>On Hold</option>
         <option value="Closed" {"selected" if status_filter=="Closed" else ""}>Closed</option>
         <option value="Withdrawn" {"selected" if status_filter=="Withdrawn" else ""}>Withdrawn</option>
         <option value="Suspended" {"selected" if status_filter=="Suspended" else ""}>Suspended</option>
@@ -2976,6 +3133,7 @@ def dashboard():
       </tbody>
     </table>
   </div>
+  {_pagination_html}
 </div>
 
 <!-- Delete confirmation modal -->
@@ -3043,11 +3201,12 @@ def dashboard():
         <button class="btn-close" data-bs-dismiss="modal"></button>
       </div>
       <form method="post" action="/update-case-status">
-        <input type="hidden" name="case_id" id="sc_case_id">
+        <input type="hidden" name="application_id" id="sc_case_id">
         <div class="modal-body pt-0">
           <div style="font-size:13px;color:#64748b;margin-bottom:12px">Case: <strong id="sc_app_id"></strong></div>
-          <select class="form-select" name="new_status" id="sc_status_select">
+          <select class="form-select" name="status" id="sc_status_select">
             <option value="Active">Active</option>
+            <option value="On Hold">&#9646;&#9646; On Hold (TAT paused)</option>
             <option value="Closed">Closed</option>
             <option value="Withdrawn">Withdrawn</option>
             <option value="Suspended">Suspended</option>
@@ -3093,7 +3252,7 @@ def dashboard():
 </div>
 """
     topbar_actions = """
-<a href="/export-dashboard" class="btn btn-sm btn-outline-secondary">
+<a href="/export" class="btn btn-sm btn-outline-secondary">
   <i class="bi bi-download"></i> Export CSV
 </a>
 <a href="/log-stage" class="btn btn-sm btn-navy">
@@ -3110,7 +3269,7 @@ function confirmDelete(url, appId){
   new bootstrap.Modal(document.getElementById('deleteModal')).show();
 }
 function openStatusModal(caseId, appId, currentStatus){
-  document.getElementById('sc_case_id').value = caseId;
+  document.getElementById('sc_case_id').value = appId;
   document.getElementById('sc_app_id').textContent = appId;
   document.getElementById('sc_status_select').value = currentStatus;
   new bootstrap.Modal(document.getElementById('statusModal')).show();
@@ -3801,20 +3960,51 @@ def delete_case(case_id):
 @app.route("/update-case-status", methods=["POST"])
 @login_required
 def update_case_status():
-    case_id = request.form.get("case_id")
-    new_status = request.form.get("new_status", "Active")
-    if new_status not in ("Active", "Closed", "Withdrawn", "Suspended"):
+    conn = get_db()
+    app_id = request.form.get("application_id")
+    new_status = request.form.get("status")
+    valid = {"Active", "On Hold", "Closed", "Withdrawn", "Suspended"}
+    if new_status not in valid:
+        conn.close()
         flash("Invalid status.", "error")
         return redirect(url_for("dashboard"))
-    conn = get_db()
-    row = conn.execute("SELECT application_id FROM case_tracking WHERE id=?", (case_id,)).fetchone()
-    if row:
-        conn.execute("UPDATE case_tracking SET status=? WHERE id=?", (new_status, case_id))
-        conn.commit()
-        log_audit("status_change", row["application_id"], f"Status → {new_status}",
-                  session.get("full_name") or session.get("username", ""), user_board_id())
-        flash(f"Case {row['application_id']} status updated to {new_status}.", "success")
+
+    case = conn.execute("SELECT * FROM case_tracking WHERE application_id=?", (app_id,)).fetchone()
+    if not case:
+        conn.close()
+        flash("Case not found.", "error")
+        return redirect(url_for("dashboard"))
+    case = dict(case)
+
+    if new_status == "On Hold":
+        # Start hold — record hold_start_date
+        conn.execute(
+            "UPDATE case_tracking SET status=?, hold_start_date=? WHERE application_id=?",
+            ("On Hold", date.today().isoformat(), app_id)
+        )
+    elif case.get("status") == "On Hold" and new_status != "On Hold":
+        # Ending hold — calculate working days held and accumulate
+        hold_start = case.get("hold_start_date")
+        extra_hold = 0
+        if hold_start:
+            extra_hold = working_days_elapsed(hold_start, date.today())
+        new_hold_days = (case.get("hold_days") or 0) + extra_hold
+        conn.execute(
+            "UPDATE case_tracking SET status=?, hold_start_date=NULL, hold_days=? WHERE application_id=?",
+            (new_status, new_hold_days, app_id)
+        )
+    else:
+        conn.execute(
+            "UPDATE case_tracking SET status=? WHERE application_id=?",
+            (new_status, app_id)
+        )
+
+    conn.commit()
+    log_audit("status_change", app_id,
+              f"Status → {new_status}", session.get("full_name") or session.get("username", ""),
+              case.get("board_id"))
     conn.close()
+    flash(f"Case {app_id} status updated to {new_status}.", "success")
     return redirect(url_for("dashboard"))
 
 
@@ -6398,52 +6588,359 @@ def backup_db():
         return redirect(url_for("system_settings"))
 
 
+@app.route("/export", methods=["GET", "POST"])
+@login_required
+def export_report():
+    """Parameterised export — choose filters then download."""
+    conn = get_db()
+    bid = user_board_id()
+    ph_progs = user_programme_names()
+
+    if bid is not None:
+        programmes = [r[0] for r in conn.execute(
+            "SELECT programme_name FROM programmes WHERE board_id=? ORDER BY programme_name", (bid,)
+        ).fetchall()]
+    else:
+        programmes = [r[0] for r in conn.execute(
+            "SELECT programme_name FROM programmes ORDER BY programme_name"
+        ).fetchall()]
+    if ph_progs is not None:
+        programmes = [p for p in programmes if p in ph_progs]
+
+    if request.method == "POST":
+        status_f   = request.form.get("status", "")
+        prog_f     = request.form.get("programme", "")
+        owner_f    = request.form.get("owner_type", "")
+        date_from  = request.form.get("date_from", "")
+        date_to    = request.form.get("date_to", "")
+
+        q = "SELECT * FROM case_tracking WHERE 1=1"
+        params = []
+        if bid is not None:
+            q += " AND board_id=?"
+            params.append(bid)
+        if ph_progs is not None and ph_progs:
+            placeholders = ",".join("?" * len(ph_progs))
+            q += f" AND programme_name IN ({placeholders})"
+            params.extend(ph_progs)
+        if status_f:
+            q += " AND status=?"
+            params.append(status_f)
+        if prog_f:
+            q += " AND programme_name=?"
+            params.append(prog_f)
+        if owner_f:
+            q += " AND owner_type=?"
+            params.append(owner_f)
+        if date_from:
+            q += " AND stage_start_date >= ?"
+            params.append(date_from)
+        if date_to:
+            q += " AND stage_start_date <= ?"
+            params.append(date_to)
+
+        cases = [dict(r) for r in conn.execute(q, params).fetchall()]
+        conn.close()
+        today = date.today()
+
+        headers_row = [
+            "Application ID", "Organisation", "Programme", "Stage", "Owner Type",
+            "Action Owner", "Email", "Stage Start", "TAT Days", "Days Elapsed",
+            "Case Status", "TAT Status", "Hold Days", "R1 Sent", "R2 Sent", "Overdue Sent", "Follow-ups"
+        ]
+        rows = []
+        for c in cases:
+            elapsed = working_days_elapsed(c["stage_start_date"], today, hold_days=c.get("hold_days", 0))
+            if c["is_milestone"]:
+                tat_status = "Milestone"
+            elif c.get("status") == "On Hold":
+                tat_status = "On Hold"
+            elif c["tat_days"] > 0 and elapsed >= c["tat_days"]:
+                tat_status = "Overdue"
+            elif c["tat_days"] > 0 and elapsed >= c.get("reminder2_day", 0):
+                tat_status = "At Risk"
+            else:
+                tat_status = "On Track"
+            rows.append([
+                c["application_id"], c["organisation_name"], c["programme_name"],
+                c["current_stage"], c["owner_type"] or "",
+                c["action_owner_name"] or "", c["action_owner_email"] or "",
+                c["stage_start_date"], c["tat_days"], elapsed,
+                c.get("status", "Active"), tat_status, c.get("hold_days", 0),
+                "Yes" if c["r1_sent"] else "No",
+                "Yes" if c["r2_sent"] else "No",
+                "Yes" if c["overdue_sent"] else "No", c["overdue_count"]
+            ])
+
+        fname_base = f"qci_export_{date.today()}"
+        output = io.StringIO()
+        w = csv.writer(output)
+        w.writerow(headers_row)
+        w.writerows(rows)
+        return Response(
+            output.getvalue(),
+            mimetype="text/csv",
+            headers={"Content-Disposition": f"attachment;filename={fname_base}.csv"}
+        )
+
+    conn.close()
+    prog_opts = '<option value="">All Programmes</option>' + "".join(
+        f'<option value="{p}">{p}</option>' for p in programmes
+    )
+    content = f"""
+<div class="row g-4 justify-content-center" style="max-width:700px;margin:0 auto">
+  <div class="col-12">
+    <div class="card">
+      <div class="card-header">
+        <i class="bi bi-file-earmark-spreadsheet" style="color:#059669"></i> Export Report
+        <span style="font-size:12px;color:#94a3b8;margin-left:8px">Configure filters then download</span>
+      </div>
+      <div class="card-body p-4">
+        <form method="post">
+          <div class="row g-3">
+            <div class="col-md-6">
+              <label class="form-label">Programme</label>
+              <select class="form-select" name="programme">{prog_opts}</select>
+            </div>
+            <div class="col-md-6">
+              <label class="form-label">Case Status</label>
+              <select class="form-select" name="status">
+                <option value="">All Statuses</option>
+                <option value="Active">Active</option>
+                <option value="On Hold">On Hold</option>
+                <option value="Closed">Closed</option>
+                <option value="Withdrawn">Withdrawn</option>
+                <option value="Suspended">Suspended</option>
+              </select>
+            </div>
+            <div class="col-md-6">
+              <label class="form-label">Owner Type</label>
+              <select class="form-select" name="owner_type">
+                <option value="">All Types</option>
+                <option value="Applicant">Applicant</option>
+                <option value="QCI">QCI</option>
+                <option value="Assessor">Assessor</option>
+                <option value="Hospital">Hospital</option>
+              </select>
+            </div>
+            <div class="col-md-3">
+              <label class="form-label">Stage Start From</label>
+              <input type="date" class="form-control" name="date_from">
+            </div>
+            <div class="col-md-3">
+              <label class="form-label">Stage Start To</label>
+              <input type="date" class="form-control" name="date_to">
+            </div>
+            <div class="col-12 pt-2">
+              <button type="submit" class="btn btn-success">
+                <i class="bi bi-download"></i> Download CSV
+              </button>
+            </div>
+          </div>
+        </form>
+      </div>
+    </div>
+  </div>
+</div>"""
+    return render_page(content, active_page="export", page_title="Export Report")
+
+
 @app.route("/export-dashboard")
 @login_required
 def export_dashboard():
-    """Export current dashboard data as CSV download."""
+    return redirect(url_for("export_report"))
+
+
+# ── Inbound REST API ──────────────────────────────────────────────────────────
+@app.route("/api/v1/cases/advance", methods=["POST"])
+def api_advance_case():
+    """Inbound API: advance a case to a new stage.
+    Auth: X-API-Key header.
+    Body JSON: {application_id, stage_name, stage_start_date, action_owner_name,
+                action_owner_email, organisation_name, programme_name, changed_by}
+    """
+    api_key = _verify_api_key(request)
+    if not api_key:
+        return jsonify({"ok": False, "error": "Invalid or missing API key"}), 401
+    data = request.get_json(silent=True) or {}
+    required = ["application_id", "stage_name", "programme_name"]
+    missing = [f for f in required if not data.get(f)]
+    if missing:
+        return jsonify({"ok": False, "error": f"Missing fields: {', '.join(missing)}"}), 400
+    try:
+        upsert_data = {
+            "application_id":     data["application_id"].strip(),
+            "organisation_name":  data.get("organisation_name", "").strip(),
+            "programme_name":     data["programme_name"].strip(),
+            "stage_name":         data["stage_name"].strip(),
+            "stage_start_date":   data.get("stage_start_date", date.today().isoformat()),
+            "action_owner_name":  data.get("action_owner_name", "").strip(),
+            "action_owner_email": data.get("action_owner_email", "").strip(),
+            "program_officer_email": data.get("program_officer_email", "").strip(),
+            "_changed_by":        data.get("changed_by", "API"),
+            "_force_advance":     True,
+        }
+        action = upsert_case(upsert_data)
+        return jsonify({"ok": True, "action": action, "application_id": data["application_id"]})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
+
+
+@app.route("/api/v1/cases/<app_id>", methods=["GET"])
+def api_get_case(app_id):
+    """Inbound API: get case details."""
+    api_key = _verify_api_key(request)
+    if not api_key:
+        return jsonify({"ok": False, "error": "Invalid or missing API key"}), 401
     conn = get_db()
-    bid = user_board_id()
-    q = "SELECT * FROM case_tracking"
+    case = conn.execute(
+        "SELECT * FROM case_tracking WHERE application_id=?", (app_id,)
+    ).fetchone()
+    conn.close()
+    if not case:
+        return jsonify({"ok": False, "error": "Case not found"}), 404
+    c = dict(case)
+    c["days_elapsed"] = working_days_elapsed(c["stage_start_date"], hold_days=c.get("hold_days", 0))
+    return jsonify({"ok": True, "case": c})
+
+
+@app.route("/api/v1/cases", methods=["GET"])
+def api_list_cases():
+    """Inbound API: list cases, optionally filtered by programme."""
+    api_key = _verify_api_key(request)
+    if not api_key:
+        return jsonify({"ok": False, "error": "Invalid or missing API key"}), 401
+    conn = get_db()
+    q = "SELECT * FROM case_tracking WHERE 1=1"
     params = []
-    if bid is not None:
-        q += " WHERE board_id=?"
-        params.append(bid)
+    if api_key.get("board_id"):
+        q += " AND board_id=?"
+        params.append(api_key["board_id"])
+    if request.args.get("programme"):
+        q += " AND programme_name=?"
+        params.append(request.args["programme"])
+    if request.args.get("status"):
+        q += " AND status=?"
+        params.append(request.args["status"])
+    q += " LIMIT 200"
     cases = [dict(r) for r in conn.execute(q, params).fetchall()]
     conn.close()
     today = date.today()
-
-    output = io.StringIO()
-    w = csv.writer(output)
-    w.writerow([
-        "Application ID", "Organisation", "Programme", "Stage", "Owner Type",
-        "Action Owner", "Email", "Stage Start", "TAT Days", "Days Elapsed",
-        "Status", "R1 Sent", "R2 Sent", "Overdue Sent", "Follow-ups"
-    ])
     for c in cases:
-        elapsed = working_days_elapsed(c["stage_start_date"], today)
-        if c["is_milestone"]:
-            status = "Milestone"
-        elif c["tat_days"] > 0 and elapsed >= c["tat_days"]:
-            status = "Overdue"
-        elif c["tat_days"] > 0 and elapsed >= c["reminder2_day"]:
-            status = "At Risk"
-        else:
-            status = "On Track"
-        w.writerow([
-            c["application_id"], c["organisation_name"], c["programme_name"],
-            c["current_stage"], c["owner_type"] or "",
-            c["action_owner_name"] or "", c["action_owner_email"] or "",
-            c["stage_start_date"], c["tat_days"], elapsed,
-            status, "Yes" if c["r1_sent"] else "No",
-            "Yes" if c["r2_sent"] else "No",
-            "Yes" if c["overdue_sent"] else "No", c["overdue_count"]
-        ])
-    return Response(
-        output.getvalue(),
-        mimetype="text/csv",
-        headers={"Content-Disposition": f"attachment;filename=qci_dashboard_{today}.csv"}
-    )
+        c["days_elapsed"] = working_days_elapsed(c["stage_start_date"], today, hold_days=c.get("hold_days", 0))
+    return jsonify({"ok": True, "count": len(cases), "cases": cases})
+
+
+@app.route("/api-keys", methods=["GET", "POST"])
+@admin_required
+def manage_api_keys():
+    conn = get_db()
+    if request.method == "POST":
+        action = request.form.get("action")
+        if action == "create":
+            raw_key = secrets.token_urlsafe(32)
+            key_hash = hashlib.sha256(raw_key.encode()).hexdigest()
+            name = request.form.get("name", "Unnamed Key").strip()
+            board_id = request.form.get("board_id") or None
+            conn.execute(
+                "INSERT INTO api_keys (key_hash, name, board_id, created_at) VALUES (?,?,?,?)",
+                (key_hash, name, board_id, datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+            )
+            conn.commit()
+            flash(f"API key created. Copy it now — it won't be shown again: {raw_key}", "success")
+        elif action == "revoke":
+            conn.execute("UPDATE api_keys SET is_active=0 WHERE id=?", (request.form["key_id"],))
+            conn.commit()
+            flash("API key revoked.", "success")
+
+    keys = [dict(r) for r in conn.execute(
+        "SELECT id, name, board_id, created_at, last_used, is_active FROM api_keys ORDER BY id DESC"
+    ).fetchall()]
+    boards = [dict(r) for r in conn.execute("SELECT id, board_name FROM boards ORDER BY board_name").fetchall()]
+    conn.close()
+
+    board_opts = "".join(f'<option value="{b["id"]}">{b["board_name"]}</option>' for b in boards)
+    key_rows = ""
+    for k in keys:
+        status_badge = '<span class="badge bg-success">Active</span>' if k["is_active"] else '<span class="badge bg-secondary">Revoked</span>'
+        revoke_btn = f'''<form method="post" style="display:inline">
+          <input type="hidden" name="action" value="revoke">
+          <input type="hidden" name="key_id" value="{k["id"]}">
+          <button class="btn btn-sm btn-outline-danger" style="font-size:11px"
+                  {"disabled" if not k["is_active"] else ""}
+                  onclick="return confirm('Revoke this key?')">Revoke</button>
+        </form>''' if k["is_active"] else ""
+        key_rows += f"""<tr>
+          <td style="font-weight:600">{k["name"]}</td>
+          <td style="font-size:12px;color:#64748b">{k["created_at"]}</td>
+          <td style="font-size:12px;color:#64748b">{k["last_used"] or "Never"}</td>
+          <td>{status_badge}</td>
+          <td>{revoke_btn}</td>
+        </tr>"""
+
+    content = f"""
+<div class="row g-4">
+  <div class="col-lg-8">
+    <div class="card">
+      <div class="card-header d-flex justify-content-between align-items-center">
+        <span><i class="bi bi-key-fill" style="color:#2563eb"></i> API Keys</span>
+        <span style="font-size:12px;color:#94a3b8">Use X-API-Key header for all requests</span>
+      </div>
+      <div class="card-body p-0">
+        <table class="data-table">
+          <thead><tr><th>Name</th><th>Created</th><th>Last Used</th><th>Status</th><th>Action</th></tr></thead>
+          <tbody>{key_rows if key_rows else '<tr><td colspan="5" style="text-align:center;padding:30px;color:#94a3b8">No API keys yet.</td></tr>'}</tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+  <div class="col-lg-4">
+    <div class="card">
+      <div class="card-header"><i class="bi bi-plus-circle" style="color:#059669"></i> Generate New Key</div>
+      <div class="card-body p-4">
+        <form method="post">
+          <input type="hidden" name="action" value="create">
+          <div class="mb-3">
+            <label class="form-label">Key Name / Description</label>
+            <input type="text" class="form-control" name="name" placeholder="e.g. NABH Portal Integration" required>
+          </div>
+          <div class="mb-3">
+            <label class="form-label">Board Scope (optional)</label>
+            <select class="form-select" name="board_id">
+              <option value="">All Boards</option>
+              {board_opts}
+            </select>
+          </div>
+          <div style="background:#fef9c3;border:1px solid #fde68a;border-radius:8px;padding:10px 12px;font-size:11px;color:#92400e;margin-bottom:16px">
+            <i class="bi bi-exclamation-triangle-fill"></i> The key is shown ONCE after creation. Store it securely.
+          </div>
+          <button class="btn btn-primary w-100">Generate Key</button>
+        </form>
+      </div>
+    </div>
+    <div class="card mt-3">
+      <div class="card-header"><i class="bi bi-code-slash" style="color:#7c3aed"></i> API Reference</div>
+      <div class="card-body p-3" style="font-size:12px">
+        <strong>Advance a case:</strong>
+        <pre style="background:#f8fafc;padding:8px;border-radius:6px;font-size:10px;overflow-x:auto">POST /api/v1/cases/advance
+X-API-Key: your-key-here
+Content-Type: application/json
+
+{{
+  "application_id": "NABH-001",
+  "programme_name": "NABH Full...",
+  "stage_name": "Document Review",
+  "organisation_name": "ABC Hospital",
+  "changed_by": "NABH Portal"
+}}</pre>
+        <strong>Get case:</strong>
+        <pre style="background:#f8fafc;padding:8px;border-radius:6px;font-size:10px">GET /api/v1/cases/NABH-001
+X-API-Key: your-key-here</pre>
+      </div>
+    </div>
+  </div>
+</div>"""
+    return render_page(content, active_page="api_keys", page_title="API Keys")
 
 
 @app.route("/healthz")
@@ -6473,33 +6970,29 @@ def run_check():
 
 # ── Scheduler ─────────────────────────────────────────────────────────────────
 def _scheduled_job():
-    """Runs every hour — dispatches per-board based on each board's configured run hour."""
-    now_ist = datetime.now(pytz.timezone("Asia/Kolkata"))
-    cur_hour = now_ist.hour
-    global_hour = int(get_app_setting("scheduler_hour", "8"))
-
-    try:
-        conn = get_db()
-        boards = [dict(r) for r in conn.execute("SELECT id, board_name FROM boards").fetchall()]
-        conn.close()
-    except Exception:
-        boards = []
-
-    if not boards:
-        # Fallback: run globally if no boards configured
-        if cur_hour == global_hour:
-            log.info("Scheduled daily check (global) running…")
-            result = run_daily_check()
-            log.info("Daily check complete: %s", result)
-        return
-
-    for board in boards:
-        bid = board["id"]
-        board_hour = int(get_app_setting(f"sched_hour_board_{bid}", str(global_hour)))
-        if cur_hour == board_hour:
-            log.info("Scheduled daily check for board %s (%s)…", bid, board["board_name"])
-            result = run_daily_check(board_id=bid)
-            log.info("Board %s check complete: %s", bid, result)
+    """Daily check with DB lock to prevent multi-worker duplicate runs."""
+    conn = get_db()
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    # Try to acquire lock — skip if another worker ran within last 10 minutes
+    existing = conn.execute("SELECT locked_at FROM scheduler_locks WHERE lock_name='daily_check'").fetchone()
+    if existing:
+        try:
+            last = datetime.strptime(existing["locked_at"], "%Y-%m-%d %H:%M:%S")
+            if (datetime.now() - last).total_seconds() < 600:
+                conn.close()
+                log.info("Scheduler: lock held by another worker, skipping.")
+                return
+        except Exception:
+            pass
+    conn.execute(
+        "INSERT OR REPLACE INTO scheduler_locks (lock_name, locked_at, worker_pid) VALUES (?,?,?)",
+        ("daily_check", now_str, os.getpid())
+    )
+    conn.commit()
+    conn.close()
+    log.info("Scheduled daily check running…")
+    result = run_daily_check()
+    log.info("Daily check complete: %s", result)
 
 
 def _weekly_digest_job():
