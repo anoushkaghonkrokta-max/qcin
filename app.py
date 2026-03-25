@@ -1120,6 +1120,9 @@ def run_daily_check(board_id=None) -> dict:
 # ── Weekly digest ────────────────────────────────────────────────────────────
 def run_weekly_digest():
     """Send a weekly summary email to board_ceo and board_admin users."""
+    if get_app_setting("digest_enabled", "1") != "1":
+        log.info("Weekly digest is disabled — skipping.")
+        return
     conn = get_db()
     today = date.today()
     recipients = [dict(r) for r in conn.execute(
@@ -1243,11 +1246,20 @@ def upsert_case(data: dict) -> str:
                 (data["programme_name"], new_stage)
             ).fetchone()
             if old_cfg and new_cfg_order:
-                if new_cfg_order["stage_order"] < old_cfg["stage_order"]:
+                old_order = old_cfg["stage_order"]
+                new_order = new_cfg_order["stage_order"]
+                if new_order < old_order:
                     conn.close()
                     raise ValueError(
-                        f"Stage '{new_stage}' (order {new_cfg_order['stage_order']}) comes before "
-                        f"'{old_stage}' (order {old_cfg['stage_order']}). Use force advance to skip."
+                        f"Cannot move backwards: '{new_stage}' (order {new_order}) is before "
+                        f"'{old_stage}' (order {old_order}). Only Board Admin can move backwards."
+                    )
+                if new_order > old_order + 1:
+                    conn.close()
+                    raise ValueError(
+                        f"Cannot skip stages: '{new_stage}' (order {new_order}) skips "
+                        f"{new_order - old_order - 1} stage(s) after '{old_stage}' (order {old_order}). "
+                        f"Use 'Force Advance' or contact a Board Admin to skip stages."
                     )
         conn.execute(
             """UPDATE case_tracking SET
@@ -6252,9 +6264,9 @@ def system_settings():
         if action == "save_scheduler":
             hour = int(request.form.get("sched_hour", 8))
             minute = int(request.form.get("sched_minute", 0))
-            set_app_setting("sched_hour", str(hour))
-            set_app_setting("sched_minute", str(minute))
-            # Reschedule
+            set_app_setting("scheduler_hour", str(hour))    # key must match startup read
+            set_app_setting("scheduler_minute", str(minute))
+            # Reschedule live
             try:
                 scheduler.reschedule_job("daily_check", trigger="cron",
                                          hour=hour, minute=minute)
@@ -6325,8 +6337,8 @@ def system_settings():
             except Exception:
                 pass
 
-    sched_hour   = int(get_app_setting("sched_hour", "8"))
-    sched_minute = int(get_app_setting("sched_minute", "0"))
+    sched_hour   = int(get_app_setting("scheduler_hour", "8"))
+    sched_minute = int(get_app_setting("scheduler_minute", "0"))
     webhook_url  = get_app_setting("webhook_url", "")
     digest_enabled = get_app_setting("digest_enabled", "1") == "1"
     ph_escalation_days = get_app_setting("ph_escalation_days", "5")
@@ -7021,7 +7033,7 @@ with app.app_context():
     _sched_minute = int(get_app_setting("scheduler_minute", "0"))
 
 scheduler.add_job(_scheduled_job, "cron",
-                  hour="*", minute=0, id="daily_check")
+                  hour=_sched_hour, minute=_sched_minute, id="daily_check")
 scheduler.add_job(_weekly_digest_job, "cron",
                   day_of_week="mon", hour=8, minute=0, id="weekly_digest")
 
