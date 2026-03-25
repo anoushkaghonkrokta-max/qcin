@@ -24,7 +24,15 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from cryptography.fernet import Fernet
 from flask import (Flask, flash, jsonify, redirect, render_template_string,
                    request, url_for, Response, session)
+from markupsafe import escape as _xe
 from werkzeug.security import check_password_hash as _check_pw
+
+
+def h(v):
+    """HTML-escape a value for safe injection into f-string HTML."""
+    if v is None:
+        return ""
+    return str(_xe(str(v)))
 
 def generate_password_hash(pw):
     from werkzeug.security import generate_password_hash as _gph
@@ -2790,31 +2798,39 @@ def dashboard():
                      "Withdrawn": ("#d97706", "#fef3c7"), "Suspended": ("#dc2626", "#fee2e2")}
         st_fg, st_bg = st_colors.get(case_st, ("#64748b", "#f1f5f9"))
         case_status_badge = f'<span style="font-size:10px;padding:1px 7px;border-radius:4px;background:{st_bg};color:{st_fg};font-weight:600">{case_st}</span>'
+        _app_id_h  = h(c['application_id'])
+        _org_h     = h(c['organisation_name'])
+        _prog_h    = h(c['programme_name'])
+        _stage_h   = h(c['current_stage'])
+        _owner_h   = h(c['action_owner_name']) if c['action_owner_name'] else '—'
+        _email_h   = h(c['action_owner_email']) if c['action_owner_email'] else ''
+        _sdate_h   = h(c['stage_start_date'])
+        _case_st_h = h(case_st)
         rows_html += f"""<tr class="{tr_cls}">
-          <td class="id-cell">{c['application_id']}<br>{case_status_badge}</td>
-          <td><div style="font-weight:500;color:#1e293b">{c['organisation_name']}</div>
-              <div style="font-size:11px;color:#94a3b8">{c['programme_name']}</div></td>
-          <td><div style="font-size:13px">{c['current_stage']}</div>
-              <div style="font-size:11px;color:#94a3b8">{owner_type_badge}Start: {c['stage_start_date']}</div></td>
+          <td class="id-cell">{_app_id_h}<br>{case_status_badge}</td>
+          <td><div style="font-weight:500;color:#1e293b">{_org_h}</div>
+              <div style="font-size:11px;color:#94a3b8">{_prog_h}</div></td>
+          <td><div style="font-size:13px">{_stage_h}</div>
+              <div style="font-size:11px;color:#94a3b8">{owner_type_badge}Start: {_sdate_h}</div></td>
           <td><div>{status_pill}</div>{bar_html}</td>
           <td class="text-center">{yn(c['r1_sent'])}</td>
           <td class="text-center">{yn(c['r2_sent'])}</td>
           <td class="text-center">{yn(c['overdue_sent'])}</td>
           <td class="text-center" style="font-weight:600;color:{'#dc2626' if c['overdue_count'] else '#94a3b8'}">{c['overdue_count'] or '—'}</td>
-          <td><div style="font-size:12.5px">{c['action_owner_name'] or '—'}</div>
-              <div style="font-size:11px;color:#94a3b8">{c['action_owner_email'] or ''}</div></td>
+          <td><div style="font-size:12.5px">{_owner_h}</div>
+              <div style="font-size:11px;color:#94a3b8">{_email_h}</div></td>
           <td style="white-space:nowrap">
-            <a href="/case-history/{c['application_id']}" class="btn btn-sm btn-action btn-outline-secondary me-1"
+            <a href="/case-history/{_app_id_h}" class="btn btn-sm btn-action btn-outline-secondary me-1"
                title="History"><i class="bi bi-clock-history"></i></a>
             <button class="btn btn-sm btn-action btn-outline-success me-1" title="Quick Advance"
-               onclick="openQuickAdvance({c['id']}, '{c['application_id']}', '{c['programme_name']}')">
+               onclick="openQuickAdvance({c['id']}, {json.dumps(c['application_id'])}, {json.dumps(c['programme_name'])})">
                <i class="bi bi-arrow-right-circle"></i></button>
             <a href="/edit-case/{c['id']}" class="btn btn-sm btn-action btn-outline-primary me-1">Edit</a>
             <button class="btn btn-sm btn-action btn-outline-warning me-1" title="Change Status"
-               onclick="openStatusModal({c['id']}, '{c['application_id']}', '{case_st}')">
+               onclick="openStatusModal({c['id']}, {json.dumps(c['application_id'])}, {json.dumps(case_st)})">
                <i class="bi bi-toggles"></i></button>
             <button class="btn btn-sm btn-action btn-outline-danger"
-              onclick="confirmDelete('/delete-case/{c['id']}', '{c['application_id']}')">Delete</button>
+              onclick="confirmDelete('/delete-case/{c['id']}', {json.dumps(c['application_id'])})">Delete</button>
           </td>
         </tr>"""
 
@@ -5160,12 +5176,12 @@ def audit_log_page():
         r = dict(r)
         icon, clr = EVENT_ICONS.get(r["event_type"], ("bi-circle", "#94a3b8"))
         tbl_rows += f"""<tr>
-  <td style="white-space:nowrap;font-size:12px;color:#64748b">{r['timestamp']}</td>
+  <td style="white-space:nowrap;font-size:12px;color:#64748b">{h(r['timestamp'])}</td>
   <td><i class="bi {icon}" style="color:{clr};margin-right:4px"></i>
-    <span style="font-size:12px;font-weight:600">{r['event_type'].replace('_',' ').title()}</span></td>
-  <td style="font-weight:500">{r['application_id'] or '—'}</td>
-  <td style="font-size:12.5px">{r['detail'] or ''}</td>
-  <td style="font-size:12px;color:#94a3b8">{r['user_name'] or 'system'}</td>
+    <span style="font-size:12px;font-weight:600">{h(r['event_type'].replace('_',' ').title())}</span></td>
+  <td style="font-weight:500">{h(r['application_id']) if r['application_id'] else '—'}</td>
+  <td style="font-size:12.5px">{h(r['detail']) if r['detail'] else ''}</td>
+  <td style="font-size:12px;color:#94a3b8">{h(r['user_name']) if r['user_name'] else 'system'}</td>
 </tr>"""
 
     content = f"""
@@ -5199,15 +5215,15 @@ def case_history(app_id):
 
     timeline_html = ""
     for t in transitions:
-        from_lbl = t["from_stage"] or '<em style="color:#94a3b8">New Case</em>'
+        from_lbl = h(t["from_stage"]) if t["from_stage"] else '<em style="color:#94a3b8">New Case</em>'
         timeline_html += f"""
 <div class="d-flex align-items-start gap-3 mb-3">
   <div style="width:12px;height:12px;border-radius:50%;background:#7c3aed;margin-top:4px;flex-shrink:0"></div>
   <div>
     <div style="font-size:13px"><span style="color:#94a3b8">{from_lbl}</span>
       <i class="bi bi-arrow-right" style="margin:0 6px;color:#7c3aed"></i>
-      <strong>{t['to_stage']}</strong></div>
-    <div style="font-size:11px;color:#94a3b8">{t['timestamp']} · by {t['changed_by'] or 'system'}</div>
+      <strong>{h(t['to_stage'])}</strong></div>
+    <div style="font-size:11px;color:#94a3b8">{h(t['timestamp'])} · by {h(t['changed_by']) if t['changed_by'] else 'system'}</div>
   </div>
 </div>"""
 
@@ -5472,10 +5488,10 @@ def bulk_advance():
         for c in pcases:
             rows += f"""<tr>
   <td><input type="checkbox" name="case_ids" value="{c['id']}" class="form-check-input case-cb"></td>
-  <td class="id-cell">{c['application_id']}</td>
-  <td>{c['organisation_name']}</td>
-  <td>{c['current_stage']}</td>
-  <td style="font-size:12px;color:#94a3b8">{c['stage_start_date']}</td>
+  <td class="id-cell">{h(c['application_id'])}</td>
+  <td>{h(c['organisation_name'])}</td>
+  <td>{h(c['current_stage'])}</td>
+  <td style="font-size:12px;color:#94a3b8">{h(c['stage_start_date'])}</td>
 </tr>"""
         case_list_html += f"""
 <div class="mb-3">
@@ -5631,13 +5647,13 @@ def search():
         else:
             badge = f'<span class="pill pill-ok">On Track·{elapsed}d</span>'
         rows += f"""<tr>
-  <td class="id-cell">{c['application_id']}</td>
-  <td>{c['organisation_name']}</td>
-  <td style="font-size:12px;color:#64748b">{c['programme_name']}</td>
-  <td>{c['current_stage']}</td>
+  <td class="id-cell">{h(c['application_id'])}</td>
+  <td>{h(c['organisation_name'])}</td>
+  <td style="font-size:12px;color:#64748b">{h(c['programme_name'])}</td>
+  <td>{h(c['current_stage'])}</td>
   <td>{badge}</td>
   <td><a href="/edit-case/{c['id']}" class="btn btn-sm btn-action btn-outline-primary me-1">Edit</a>
-      <a href="/case-history/{c['application_id']}" class="btn btn-sm btn-action btn-outline-secondary">History</a></td>
+      <a href="/case-history/{h(c['application_id'])}" class="btn btn-sm btn-action btn-outline-secondary">History</a></td>
 </tr>"""
 
     content = f"""
@@ -6835,6 +6851,19 @@ def api_advance_case():
     missing = [f for f in required if not data.get(f)]
     if missing:
         return jsonify({"ok": False, "error": f"Missing fields: {', '.join(missing)}"}), 400
+
+    # ── IDOR fix: verify programme belongs to the API key's board ──────────────
+    if api_key.get("board_id"):
+        _conn = get_db()
+        _prog_row = _conn.execute(
+            "SELECT id FROM programmes WHERE programme_name=? AND board_id=?",
+            (data["programme_name"].strip(), api_key["board_id"])
+        ).fetchone()
+        _conn.close()
+        if not _prog_row:
+            return jsonify({"ok": False,
+                            "error": "Programme not found or not authorised for this API key"}), 403
+
     try:
         upsert_data = {
             "application_id":     data["application_id"].strip(),
@@ -7032,33 +7061,49 @@ def healthz():
 @app.route("/run-check")
 @admin_required
 def run_check():
-    summary = run_daily_check()
-    return jsonify(summary)
+    """Trigger daily check in a background thread so the request returns immediately
+    instead of blocking until all SMTP sends complete (avoids 30-60s gateway timeouts)."""
+    import threading
+    _job_id = secrets.token_hex(4)
+
+    def _bg():
+        log.info("Manual run-check started (job=%s)", _job_id)
+        result = run_daily_check()
+        log.info("Manual run-check done (job=%s): %s", _job_id, result)
+
+    t = threading.Thread(target=_bg, daemon=True)
+    t.start()
+    return jsonify({"ok": True, "message": "Check triggered in background.", "job_id": _job_id})
 
 
 # ── Scheduler ─────────────────────────────────────────────────────────────────
 def _scheduled_job():
-    """Daily check with DB lock to prevent multi-worker duplicate runs."""
+    """Daily check with atomic DB lock to prevent multi-worker duplicate runs.
+
+    Uses a single atomic UPDATE (not SELECT+INSERT) to win the lock.
+    Only the worker whose UPDATE returns rowcount=1 proceeds.
+    """
     conn = get_db()
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    # Try to acquire lock — skip if another worker ran within last 10 minutes
-    existing = conn.execute("SELECT locked_at FROM scheduler_locks WHERE lock_name='daily_check'").fetchone()
-    if existing:
-        try:
-            last = datetime.strptime(existing["locked_at"], "%Y-%m-%d %H:%M:%S")
-            if (datetime.now() - last).total_seconds() < 600:
-                conn.close()
-                log.info("Scheduler: lock held by another worker, skipping.")
-                return
-        except Exception:
-            pass
+    # Ensure the lock row exists (idempotent — INSERT OR IGNORE with epoch sentinel)
     conn.execute(
-        "INSERT OR REPLACE INTO scheduler_locks (lock_name, locked_at, worker_pid) VALUES (?,?,?)",
-        ("daily_check", now_str, os.getpid())
+        "INSERT OR IGNORE INTO scheduler_locks (lock_name, locked_at, worker_pid) "
+        "VALUES ('daily_check', '2000-01-01 00:00:00', 0)"
+    )
+    conn.commit()
+    # Atomic compare-and-swap: only update if lock is older than 10 minutes
+    cutoff = (datetime.now() - timedelta(minutes=10)).strftime("%Y-%m-%d %H:%M:%S")
+    cur = conn.execute(
+        "UPDATE scheduler_locks SET locked_at=?, worker_pid=? "
+        "WHERE lock_name='daily_check' AND locked_at < ?",
+        (now_str, os.getpid(), cutoff)
     )
     conn.commit()
     conn.close()
-    log.info("Scheduled daily check running…")
+    if cur.rowcount != 1:
+        log.info("Scheduler: another worker holds the lock — skipping.")
+        return
+    log.info("Scheduled daily check running… (pid=%s)", os.getpid())
     result = run_daily_check()
     log.info("Daily check complete: %s", result)
 
