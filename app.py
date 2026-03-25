@@ -4823,15 +4823,15 @@ def settings():
 
     # Board holiday calendar card
     _hol_rows = ""
-    for h in _board_holidays:
-        scope = '<span style="font-size:10px;color:#94a3b8">(global)</span>' if not h.get("board_id") else ""
+    for _hol in _board_holidays:
+        scope = '<span style="font-size:10px;color:#94a3b8">(global)</span>' if not _hol.get("board_id") else ""
         _hol_rows += f"""<tr>
-  <td style="font-size:12px">{h['holiday_date']}</td>
-  <td style="font-size:12px">{h['name']} {scope}</td>
+  <td style="font-size:12px">{_hol['holiday_date']}</td>
+  <td style="font-size:12px">{_hol['name']} {scope}</td>
   <td>
     <form method="post" style="display:inline">
       <input type="hidden" name="action" value="delete_board_holiday">
-      <input type="hidden" name="holiday_id" value="{h['id']}">
+      <input type="hidden" name="holiday_id" value="{_hol['id']}">
       <button type="submit" class="btn btn-xs btn-outline-danger" style="font-size:10px;padding:1px 6px"
               onclick="return confirm('Remove holiday?')"><i class="bi bi-trash"></i></button>
     </form>
