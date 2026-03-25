@@ -4565,10 +4565,13 @@ def settings():
                     sh, sm = int(parts[0]), int(parts[1])
                     set_app_setting("scheduler_hour",   str(sh))
                     set_app_setting("scheduler_minute", str(sm))
-                    scheduler.reschedule_job(
-                        "daily_check", trigger="cron",
-                        hour=sh, minute=sm
-                    )
+                    try:
+                        scheduler.reschedule_job(
+                            "daily_check", trigger="cron",
+                            hour=sh, minute=sm
+                        )
+                    except Exception:
+                        pass  # scheduler not running (Vercel serverless — Cron Job used instead)
                     flash(f"Daily check rescheduled to {sh:02d}:{sm:02d} IST.", "success")
                 except Exception as e:
                     flash(f"Error updating schedule: {e}", "error")
@@ -6924,9 +6927,9 @@ def system_settings():
             try:
                 scheduler.reschedule_job("daily_check", trigger="cron",
                                          hour=hour, minute=minute)
-                flash(f"Scheduler updated to {hour:02d}:{minute:02d} IST. Effective immediately.", "success")
-            except Exception as e:
-                flash(f"Error rescheduling: {e}", "error")
+            except Exception:
+                pass  # scheduler not running on Vercel; setting saved to DB is enough
+            flash(f"Scheduler updated to {hour:02d}:{minute:02d} IST. Effective on next restart.", "success")
 
         elif action == "save_webhook":
             set_app_setting("webhook_url", request.form.get("webhook_url", "").strip())
@@ -6989,7 +6992,7 @@ def system_settings():
                 scheduler.reschedule_job("weekly_digest", trigger="cron",
                                          day_of_week="mon", hour=8, minute=0)
             except Exception:
-                pass
+                pass  # scheduler not running on Vercel
 
     sched_hour   = int(get_app_setting("scheduler_hour", "8"))
     sched_minute = int(get_app_setting("scheduler_minute", "0"))
@@ -7702,6 +7705,34 @@ def _scheduled_job():
             rel.commit()
         finally:
             rel.close()
+
+
+# ── Scheduler (disabled on Vercel — Cron Jobs call /run-check instead) ───────
+class _NoOpScheduler:
+    """Stub used on Vercel so scheduler.reschedule_job() calls don't crash."""
+    def reschedule_job(self, *a, **kw): pass
+    def add_job(self, *a, **kw): pass
+    def start(self): pass
+
+_IS_VERCEL = bool(os.environ.get("VERCEL"))
+if _IS_VERCEL:
+    scheduler = _NoOpScheduler()
+    log.info("Vercel detected — APScheduler disabled; using Vercel Cron Jobs.")
+else:
+    try:
+        from apscheduler.schedulers.background import BackgroundScheduler as _BGS
+        scheduler = _BGS(timezone="Asia/Kolkata")
+        with app.app_context():
+            _sched_hour   = int(get_app_setting("scheduler_hour",   "8"))
+            _sched_minute = int(get_app_setting("scheduler_minute", "0"))
+        scheduler.add_job(_scheduled_job,     "cron",
+                          hour=_sched_hour, minute=_sched_minute, id="daily_check")
+        scheduler.add_job(_weekly_digest_job, "cron",
+                          day_of_week="mon", hour=8, minute=0, id="weekly_digest")
+        scheduler.start()
+    except Exception as _sched_err:
+        log.warning("APScheduler not available: %s — using no-op stub.", _sched_err)
+        scheduler = _NoOpScheduler()
 
 
 # ── App startup ───────────────────────────────────────────────────────────────
