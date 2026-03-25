@@ -53,25 +53,25 @@ log = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
-# ── Secret key (must be set via environment variable on Vercel) ───────────────
+# ── Secret key (must be set via environment variable on Render) ───────────────
 _secret_key_env = os.environ.get("SECRET_KEY")
 if not _secret_key_env:
     raise RuntimeError(
         "SECRET_KEY environment variable is not set. "
         "Generate one with: python3 -c \"import secrets; print(secrets.token_hex(32))\" "
-        "and add it in the Vercel project dashboard under Settings → Environment Variables."
+        "and add it in the Render project dashboard under Environment → Environment Variables."
     )
 app.secret_key = _secret_key_env
 
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
 
-# ── Fernet encryption (must be set via environment variable on Vercel) ────────
+# ── Fernet encryption (must be set via environment variable on Render) ────────
 _fk_env = os.environ.get("FERNET_KEY")
 if not _fk_env:
     raise RuntimeError(
         "FERNET_KEY environment variable is not set. "
         "Generate one with: python3 -c \"from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())\" "
-        "and add it in the Vercel project dashboard under Settings → Environment Variables."
+        "and add it in the Render project dashboard under Environment → Environment Variables."
     )
 _FERNET_KEY = _fk_env.encode()
 
@@ -136,6 +136,8 @@ def log_audit(event_type: str, application_id: str = None, detail: str = "",
             )
         except Exception:
             # Fallback: insert without entry_hash (older schema)
+            # PostgreSQL requires a rollback after any failed statement before retrying
+            conn.rollback()
             conn.execute(
                 "INSERT INTO audit_log "
                 "(timestamp, application_id, event_type, detail, user_name, board_id) "
@@ -420,8 +422,8 @@ def _get_pool() -> "psycopg2.pool.ThreadedConnectionPool":
         if not DATABASE_URL:
             raise RuntimeError(
                 "DATABASE_URL environment variable is not set. "
-                "Add a Postgres database (Neon, Supabase, or Vercel Postgres) and set DATABASE_URL "
-                "in the Vercel project dashboard under Settings → Environment Variables."
+                "Add a Postgres database and set DATABASE_URL "
+                "in the Render project dashboard under Environment → Environment Variables."
             )
         _db_pool = psycopg2.pool.ThreadedConnectionPool(1, 3, DATABASE_URL)
     return _db_pool
@@ -804,7 +806,7 @@ def migrate_data():
         try:
             conn.execute("INSERT INTO boards (board_name) VALUES (?)", (b,))
         except Exception:
-            pass
+            conn.rollback()  # PostgreSQL requires rollback after any failed statement
     conn.commit()
 
     # 2. Rename role admin → super_admin
@@ -833,7 +835,7 @@ def migrate_data():
                 conn.execute("INSERT INTO programmes (programme_name, board_id) VALUES (?,?)",
                              (pname, board_row[0]))
             except Exception:
-                pass
+                conn.rollback()  # PostgreSQL requires rollback after any failed statement
     conn.commit()
 
     # 4. Backfill board_id on programme_config
@@ -911,7 +913,7 @@ def seed_data():
             conn.execute("INSERT INTO programmes (programme_name, board_id) VALUES (?,?)",
                          ("NABH Full Accreditation Hospitals", nabh_id))
         except Exception:
-            pass
+            conn.rollback()  # PostgreSQL requires rollback after any failed statement
         for row in _SEED_STAGES:
             conn.execute(
                 "INSERT INTO programme_config "
@@ -4482,6 +4484,7 @@ def settings():
                                 )
                                 copied += 1
                             except Exception:
+                                conn.rollback()  # PostgreSQL requires rollback after failed statement
                                 skipped += 1
                         conn.commit()
                         msg = f"Copied {copied} stage(s) from '{src_prog}' to '{dst_prog}'."
@@ -4548,6 +4551,7 @@ def settings():
                                 )
                                 copied2 += 1
                             except Exception:
+                                conn.rollback()  # PostgreSQL requires rollback after failed statement
                                 skipped2 += 1
                         conn.commit()
                         msg2 = f"Copied {copied2} stage(s) from '{src_prog}' to '{dst_prog}'."
