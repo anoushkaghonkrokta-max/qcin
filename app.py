@@ -4593,14 +4593,20 @@ def settings():
                     stage_flags += '<span style="background:#e0f2fe;color:#0369a1;font-size:10px;padding:1px 6px;border-radius:4px;margin-left:4px"><i class="bi bi-skip-forward-fill"></i> Optional</span>'
                 sname_js = s["stage_name"].replace("'", "\\'").replace('"', '&quot;')
                 if is_ba:
-                    _es_owner_js = (s["owner_type"] or "").replace("'", "\\'")
                     edit_stage_btn = (
                         f'<button class="btn btn-sm btn-outline-primary py-0 px-1 me-1" style="font-size:11px" '
                         f'title="Edit stage" '
-                        f'onclick="editStage({s["id"]}, {json.dumps(s["stage_name"])}, {s["stage_order"]}, '
-                        f'{s["tat_days"]}, {s["reminder1_day"]}, {s["reminder2_day"]}, '
-                        f'{json.dumps(s["owner_type"] or "")}, {s["overdue_interval_days"]}, '
-                        f'{s["is_milestone"]}, {int(s.get("is_optional", 0))})">'
+                        f'data-sid="{s["id"]}" '
+                        f'data-name="{h(s["stage_name"])}" '
+                        f'data-order="{s["stage_order"]}" '
+                        f'data-tat="{s["tat_days"]}" '
+                        f'data-r1="{s["reminder1_day"]}" '
+                        f'data-r2="{s["reminder2_day"]}" '
+                        f'data-owner="{h(s["owner_type"] or "")}" '
+                        f'data-odi="{s["overdue_interval_days"]}" '
+                        f'data-ms="{s["is_milestone"]}" '
+                        f'data-opt="{int(s.get("is_optional", 0))}" '
+                        f'onclick="editStageFromBtn(this)">'
                         f'<i class="bi bi-pencil"></i></button>'
                     )
                     del_stage_btn = (
@@ -5140,6 +5146,10 @@ def settings():
 function togglePanel(id){
   var el = document.getElementById(id);
   el.style.display = el.style.display === 'none' ? '' : 'none';
+}
+function editStageFromBtn(btn) {
+  var d = btn.dataset;
+  editStage(d.sid, d.name, d.order, d.tat, d.r1, d.r2, d.owner, d.odi, d.ms, d.opt);
 }
 function editStage(id, name, order, tat, r1, r2, owner, odi, ms, opt) {
   document.getElementById('es_id').value = id;
