@@ -1557,9 +1557,11 @@ th{white-space:nowrap}
     <a class="nav-link {{ 'active' if active_page=='dashboard' else '' }}" href="/">
       <i class="bi bi-speedometer2"></i> Dashboard
     </a>
+    {% if user_role in ('program_officer', 'program_head') %}
     <a class="nav-link {{ 'active' if active_page=='my_cases' else '' }}" href="/?my_cases=1">
       <i class="bi bi-person-check"></i> My Cases
     </a>
+    {% endif %}
     <a class="nav-link {{ 'active' if active_page=='log' else '' }}" href="/log-stage">
       <i class="bi bi-plus-circle"></i> Log Stage Change
     </a>
@@ -2685,6 +2687,10 @@ def dashboard():
         if po_email and po_email["email"]:
             base_q += " AND program_officer_email=?"
             base_params.append(po_email["email"])
+        else:
+            # No email on this account — return zero results with a flash hint
+            base_q += " AND 1=0"
+            flash("Your account has no email address set. Add one in your profile so 'My Cases' can filter correctly.", "info")
 
     cases = [dict(r) for r in conn.execute(base_q, base_params).fetchall()]
     conn.close()
