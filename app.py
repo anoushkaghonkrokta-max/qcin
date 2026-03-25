@@ -591,10 +591,22 @@ def init_db():
         "ALTER TABLE users ADD COLUMN IF NOT EXISTS board_id INTEGER",
         "ALTER TABLE users ADD COLUMN IF NOT EXISTS force_password_reset INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE users ADD COLUMN IF NOT EXISTS totp_secret TEXT",
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS last_login TEXT",
         "ALTER TABLE case_tracking ADD COLUMN IF NOT EXISTS board_id INTEGER",
         "ALTER TABLE case_tracking ADD COLUMN IF NOT EXISTS cc_emails TEXT",
         "ALTER TABLE case_tracking ADD COLUMN IF NOT EXISTS suppress_until TEXT",
+        "ALTER TABLE case_tracking ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'Active'",
         "ALTER TABLE email_templates ADD COLUMN IF NOT EXISTS board_id INTEGER",
+        "ALTER TABLE holidays ADD COLUMN IF NOT EXISTS board_id INTEGER",
+        "ALTER TABLE case_tracking ADD COLUMN IF NOT EXISTS hold_days INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE case_tracking ADD COLUMN IF NOT EXISTS hold_start_date TEXT",
+        "ALTER TABLE audit_log ADD COLUMN IF NOT EXISTS entry_hash TEXT",
+        "ALTER TABLE programme_config ADD COLUMN IF NOT EXISTS is_optional INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE programmes ADD COLUMN IF NOT EXISTS tat_days INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE programmes ADD COLUMN IF NOT EXISTS reminder1_days INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE programmes ADD COLUMN IF NOT EXISTS reminder2_days INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE programmes ADD COLUMN IF NOT EXISTS overdue_days INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE programmes ADD COLUMN IF NOT EXISTS notification_emails TEXT",
     ]:
         try:
             conn.execute(sql)
@@ -2088,7 +2100,7 @@ def manage_users():
         _urole = u["role"]
         remap_btn = (
             '<button class="btn btn-sm btn-outline-primary" style="font-size:12px;padding:3px 8px" title="Map Programmes" '
-            f'onclick="showRemapPh({_uid}, {json.dumps(_uname)}, {json.dumps(_urole)})">'
+            f'onclick="showRemapPh({json.dumps(str(_uid))}, {json.dumps(str(_uname))}, {json.dumps(str(_urole))})">'
             '<i class="bi bi-diagram-3"></i></button>'
             if _urole in _REMAP_ROLES else ""
         )
@@ -4159,6 +4171,39 @@ def settings():
                     except Exception as e:
                         flash(f"Error: {e}", "error")
 
+        elif action == "edit_programme":
+            ep_name = request.form.get("programme_name", "").strip()
+            if not ep_name:
+                flash("Programme name missing.", "error")
+            else:
+                ep_row = conn.execute(
+                    "SELECT board_id FROM programmes WHERE programme_name=?", (ep_name,)
+                ).fetchone()
+                if not ep_row:
+                    flash("Programme not found.", "error")
+                elif session.get("role") == "board_admin" and ep_row["board_id"] != session.get("board_id"):
+                    flash("Cannot edit a programme from another board.", "error")
+                else:
+                    try:
+                        conn.execute(
+                            """UPDATE programmes SET
+                               tat_days=?, reminder1_days=?, reminder2_days=?,
+                               overdue_days=?, notification_emails=?
+                               WHERE programme_name=?""",
+                            (
+                                int(request.form.get("tat_days", 0) or 0),
+                                int(request.form.get("reminder1_days", 0) or 0),
+                                int(request.form.get("reminder2_days", 0) or 0),
+                                int(request.form.get("overdue_days", 0) or 0),
+                                request.form.get("notification_emails", "").strip() or None,
+                                ep_name,
+                            )
+                        )
+                        conn.commit()
+                        flash(f"Programme '{ep_name}' updated.", "success")
+                    except Exception as e:
+                        flash(f"Error updating programme: {e}", "error")
+
         elif action == "add_stage":
             pname = request.form.get("programme_name", "").strip()
             sname = request.form.get("stage_name", "").strip()
@@ -4389,6 +4434,72 @@ def settings():
                             msg += f" {skipped} skipped (order conflict)."
                         flash(msg, "success")
 
+        elif action == "copy_stages_from":
+            src_prog = request.form.get("source_programme_name", "").strip()
+            dst_prog = request.form.get("current_programme_name", "").strip()
+            confirm_replace = request.form.get("confirm_replace") == "1"
+            if not src_prog or not dst_prog:
+                flash("Source and current programme names are required.", "error")
+            elif src_prog == dst_prog:
+                flash("Source and destination cannot be the same programme.", "error")
+            else:
+                src_row = conn.execute(
+                    "SELECT id, board_id FROM programmes WHERE programme_name=?", (src_prog,)
+                ).fetchone()
+                dst_row2 = conn.execute(
+                    "SELECT id, board_id FROM programmes WHERE programme_name=?", (dst_prog,)
+                ).fetchone()
+                if not src_row or not dst_row2:
+                    flash("Programme not found.", "error")
+                elif src_row["board_id"] != dst_row2["board_id"]:
+                    flash("Both programmes must belong to the same board.", "error")
+                elif session.get("role") == "board_admin" and dst_row2["board_id"] != session.get("board_id"):
+                    flash("Cannot copy stages to a programme in another board.", "error")
+                else:
+                    src_stages = conn.execute(
+                        "SELECT * FROM programme_config WHERE programme_name=? ORDER BY stage_order",
+                        (src_prog,)
+                    ).fetchall()
+                    if not src_stages:
+                        flash(f"Source programme '{src_prog}' has no stages to copy.", "error")
+                    else:
+                        if confirm_replace:
+                            conn.execute(
+                                "DELETE FROM programme_config WHERE programme_name=?", (dst_prog,)
+                            )
+                            conn.commit()
+                        copied2 = 0
+                        skipped2 = 0
+                        for _ss2 in src_stages:
+                            _exist2 = conn.execute(
+                                "SELECT id FROM programme_config WHERE programme_name=? AND stage_order=?",
+                                (dst_prog, _ss2["stage_order"])
+                            ).fetchone()
+                            if _exist2 and not confirm_replace:
+                                skipped2 += 1
+                                continue
+                            try:
+                                conn.execute(
+                                    """INSERT INTO programme_config
+                                       (programme_name, stage_name, stage_order, tat_days,
+                                        reminder1_day, reminder2_day, owner_type,
+                                        overdue_interval_days, is_milestone, is_optional, board_id)
+                                       VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+                                    (dst_prog, _ss2["stage_name"], _ss2["stage_order"],
+                                     _ss2["tat_days"], _ss2["reminder1_day"], _ss2["reminder2_day"],
+                                     _ss2["owner_type"], _ss2["overdue_interval_days"],
+                                     _ss2["is_milestone"], _ss2["is_optional"],
+                                     dst_row2["board_id"])
+                                )
+                                copied2 += 1
+                            except Exception:
+                                skipped2 += 1
+                        conn.commit()
+                        msg2 = f"Copied {copied2} stage(s) from '{src_prog}' to '{dst_prog}'."
+                        if skipped2:
+                            msg2 += f" {skipped2} skipped (order conflict)."
+                        flash(msg2, "success")
+
         elif action == "update_schedule":
             if session.get("role") != "super_admin":
                 flash("Only Super Admin can change the schedule.", "error")
@@ -4585,7 +4696,19 @@ def settings():
                 stages_table_html = '<div style="padding:16px 20px;color:#94a3b8;font-size:13px">No stages configured yet.</div>'
 
             del_prog_btn = ""
+            edit_prog_btn = ""
             if is_ba:
+                _p_tat = p.get("tat_days") or 0
+                _p_r1 = p.get("reminder1_days") or 0
+                _p_r2 = p.get("reminder2_days") or 0
+                _p_od = p.get("overdue_days") or 0
+                _p_emails = h(p.get("notification_emails") or "")
+                edit_prog_btn = (
+                    f'<button class="btn btn-sm btn-outline-secondary ms-2 flex-shrink-0" '
+                    f'style="font-size:11px;padding:4px 10px;white-space:nowrap" '
+                    f'onclick="editProgramme({json.dumps(pname)}, {_p_tat}, {_p_r1}, {_p_r2}, {_p_od}, {json.dumps(_p_emails)})">'
+                    f'<i class="bi bi-gear"></i> Edit</button>'
+                )
                 del_prog_btn = f"""
     <form method="post" class="ms-2 flex-shrink-0"
           onsubmit="return confirm('Delete programme &quot;{pname}&quot; and ALL its stages? This cannot be undone.')">
@@ -4608,11 +4731,39 @@ def settings():
         <span class="ms-auto" style="font-size:12px;color:#94a3b8">{len(stages)} stages</span>
       </div>
     </button>
+    {edit_prog_btn}
     {del_prog_btn}
   </div>
   <div id="prog_{pid_safe}" class="accordion-collapse collapse">
     <div class="accordion-body p-0">
       {stages_table_html}
+      <div style="padding:12px 20px;background:#f0fdf4;border-top:1px solid #e2e8f0">
+        <div style="font-size:12px;font-weight:600;color:#64748b;text-transform:uppercase;letter-spacing:.5px;margin-bottom:8px">
+          <i class="bi bi-copy"></i> Copy Stages From Another Programme
+        </div>
+        <form method="post" class="row g-2 align-items-end">
+          <input type="hidden" name="action" value="copy_stages_from">
+          <input type="hidden" name="current_programme_name" value="{pname}">
+          <div class="col">
+            <label class="form-label" style="font-size:11px">Source Programme (same board)</label>
+            <select class="form-select form-select-sm" name="source_programme_name" required>
+              <option value="">— select source —</option>
+              {''.join(f'<option value="{h(op["programme_name"])}">{h(op["programme_name"])}</option>' for op in board_programmes[b["id"]] if op["programme_name"] != pname)}
+            </select>
+          </div>
+          <div class="col-auto d-flex align-items-end gap-2">
+            <div class="form-check mb-0" style="white-space:nowrap">
+              <input class="form-check-input" type="checkbox" name="confirm_replace" value="1"
+                     id="cr_{pid_safe}" onchange="return this.checked ? confirm('This will DELETE all existing stages in &quot;{pname}&quot; first. Are you sure?') : true">
+              <label class="form-check-label" style="font-size:11px" for="cr_{pid_safe}">Replace existing</label>
+            </div>
+            <button class="btn btn-sm btn-outline-success" type="submit"
+                    onclick="return confirm('Copy stages from selected programme into &quot;{pname}&quot;?')">
+              <i class="bi bi-copy"></i> Copy
+            </button>
+          </div>
+        </form>
+      </div>
       <div style="padding:16px 20px;background:#f8fafc;border-top:1px solid #e2e8f0">
         <div style="font-size:12px;font-weight:600;color:#64748b;text-transform:uppercase;letter-spacing:.5px;margin-bottom:12px">
           <i class="bi bi-envelope-at"></i> Outbound Email Settings
@@ -5106,7 +5257,67 @@ function editStage(id, name, order, tat, r1, r2, owner, odi, ms, opt) {
   document.getElementById('es_opt').checked = (opt == 1);
   new bootstrap.Modal(document.getElementById('editStageModal')).show();
 }
-</script>"""
+function editProgramme(name, tat, r1, r2, od, emails) {
+  document.getElementById('ep_name').value = name;
+  document.getElementById('ep_tat').value = tat;
+  document.getElementById('ep_r1').value = r1;
+  document.getElementById('ep_r2').value = r2;
+  document.getElementById('ep_od').value = od;
+  document.getElementById('ep_emails').value = emails;
+  new bootstrap.Modal(document.getElementById('editProgModal')).show();
+}
+</script>
+<!-- Edit Programme Modal -->
+<div class="modal fade" id="editProgModal" tabindex="-1">
+  <div class="modal-dialog modal-dialog-centered">
+    <div class="modal-content">
+      <div class="modal-header" style="background:#f8fafc;border-bottom:1px solid #e2e8f0">
+        <h6 class="modal-title" style="font-weight:600">
+          <i class="bi bi-gear" style="color:#7c3aed"></i> Edit Programme Settings
+        </h6>
+        <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+      </div>
+      <form method="post" id="editProgForm">
+        <input type="hidden" name="action" value="edit_programme">
+        <input type="hidden" name="programme_name" id="ep_name">
+        <div class="modal-body">
+          <div class="row g-2 mb-3">
+            <div class="col-6">
+              <label class="form-label" style="font-size:12px;font-weight:600">Default TAT Days</label>
+              <input type="number" class="form-control form-control-sm" name="tat_days" id="ep_tat" min="0" value="0">
+            </div>
+            <div class="col-6">
+              <label class="form-label" style="font-size:12px;font-weight:600">Overdue Days</label>
+              <input type="number" class="form-control form-control-sm" name="overdue_days" id="ep_od" min="0" value="0">
+            </div>
+          </div>
+          <div class="row g-2 mb-3">
+            <div class="col-6">
+              <label class="form-label" style="font-size:12px;font-weight:600">Reminder 1 Days</label>
+              <input type="number" class="form-control form-control-sm" name="reminder1_days" id="ep_r1" min="0" value="0">
+            </div>
+            <div class="col-6">
+              <label class="form-label" style="font-size:12px;font-weight:600">Reminder 2 Days</label>
+              <input type="number" class="form-control form-control-sm" name="reminder2_days" id="ep_r2" min="0" value="0">
+            </div>
+          </div>
+          <div class="mb-3">
+            <label class="form-label" style="font-size:12px;font-weight:600">Notification Emails <span style="color:#94a3b8;font-weight:400">(comma-separated)</span></label>
+            <input type="text" class="form-control form-control-sm" name="notification_emails" id="ep_emails"
+                   placeholder="admin@org.com, manager@org.com">
+            <div style="font-size:11px;color:#94a3b8;margin-top:4px">These addresses receive programme-level notification copies.</div>
+          </div>
+        </div>
+        <div class="modal-footer" style="background:#f8fafc;border-top:1px solid #e2e8f0">
+          <button type="button" class="btn btn-sm btn-outline-secondary" data-bs-dismiss="modal">Cancel</button>
+          <button type="submit" class="btn btn-sm btn-primary">
+            <i class="bi bi-check-lg"></i> Save Changes
+          </button>
+        </div>
+      </form>
+    </div>
+  </div>
+</div>"""
     return render_page(content, scripts, active_page="settings",
                        page_title="Programme Settings")
 
