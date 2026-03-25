@@ -5443,7 +5443,7 @@ def email_templates_page():
             (et_bid,)
         ).fetchall()]
         stages_rows = conn.execute(
-            "SELECT DISTINCT programme_name, stage_name FROM programme_config "
+            "SELECT DISTINCT programme_name, stage_name, stage_order FROM programme_config "
             "WHERE programme_name IN (SELECT programme_name FROM programmes WHERE board_id=?) "
             "ORDER BY programme_name, stage_order",
             (et_bid,)
@@ -5459,7 +5459,7 @@ def email_templates_page():
             "SELECT * FROM stage_email_override ORDER BY programme_name, stage_name"
         ).fetchall()]
         stages_rows = conn.execute(
-            "SELECT DISTINCT programme_name, stage_name FROM programme_config ORDER BY programme_name, stage_order"
+            "SELECT DISTINCT programme_name, stage_name, stage_order FROM programme_config ORDER BY programme_name, stage_order"
         ).fetchall()
     conn.close()
 
