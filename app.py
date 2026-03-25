@@ -13,6 +13,7 @@ import smtplib
 import psycopg2
 import psycopg2.extras
 import struct
+import threading
 import time
 import urllib.request
 from datetime import date, datetime, timedelta
@@ -386,41 +387,30 @@ _HOLIDAYS = {
 }
 
 
-def _get_all_holidays():
-    """Return combined set of hardcoded + DB holidays."""
-    holidays = set(_HOLIDAYS)
-    try:
-        conn = get_db()
-        rows = conn.execute("SELECT holiday_date FROM holidays").fetchall()
-        conn.close()
-        for r in rows:
-            try:
-                holidays.add(date.fromisoformat(r[0]))
-            except Exception:
-                pass
-    except Exception:
-        pass
-    return holidays
-
-
 def working_days_elapsed(start: str, end_d=None, hold_days: int = 0) -> int:
-    """Working days from start (inclusive) to end (inclusive, default today), minus hold_days."""
+    """Working days from start (inclusive) to end (inclusive, default today).
+
+    hold_days: subtract paused/on-hold days from the elapsed count.
+    start strings longer than 10 chars (e.g. Excel datetime exports) are
+    truncated to the date portion before parsing.
+    """
     if end_d is None:
         end_d = date.today()
     if not start:
-        return 0  # guard against None / empty string from bad data
+        return 0
     try:
+        if isinstance(start, str):
+            start = start[:10]  # trim Excel datetime suffix e.g. "2024-01-15 00:00:00"
         s = datetime.strptime(start, "%Y-%m-%d").date() if isinstance(start, str) else start
     except (ValueError, TypeError):
-        return 0  # unparseable date — treat as 0 elapsed rather than crashing dashboard
-    all_holidays = _get_all_holidays()
+        return 0
     count = 0
     cur = s
     while cur <= end_d:
         if cur.weekday() < 5 and cur not in all_holidays:
             count += 1
         cur += timedelta(days=1)
-    return max(0, count - 1 - hold_days)  # days elapsed after start date, minus hold
+    return max(0, count - 1 - hold_days)  # days elapsed after start date, minus hold days
 
 
 # ── Database helpers ─────────────────────────────────────────────────────────
@@ -587,47 +577,10 @@ def init_db():
             error_msg       TEXT,
             board_id        INTEGER
         );
-        CREATE TABLE IF NOT EXISTS user_programme_map (
-            user_id      INTEGER NOT NULL REFERENCES users(id),
-            programme_id INTEGER NOT NULL REFERENCES programmes(id),
-            PRIMARY KEY (user_id, programme_id)
-        );
-        CREATE TABLE IF NOT EXISTS holidays (
-            id           INTEGER PRIMARY KEY AUTOINCREMENT,
-            holiday_date TEXT NOT NULL UNIQUE,
-            name         TEXT NOT NULL,
-            description  TEXT
-        );
-        CREATE TABLE IF NOT EXISTS saved_filters (
-            id          INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id     INTEGER NOT NULL REFERENCES users(id),
-            filter_name TEXT NOT NULL,
-            filter_json TEXT NOT NULL,
-            created_at  TEXT NOT NULL,
-            UNIQUE(user_id, filter_name)
-        );
-        CREATE TABLE IF NOT EXISTS stage_email_override (
-            id                INTEGER PRIMARY KEY AUTOINCREMENT,
-            programme_name    TEXT NOT NULL,
-            stage_name        TEXT NOT NULL,
-            notification_type TEXT NOT NULL,
-            subject_line      TEXT NOT NULL,
-            email_body        TEXT NOT NULL,
-            UNIQUE(programme_name, stage_name, notification_type)
-        );
         CREATE TABLE IF NOT EXISTS scheduler_locks (
-            lock_name  TEXT PRIMARY KEY,
-            locked_at  TEXT NOT NULL,
-            worker_pid INTEGER
-        );
-        CREATE TABLE IF NOT EXISTS api_keys (
-            id         INTEGER PRIMARY KEY AUTOINCREMENT,
-            key_hash   TEXT NOT NULL UNIQUE,
-            name       TEXT NOT NULL,
-            board_id   INTEGER,
-            created_at TEXT NOT NULL,
-            last_used  TEXT,
-            is_active  INTEGER NOT NULL DEFAULT 1
+            lock_name       TEXT PRIMARY KEY,
+            locked_at       TEXT NOT NULL,
+            worker_id       TEXT NOT NULL
         );
     """)
     # Migrate existing DBs: add columns if absent (IF NOT EXISTS is safe to re-run)
@@ -1292,66 +1245,23 @@ def run_weekly_digest():
 def upsert_case(data: dict) -> str:
     """Insert or update a case. Returns 'created' or 'updated'."""
     conn = get_db()
-    cfg = conn.execute(
-        "SELECT tat_days,reminder1_day,reminder2_day,owner_type,is_milestone,overdue_interval_days,board_id "
-        "FROM programme_config WHERE programme_name=? AND stage_name=?",
-        (data["programme_name"], data["stage_name"]),
-    ).fetchone()
-    if not cfg:
-        conn.close()
-        raise ValueError(f"Stage '{data['stage_name']}' not found in programme '{data['programme_name']}'")
+    try:
+        cfg = conn.execute(
+            "SELECT tat_days,reminder1_day,reminder2_day,owner_type,is_milestone,overdue_interval_days,board_id "
+            "FROM programme_config WHERE programme_name=? AND stage_name=?",
+            (data["programme_name"], data["stage_name"]),
+        ).fetchone()
+        if not cfg:
+            raise ValueError(f"Stage '{data['stage_name']}' not found in programme '{data['programme_name']}'")
 
-    existing = conn.execute(
-        "SELECT id, current_stage FROM case_tracking WHERE application_id=?", (data["application_id"],)
-    ).fetchone()
+        existing = conn.execute(
+            "SELECT id, current_stage FROM case_tracking WHERE application_id=?", (data["application_id"],)
+        ).fetchone()
 
-    board_id = cfg["board_id"]
-    if existing:
-        old_stage = existing["current_stage"]
-        new_stage = data["stage_name"]
-        # Stage order validation (skip for API calls, super_admin, board_admin, or same stage)
-        try:
-            _caller_role = session.get("role", "")
-        except Exception:
-            _caller_role = ""
-        if (old_stage != new_stage
-                and not data.get("_force_advance")
-                and _caller_role not in ("super_admin", "board_admin")):
-            old_cfg = conn.execute(
-                "SELECT stage_order FROM programme_config WHERE programme_name=? AND stage_name=?",
-                (data["programme_name"], old_stage)
-            ).fetchone()
-            new_cfg_order = conn.execute(
-                "SELECT stage_order FROM programme_config WHERE programme_name=? AND stage_name=?",
-                (data["programme_name"], new_stage)
-            ).fetchone()
-            if old_cfg and new_cfg_order:
-                old_order = old_cfg["stage_order"]
-                new_order = new_cfg_order["stage_order"]
-                if new_order < old_order:
-                    conn.close()
-                    raise ValueError(
-                        f"Stage '{new_stage}' (order {new_order}) comes before "
-                        f"'{old_stage}' (order {old_order}). Cannot move backwards."
-                    )
-                if new_order > old_order + 1:
-                    # Check all intermediate stages are optional
-                    intermediates = conn.execute(
-                        "SELECT stage_name, is_optional FROM programme_config "
-                        "WHERE programme_name=? AND stage_order > ? AND stage_order < ? ORDER BY stage_order",
-                        (data["programme_name"], old_order, new_order)
-                    ).fetchall()
-                    non_optional = [r["stage_name"] for r in intermediates if not r["is_optional"]]
-                    if non_optional:
-                        conn.close()
-                        raise ValueError(
-                            f"Cannot skip required stage(s): {', '.join(non_optional)}. "
-                            f"Only optional stages may be skipped."
-                        )
-                    # Log skipped optional stages for audit
-                    data["_skipped_stages"] = [r["stage_name"] for r in intermediates]
-        if old_stage != new_stage:
-            # Stage changed — reset notification flags so new stage gets fresh reminders
+        board_id = cfg["board_id"]
+        if existing:
+            old_stage = existing["current_stage"]
+            new_stage = data["stage_name"]
             conn.execute(
                 """UPDATE case_tracking SET
                    programme_name=?, organisation_name=?, current_stage=?, stage_start_date=?,
@@ -1368,25 +1278,32 @@ def upsert_case(data: dict) -> str:
                  data.get("cc_emails") or None, data.get("suppress_until") or None,
                  data["application_id"]),
             )
+            conn.commit()
+            action = "updated"
         else:
-            # Same stage — preserve notification flags, only update metadata
             conn.execute(
-                """UPDATE case_tracking SET
-                   programme_name=?, organisation_name=?, current_stage=?, stage_start_date=?,
-                   tat_days=?, reminder1_day=?, reminder2_day=?, owner_type=?,
-                   action_owner_name=?, action_owner_email=?, program_officer_email=?,
-                   is_milestone=?, board_id=?,
-                   cc_emails=?, suppress_until=?
-                   WHERE application_id=?""",
-                (data["programme_name"], data["organisation_name"], data["stage_name"],
-                 data["stage_start_date"], cfg["tat_days"], cfg["reminder1_day"], cfg["reminder2_day"],
-                 cfg["owner_type"], data["action_owner_name"], data["action_owner_email"],
+                """INSERT INTO case_tracking
+                   (application_id,programme_name,organisation_name,current_stage,stage_start_date,
+                    tat_days,reminder1_day,reminder2_day,owner_type,
+                    action_owner_name,action_owner_email,program_officer_email,is_milestone,board_id,
+                    cc_emails,suppress_until)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (data["application_id"], data["programme_name"], data["organisation_name"],
+                 data["stage_name"], data["stage_start_date"],
+                 cfg["tat_days"], cfg["reminder1_day"], cfg["reminder2_day"], cfg["owner_type"],
+                 data["action_owner_name"], data["action_owner_email"],
                  data["program_officer_email"], cfg["is_milestone"], board_id,
-                 data.get("cc_emails") or None, data.get("suppress_until") or None,
-                 data["application_id"]),
+                 data.get("cc_emails") or None, data.get("suppress_until") or None),
             )
-        conn.commit()
+            conn.commit()
+            action = "created"
+    finally:
         conn.close()
+
+    # Audit/history logging runs outside the connection (uses its own conn)
+    if action == "updated":
+        old_stage = existing["current_stage"]
+        new_stage = data["stage_name"]
         if old_stage != new_stage:
             log_stage_transition(data["application_id"], old_stage, new_stage,
                                  data.get("_changed_by", ""), board_id)
@@ -1398,29 +1315,12 @@ def upsert_case(data: dict) -> str:
         else:
             log_audit("case_updated", data["application_id"],
                       f"Updated (stage: {new_stage})", data.get("_changed_by", ""), board_id)
-        return "updated"
     else:
-        conn.execute(
-            """INSERT INTO case_tracking
-               (application_id,programme_name,organisation_name,current_stage,stage_start_date,
-                tat_days,reminder1_day,reminder2_day,owner_type,
-                action_owner_name,action_owner_email,program_officer_email,is_milestone,board_id,
-                cc_emails,suppress_until)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-            (data["application_id"], data["programme_name"], data["organisation_name"],
-             data["stage_name"], data["stage_start_date"],
-             cfg["tat_days"], cfg["reminder1_day"], cfg["reminder2_day"], cfg["owner_type"],
-             data["action_owner_name"], data["action_owner_email"],
-             data["program_officer_email"], cfg["is_milestone"], board_id,
-             data.get("cc_emails") or None, data.get("suppress_until") or None),
-        )
-        conn.commit()
-        conn.close()
         log_stage_transition(data["application_id"], None, data["stage_name"],
                              data.get("_changed_by", ""), board_id)
         log_audit("case_created", data["application_id"],
                   f"New case: {data['stage_name']}", data.get("_changed_by", ""), board_id)
-        return "created"
+    return action
 
 
 # ── HTML base template ────────────────────────────────────────────────────────
@@ -5227,8 +5127,10 @@ def email_templates_page():
                 )
             else:
                 conn.execute(
-                    "INSERT OR REPLACE INTO email_templates "
-                    "(programme_name, notification_type, subject_line, email_body) VALUES (?,?,?,?)",
+                    "INSERT INTO email_templates "
+                    "(programme_name, notification_type, subject_line, email_body) VALUES (?,?,?,?) "
+                    "ON CONFLICT(programme_name, notification_type) "
+                    "DO UPDATE SET subject_line=EXCLUDED.subject_line, email_body=EXCLUDED.email_body",
                     (request.form["programme_name"], request.form["notification_type"],
                      request.form["subject_line"], request.form["email_body"]),
                 )
@@ -7474,51 +7376,63 @@ def healthz():
 @app.route("/run-check")
 @admin_required
 def run_check():
-    """Trigger daily check in a background thread so the request returns immediately
-    instead of blocking until all SMTP sends complete (avoids 30-60s gateway timeouts)."""
-    import threading
-    _job_id = secrets.token_hex(4)
-
     def _bg():
-        log.info("Manual run-check started (job=%s)", _job_id)
-        result = run_daily_check()
-        log.info("Manual run-check done (job=%s): %s", _job_id, result)
+        try:
+            run_daily_check()
+        except Exception as exc:
+            log.error("Background run-check failed: %s", exc)
 
-    t = threading.Thread(target=_bg, daemon=True)
-    t.start()
-    return jsonify({"ok": True, "message": "Check triggered in background.", "job_id": _job_id})
+    threading.Thread(target=_bg, daemon=True).start()
+    return jsonify({"status": "started", "message": "Daily check is running in the background."})
 
 
 # ── Scheduler ─────────────────────────────────────────────────────────────────
 def _scheduled_job():
-    """Daily check with atomic DB lock to prevent multi-worker duplicate runs.
-
-    Uses a single atomic UPDATE (not SELECT+INSERT) to win the lock.
-    Only the worker whose UPDATE returns rowcount=1 proceeds.
-    """
-    conn = get_db()
+    """Run the daily check with an atomic DB-level lock so only one worker fires it."""
+    worker_id = secrets.token_hex(8)
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    # Ensure the lock row exists (idempotent — INSERT OR IGNORE with epoch sentinel)
-    conn.execute(
-        "INSERT OR IGNORE INTO scheduler_locks (lock_name, locked_at, worker_pid) "
-        "VALUES ('daily_check', '2000-01-01 00:00:00', 0)"
-    )
-    conn.commit()
-    # Atomic compare-and-swap: only update if lock is older than 10 minutes
-    cutoff = (datetime.now() - timedelta(minutes=10)).strftime("%Y-%m-%d %H:%M:%S")
-    cur = conn.execute(
-        "UPDATE scheduler_locks SET locked_at=?, worker_pid=? "
-        "WHERE lock_name='daily_check' AND locked_at < ?",
-        (now_str, os.getpid(), cutoff)
-    )
-    conn.commit()
-    conn.close()
-    if cur.rowcount != 1:
-        log.info("Scheduler: another worker holds the lock — skipping.")
-        return
-    log.info("Scheduled daily check running… (pid=%s)", os.getpid())
-    result = run_daily_check()
-    log.info("Daily check complete: %s", result)
+    # Stale lock threshold: if another worker crashed, release locks older than 10 min
+    stale_cutoff = (datetime.now() - timedelta(minutes=10)).strftime("%Y-%m-%d %H:%M:%S")
+    conn = get_db()
+    try:
+        # Delete any stale locks first
+        conn.execute(
+            "DELETE FROM scheduler_locks WHERE lock_name='daily_check' AND locked_at < ?",
+            (stale_cutoff,),
+        )
+        conn.commit()
+        # Atomically claim the lock — fails silently if another worker already holds it
+        conn.execute(
+            "INSERT INTO scheduler_locks (lock_name, locked_at, worker_id) VALUES (?,?,?) "
+            "ON CONFLICT (lock_name) DO NOTHING",
+            ("daily_check", now_str, worker_id),
+        )
+        conn.commit()
+        # Check whether we won the lock
+        row = conn.execute(
+            "SELECT worker_id FROM scheduler_locks WHERE lock_name='daily_check'",
+        ).fetchone()
+        if not row or row["worker_id"] != worker_id:
+            log.info("Scheduler lock held by another worker — skipping.")
+            return
+    finally:
+        conn.close()
+
+    try:
+        log.info("Scheduled daily check running… (worker %s)", worker_id)
+        result = run_daily_check()
+        log.info("Daily check complete: %s", result)
+    finally:
+        # Release the lock
+        rel = get_db()
+        try:
+            rel.execute(
+                "DELETE FROM scheduler_locks WHERE lock_name='daily_check' AND worker_id=?",
+                (worker_id,),
+            )
+            rel.commit()
+        finally:
+            rel.close()
 
 
 def _weekly_digest_job():
