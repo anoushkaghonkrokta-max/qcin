@@ -983,6 +983,28 @@ def run_daily_check(board_id=None) -> dict:
     summary = {"r1": 0, "r2": 0, "overdue": 0, "followup": 0,
                "skipped_milestone": 0, "errors": []}
 
+    # Pre-fetch programme_config to avoid N+1 queries per case
+    _pc_rows = conn.execute(
+        "SELECT programme_name, stage_name, overdue_interval_days, "
+        "sender_email, sender_password, smtp_host, smtp_port "
+        "FROM programme_config"
+    ).fetchall()
+    _pc_lookup = {(r["programme_name"], r["stage_name"]): dict(r) for r in _pc_rows}
+
+    # Pre-fetch programme → programme_head email mapping for escalations
+    _ph_rows = conn.execute(
+        """SELECT p.programme_name, u.email, u.full_name
+           FROM programmes p
+           JOIN user_programme_map upm ON upm.programme_id = p.id
+           JOIN users u ON u.id = upm.user_id
+           WHERE u.role='program_head' AND u.email IS NOT NULL"""
+    ).fetchall()
+    _ph_map: dict = {}
+    for _r in _ph_rows:
+        _ph_map.setdefault(_r["programme_name"], []).append(
+            {"email": _r["email"], "full_name": _r["full_name"]}
+        )
+
     for case in cases:
         # Skip closed/withdrawn/suspended/on-hold cases
         case_status = case.get("status", "Active")
@@ -997,11 +1019,7 @@ def run_daily_check(board_id=None) -> dict:
         r1_day  = case["reminder1_day"]
         r2_day  = case["reminder2_day"]
 
-        cfg = conn.execute(
-            "SELECT overdue_interval_days, sender_email, sender_password, smtp_host, smtp_port "
-            "FROM programme_config WHERE programme_name=? AND stage_name=?",
-            (case["programme_name"], case["current_stage"]),
-        ).fetchone()
+        cfg = _pc_lookup.get((case["programme_name"], case["current_stage"]))
 
         overdue_interval = cfg["overdue_interval_days"] if cfg else 3
         sender_email     = cfg["sender_email"] if cfg and cfg["sender_email"] else None
@@ -1061,18 +1079,7 @@ def run_daily_check(board_id=None) -> dict:
             days_overdue = elapsed - tat
             if days_overdue < escalation_threshold:
                 return
-            prog_row = conn.execute(
-                "SELECT id FROM programmes WHERE programme_name=?",
-                (case["programme_name"],)
-            ).fetchone()
-            if not prog_row:
-                return
-            ph_users = conn.execute(
-                """SELECT u.email, u.full_name FROM users u
-                   JOIN user_programme_map upm ON upm.user_id = u.id
-                   WHERE upm.programme_id=? AND u.role='program_head' AND u.email IS NOT NULL""",
-                (prog_row["id"],)
-            ).fetchall()
+            ph_users = _ph_map.get(case["programme_name"], [])
             for ph_user in ph_users:
                 if not ph_user["email"]:
                     continue
@@ -1304,22 +1311,41 @@ def upsert_case(data: dict) -> str:
                         )
                     # Log skipped optional stages for audit
                     data["_skipped_stages"] = [r["stage_name"] for r in intermediates]
-        conn.execute(
-            """UPDATE case_tracking SET
-               programme_name=?, organisation_name=?, current_stage=?, stage_start_date=?,
-               tat_days=?, reminder1_day=?, reminder2_day=?, owner_type=?,
-               action_owner_name=?, action_owner_email=?, program_officer_email=?,
-               r1_sent=0, r2_sent=0, overdue_sent=0, overdue_count=0,
-               last_overdue_date=NULL, is_milestone=?, board_id=?,
-               cc_emails=?, suppress_until=?
-               WHERE application_id=?""",
-            (data["programme_name"], data["organisation_name"], data["stage_name"],
-             data["stage_start_date"], cfg["tat_days"], cfg["reminder1_day"], cfg["reminder2_day"],
-             cfg["owner_type"], data["action_owner_name"], data["action_owner_email"],
-             data["program_officer_email"], cfg["is_milestone"], board_id,
-             data.get("cc_emails") or None, data.get("suppress_until") or None,
-             data["application_id"]),
-        )
+        if old_stage != new_stage:
+            # Stage changed — reset notification flags so new stage gets fresh reminders
+            conn.execute(
+                """UPDATE case_tracking SET
+                   programme_name=?, organisation_name=?, current_stage=?, stage_start_date=?,
+                   tat_days=?, reminder1_day=?, reminder2_day=?, owner_type=?,
+                   action_owner_name=?, action_owner_email=?, program_officer_email=?,
+                   r1_sent=0, r2_sent=0, overdue_sent=0, overdue_count=0,
+                   last_overdue_date=NULL, is_milestone=?, board_id=?,
+                   cc_emails=?, suppress_until=?
+                   WHERE application_id=?""",
+                (data["programme_name"], data["organisation_name"], data["stage_name"],
+                 data["stage_start_date"], cfg["tat_days"], cfg["reminder1_day"], cfg["reminder2_day"],
+                 cfg["owner_type"], data["action_owner_name"], data["action_owner_email"],
+                 data["program_officer_email"], cfg["is_milestone"], board_id,
+                 data.get("cc_emails") or None, data.get("suppress_until") or None,
+                 data["application_id"]),
+            )
+        else:
+            # Same stage — preserve notification flags, only update metadata
+            conn.execute(
+                """UPDATE case_tracking SET
+                   programme_name=?, organisation_name=?, current_stage=?, stage_start_date=?,
+                   tat_days=?, reminder1_day=?, reminder2_day=?, owner_type=?,
+                   action_owner_name=?, action_owner_email=?, program_officer_email=?,
+                   is_milestone=?, board_id=?,
+                   cc_emails=?, suppress_until=?
+                   WHERE application_id=?""",
+                (data["programme_name"], data["organisation_name"], data["stage_name"],
+                 data["stage_start_date"], cfg["tat_days"], cfg["reminder1_day"], cfg["reminder2_day"],
+                 cfg["owner_type"], data["action_owner_name"], data["action_owner_email"],
+                 data["program_officer_email"], cfg["is_milestone"], board_id,
+                 data.get("cc_emails") or None, data.get("suppress_until") or None,
+                 data["application_id"]),
+            )
         conn.commit()
         conn.close()
         if old_stage != new_stage:
@@ -2123,13 +2149,13 @@ def manage_users():
         _urole = u["role"]
         remap_btn = (
             '<button class="btn btn-sm btn-outline-primary" style="font-size:12px;padding:3px 8px" title="Map Programmes" '
-            'onclick="showRemapPh(' + str(_uid) + ', \'' + _uname + '\', \'' + _urole + '\')">'
+            f'onclick="showRemapPh({_uid}, {json.dumps(_uname)}, {json.dumps(_urole)})">'
             '<i class="bi bi-diagram-3"></i></button>'
             if _urole in _REMAP_ROLES else ""
         )
         del_btn = (
             '<button class="btn btn-sm btn-outline-danger" style="font-size:12px;padding:3px 8px" title="Delete User" '
-            'onclick="confirmDeleteUser(' + str(_uid) + ', \'' + _uname + '\')">'
+            f'onclick="confirmDeleteUser({_uid}, {json.dumps(_uname)})">'
             '<i class="bi bi-trash"></i></button>'
             if not is_self else ""
         )
@@ -2144,7 +2170,7 @@ def manage_users():
           <td>
             <div class="d-flex gap-1 align-items-center" style="white-space:nowrap">
               <button class="btn btn-sm btn-outline-secondary" style="font-size:12px;padding:3px 8px" title="Reset Password"
-                onclick="showResetPw({u['id']}, '{u['username']}')">
+                onclick="showResetPw({u['id']}, {json.dumps(u['username'])})">
                 <i class="bi bi-key"></i></button>
               {remap_btn}
               {del_btn}
@@ -3116,7 +3142,7 @@ def dashboard():
     ).fetchall()]
     conn2.close()
     saved_filter_opts = "".join(
-        f'<option value=\'{f["filter_json"]}\'>{f["filter_name"]} '
+        f'<option value="{h(f["filter_json"])}">{h(f["filter_name"])} '
         f'<a data-id="{f["id"]}" onclick="deleteFilter({f["id"]})">×</a></option>'
         for f in saved_filters_list
     )
@@ -3888,6 +3914,10 @@ def edit_case(case_id):
     case = dict(case)
 
     bid = user_board_id()
+    if bid is not None and case.get("board_id") != bid:
+        conn.close()
+        flash("Access denied.", "error")
+        return redirect(url_for("dashboard"))
     if bid is not None:
         programmes = [r[0] for r in conn.execute(
             "SELECT programme_name FROM programmes WHERE board_id=? ORDER BY programme_name", (bid,)
@@ -4039,17 +4069,23 @@ loadStages("{case['programme_name']}", _currentStage);
 @login_required
 def delete_case(case_id):
     conn = get_db()
-    row = conn.execute("SELECT application_id FROM case_tracking WHERE id=?", (case_id,)).fetchone()
-    if row:
-        conn.execute("DELETE FROM case_tracking WHERE id=?", (case_id,))
-        conn.commit()
-        flash(f"Case {row['application_id']} closed.", "success")
+    row = conn.execute("SELECT application_id, board_id FROM case_tracking WHERE id=?", (case_id,)).fetchone()
+    if not row:
         conn.close()
-        log_audit("case_closed", row["application_id"], "Case closed/removed",
-                  session.get("full_name") or session.get("username", ""),
-                  user_board_id())
-    else:
+        flash("Case not found.", "error")
+        return redirect(url_for("dashboard"))
+    bid = user_board_id()
+    if bid is not None and row["board_id"] != bid:
         conn.close()
+        flash("Access denied.", "error")
+        return redirect(url_for("dashboard"))
+    conn.execute("DELETE FROM case_tracking WHERE id=?", (case_id,))
+    conn.commit()
+    flash(f"Case {row['application_id']} closed.", "success")
+    conn.close()
+    log_audit("case_closed", row["application_id"], "Case closed/removed",
+              session.get("full_name") or session.get("username", ""),
+              bid)
     return redirect(url_for("dashboard"))
 
 
@@ -4071,6 +4107,12 @@ def update_case_status():
         flash("Case not found.", "error")
         return redirect(url_for("dashboard"))
     case = dict(case)
+
+    bid = user_board_id()
+    if bid is not None and case.get("board_id") != bid:
+        conn.close()
+        flash("Access denied.", "error")
+        return redirect(url_for("dashboard"))
 
     if new_status == "On Hold":
         # Start hold — record hold_start_date
@@ -4591,8 +4633,8 @@ def settings():
         if _settings_bid and is_board_admin:
             _bh = request.form.get("board_sched_hour", "8")
             _bm = request.form.get("board_sched_minute", "0")
-            upsert_app_setting(f"sched_hour_board_{_settings_bid}", _bh)
-            upsert_app_setting(f"sched_minute_board_{_settings_bid}", _bm)
+            set_app_setting(f"sched_hour_board_{_settings_bid}", _bh)
+            set_app_setting(f"sched_minute_board_{_settings_bid}", _bm)
             flash("Board notification schedule updated.", "success")
 
     _board_sched_hour = int(get_app_setting(
@@ -5249,6 +5291,19 @@ def audit_log_page():
 @login_required
 def case_history(app_id):
     conn = get_db()
+    # IDOR: verify the case belongs to the caller's board
+    _ch_case = conn.execute(
+        "SELECT board_id FROM case_tracking WHERE application_id=?", (app_id,)
+    ).fetchone()
+    if not _ch_case:
+        conn.close()
+        flash("Case not found.", "error")
+        return redirect(url_for("dashboard"))
+    _ch_bid = user_board_id()
+    if _ch_bid is not None and _ch_case["board_id"] != _ch_bid:
+        conn.close()
+        flash("Access denied.", "error")
+        return redirect(url_for("dashboard"))
     transitions = [dict(r) for r in conn.execute(
         "SELECT * FROM stage_history WHERE application_id=? ORDER BY id ASC", (app_id,)
     ).fetchall()]
