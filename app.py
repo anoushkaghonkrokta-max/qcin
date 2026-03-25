@@ -12,8 +12,8 @@ import secrets
 import smtplib
 import psycopg2
 import psycopg2.extras
+import psycopg2.pool
 import struct
-import threading
 import time
 import urllib.request
 from datetime import date, datetime, timedelta
@@ -21,7 +21,6 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from functools import wraps
 
-from apscheduler.schedulers.background import BackgroundScheduler
 from cryptography.fernet import Fernet
 from flask import (Flask, flash, jsonify, redirect, render_template_string,
                    request, url_for, Response, session)
@@ -46,31 +45,27 @@ log = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
-# Stable secret key persisted to disk
-_SK_FILE = os.path.join(os.path.dirname(__file__), "secret.key")
-if os.path.exists(_SK_FILE):
-    with open(_SK_FILE) as _f:
-        _SK = _f.read().strip()
-else:
-    _SK = secrets.token_hex(32)
-    with open(_SK_FILE, "w") as _f:
-        _f.write(_SK)
-app.secret_key = os.environ.get("SECRET_KEY", _SK)
+# ── Secret key (must be set via environment variable on Vercel) ───────────────
+_secret_key_env = os.environ.get("SECRET_KEY")
+if not _secret_key_env:
+    raise RuntimeError(
+        "SECRET_KEY environment variable is not set. "
+        "Generate one with: python3 -c \"import secrets; print(secrets.token_hex(32))\" "
+        "and add it in the Vercel project dashboard under Settings → Environment Variables."
+    )
+app.secret_key = _secret_key_env
 
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
-KEY_FILE = os.path.join(os.path.dirname(__file__), "fernet.key")
 
-# ── Fernet encryption ────────────────────────────────────────────────────────
+# ── Fernet encryption (must be set via environment variable on Vercel) ────────
 _fk_env = os.environ.get("FERNET_KEY")
-if _fk_env:
-    _FERNET_KEY = _fk_env.encode()
-elif os.path.exists(KEY_FILE):
-    with open(KEY_FILE, "rb") as _f:
-        _FERNET_KEY = _f.read()
-else:
-    _FERNET_KEY = Fernet.generate_key()
-    with open(KEY_FILE, "wb") as _f:
-        _f.write(_FERNET_KEY)
+if not _fk_env:
+    raise RuntimeError(
+        "FERNET_KEY environment variable is not set. "
+        "Generate one with: python3 -c \"from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())\" "
+        "and add it in the Vercel project dashboard under Settings → Environment Variables."
+    )
+_FERNET_KEY = _fk_env.encode()
 
 _fernet = Fernet(_FERNET_KEY)
 
@@ -308,6 +303,25 @@ def working_days_elapsed(start: str, end_d=None, hold_days: int = 0) -> int:
 
 
 # ── Database helpers ─────────────────────────────────────────────────────────
+# Module-level connection pool — survives across requests on a warm Vercel instance.
+# min=1, max=3 keeps memory low; Vercel spins up multiple instances under load so
+# the effective pool across all instances stays well within Postgres limits.
+_db_pool: "psycopg2.pool.ThreadedConnectionPool | None" = None
+
+
+def _get_pool() -> "psycopg2.pool.ThreadedConnectionPool":
+    global _db_pool
+    if _db_pool is None or _db_pool.closed:
+        if not DATABASE_URL:
+            raise RuntimeError(
+                "DATABASE_URL environment variable is not set. "
+                "Add a Postgres database (Neon, Supabase, or Vercel Postgres) and set DATABASE_URL "
+                "in the Vercel project dashboard under Settings → Environment Variables."
+            )
+        _db_pool = psycopg2.pool.ThreadedConnectionPool(1, 3, DATABASE_URL)
+    return _db_pool
+
+
 class DBConn:
     """Thin psycopg2 wrapper that mimics the sqlite3 connection API used throughout this app.
 
@@ -316,10 +330,12 @@ class DBConn:
     - ``INTEGER PRIMARY KEY AUTOINCREMENT`` → ``SERIAL PRIMARY KEY`` in DDL
     - ``executescript()`` by splitting on ``;`` and executing each statement
     - sqlite3-style ``conn.execute()`` that returns the cursor
+    - Returns connections to the pool on close() instead of closing them
     """
 
-    def __init__(self, pg_conn):
+    def __init__(self, pg_conn, pool=None):
         self._conn = pg_conn
+        self._pool = pool
         self._cur = pg_conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
 
     def execute(self, sql, params=()):
@@ -349,18 +365,18 @@ class DBConn:
         self._conn.rollback()
 
     def close(self):
-        self._conn.close()
+        self._cur.close()
+        if self._pool:
+            self._pool.putconn(self._conn)   # return to pool, not closed
+        else:
+            self._conn.close()
 
 
-def get_db():
-    if not DATABASE_URL:
-        raise RuntimeError(
-            "DATABASE_URL environment variable is not set. "
-            "Add a PostgreSQL plugin in your Railway project and set DATABASE_URL."
-        )
-    pg_conn = psycopg2.connect(DATABASE_URL)
+def get_db() -> DBConn:
+    pool = _get_pool()
+    pg_conn = pool.getconn()
     pg_conn.autocommit = False
-    return DBConn(pg_conn)
+    return DBConn(pg_conn, pool)
 
 
 def init_db():
@@ -4680,14 +4696,10 @@ def export_dashboard():
 @app.route("/run-check")
 @admin_required
 def run_check():
-    def _bg():
-        try:
-            run_daily_check()
-        except Exception as exc:
-            log.error("Background run-check failed: %s", exc)
-
-    threading.Thread(target=_bg, daemon=True).start()
-    return jsonify({"status": "started", "message": "Daily check is running in the background."})
+    # Called synchronously by Vercel Cron (schedule defined in vercel.json).
+    # Vercel allows up to 5 minutes for cron functions, enough for email processing.
+    summary = _scheduled_job()
+    return jsonify(summary or {"status": "ok"})
 
 
 # ── Scheduler ─────────────────────────────────────────────────────────────────
@@ -4718,7 +4730,7 @@ def _scheduled_job():
         ).fetchone()
         if not row or row["worker_id"] != worker_id:
             log.info("Scheduler lock held by another worker — skipping.")
-            return
+            return {"status": "skipped", "reason": "lock held by another worker"}
     finally:
         conn.close()
 
@@ -4726,6 +4738,7 @@ def _scheduled_job():
         log.info("Scheduled daily check running… (worker %s)", worker_id)
         result = run_daily_check()
         log.info("Daily check complete: %s", result)
+        return result
     finally:
         # Release the lock
         rel = get_db()
@@ -4739,21 +4752,12 @@ def _scheduled_job():
             rel.close()
 
 
-scheduler = BackgroundScheduler(timezone="Asia/Kolkata")
-
 # ── App startup ───────────────────────────────────────────────────────────────
+# Vercel runs this at cold-start (module import). Tables are created if absent.
 with app.app_context():
     init_db()
     migrate_data()
     seed_data()
-    # Read schedule from DB (default: 08:00 IST)
-    _sched_hour   = int(get_app_setting("scheduler_hour",   "8"))
-    _sched_minute = int(get_app_setting("scheduler_minute", "0"))
-
-scheduler.add_job(_scheduled_job, "cron",
-                  hour=_sched_hour, minute=_sched_minute, id="daily_check")
-
-scheduler.start()
 
 if __name__ == "__main__":
     app.run(debug=True, use_reloader=False, port=5050)
