@@ -116,25 +116,44 @@ def set_app_setting(key: str, value: str):
 
 def log_audit(event_type: str, application_id: str = None, detail: str = "",
               user_name: str = None, board_id: int = None):
-    """Write a tamper-evident row to audit_log. Each entry hashes previous entry + payload."""
-    conn = get_db()
-    # Get previous hash for chain
-    prev_row = conn.execute(
-        "SELECT entry_hash FROM audit_log ORDER BY id DESC LIMIT 1"
-    ).fetchone()
-    prev_hash = prev_row["entry_hash"] if prev_row and prev_row["entry_hash"] else "GENESIS"
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    # Compute chain hash
-    raw = f"{prev_hash}|{timestamp}|{event_type}|{application_id}|{detail}|{user_name}"
-    entry_hash = hashlib.sha256(raw.encode()).hexdigest()
-    conn.execute(
-        "INSERT INTO audit_log (timestamp, application_id, event_type, detail, user_name, board_id, entry_hash) "
-        "VALUES (?,?,?,?,?,?,?)",
-        (timestamp, application_id, event_type,
-         detail[:500] if detail else "", user_name, board_id, entry_hash)
-    )
-    conn.commit()
-    conn.close()
+    """Write a tamper-evident row to audit_log. Each entry hashes previous entry + payload.
+    Never raises — audit failures must not crash the calling request."""
+    try:
+        conn = get_db()
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        # Hash-chaining: try to read previous hash (column may not exist on older DBs)
+        entry_hash = None
+        try:
+            prev_row = conn.execute(
+                "SELECT entry_hash FROM audit_log ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+            prev_hash = prev_row["entry_hash"] if prev_row and prev_row["entry_hash"] else "GENESIS"
+            raw = f"{prev_hash}|{timestamp}|{event_type}|{application_id}|{detail}|{user_name}"
+            entry_hash = hashlib.sha256(raw.encode()).hexdigest()
+        except Exception:
+            pass  # entry_hash column may not exist on older DBs — gracefully skip
+        # Try INSERT with entry_hash first; fall back to without if column missing
+        try:
+            conn.execute(
+                "INSERT INTO audit_log "
+                "(timestamp, application_id, event_type, detail, user_name, board_id, entry_hash) "
+                "VALUES (?,?,?,?,?,?,?)",
+                (timestamp, application_id, event_type,
+                 detail[:500] if detail else "", user_name, board_id, entry_hash)
+            )
+        except Exception:
+            # Fallback: insert without entry_hash (older schema)
+            conn.execute(
+                "INSERT INTO audit_log "
+                "(timestamp, application_id, event_type, detail, user_name, board_id) "
+                "VALUES (?,?,?,?,?,?)",
+                (timestamp, application_id, event_type,
+                 detail[:500] if detail else "", user_name, board_id)
+            )
+        conn.commit()
+        conn.close()
+    except Exception as _audit_err:
+        log.error("log_audit failed silently: %s", _audit_err)
 
 
 def _verify_api_key(request) -> dict:
@@ -390,7 +409,12 @@ def working_days_elapsed(start: str, end_d=None, hold_days: int = 0) -> int:
     """Working days from start (inclusive) to end (inclusive, default today), minus hold_days."""
     if end_d is None:
         end_d = date.today()
-    s = datetime.strptime(start, "%Y-%m-%d").date() if isinstance(start, str) else start
+    if not start:
+        return 0  # guard against None / empty string from bad data
+    try:
+        s = datetime.strptime(start, "%Y-%m-%d").date() if isinstance(start, str) else start
+    except (ValueError, TypeError):
+        return 0  # unparseable date — treat as 0 elapsed rather than crashing dashboard
     all_holidays = _get_all_holidays()
     count = 0
     cur = s
@@ -3638,6 +3662,26 @@ def bulk_upload():
                 }
                 if not data["application_id"]:
                     raise ValueError("Application_ID is empty")
+                # Validate date format (YYYY-MM-DD required)
+                _raw_date = data["stage_start_date"]
+                if not _raw_date:
+                    data["stage_start_date"] = date.today().isoformat()
+                else:
+                    try:
+                        datetime.strptime(_raw_date, "%Y-%m-%d")
+                    except ValueError:
+                        # Try common alternate formats: DD/MM/YYYY, MM/DD/YYYY
+                        _parsed = None
+                        for _fmt in ("%d/%m/%Y", "%m/%d/%Y", "%d-%m-%Y"):
+                            try:
+                                _parsed = datetime.strptime(_raw_date, _fmt).date().isoformat()
+                                break
+                            except ValueError:
+                                pass
+                        if _parsed:
+                            data["stage_start_date"] = _parsed
+                        else:
+                            raise ValueError(f"Date_of_Stage_Change '{_raw_date}' must be YYYY-MM-DD")
                 action = upsert_case(data)
                 if action == "created":
                     created += 1
