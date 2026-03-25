@@ -430,6 +430,7 @@ class DBConn:
 
     def execute(self, sql, params=()):
         pg_sql = sql.replace("?", "%s")
+        pg_sql = pg_sql.replace("INSERT OR IGNORE INTO", "INSERT INTO").replace("INSERT OR REPLACE INTO", "INSERT INTO")
         if params:
             self._cur.execute(pg_sql, params)
         else:
@@ -581,6 +582,45 @@ def init_db():
             lock_name       TEXT PRIMARY KEY,
             locked_at       TEXT NOT NULL,
             worker_id       TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS holidays (
+            id           SERIAL PRIMARY KEY,
+            holiday_date TEXT NOT NULL,
+            name         TEXT NOT NULL,
+            board_id     INTEGER REFERENCES boards(id),
+            UNIQUE(holiday_date, board_id)
+        );
+        CREATE TABLE IF NOT EXISTS user_programme_map (
+            id           SERIAL PRIMARY KEY,
+            user_id      INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            programme_id INTEGER NOT NULL REFERENCES programmes(id) ON DELETE CASCADE,
+            UNIQUE(user_id, programme_id)
+        );
+        CREATE TABLE IF NOT EXISTS saved_filters (
+            id          SERIAL PRIMARY KEY,
+            user_id     INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            filter_name TEXT NOT NULL,
+            filter_json TEXT NOT NULL,
+            created_at  TEXT NOT NULL,
+            UNIQUE(user_id, filter_name)
+        );
+        CREATE TABLE IF NOT EXISTS stage_email_override (
+            id                SERIAL PRIMARY KEY,
+            programme_name    TEXT NOT NULL,
+            stage_name        TEXT NOT NULL,
+            notification_type TEXT NOT NULL,
+            subject_line      TEXT NOT NULL,
+            email_body        TEXT NOT NULL,
+            UNIQUE(programme_name, stage_name, notification_type)
+        );
+        CREATE TABLE IF NOT EXISTS api_keys (
+            id         SERIAL PRIMARY KEY,
+            key_hash   TEXT NOT NULL UNIQUE,
+            name       TEXT NOT NULL,
+            board_id   INTEGER REFERENCES boards(id),
+            created_at TEXT NOT NULL,
+            last_used  TEXT,
+            is_active  INTEGER NOT NULL DEFAULT 1
         );
     """)
     # Migrate existing DBs: add columns if absent (IF NOT EXISTS is safe to re-run)
@@ -829,7 +869,7 @@ def seed_data():
             ("admin", generate_password_hash(_admin_pw), "super_admin", "Super Administrator"),
         )
         conn.commit()
-        log.info("seed_data: admin user created (DB_PATH=%s)", DB_PATH)
+        log.info("seed_data: admin user created")
     elif os.environ.get("ADMIN_PASSWORD"):
         # Force-reset password if env var explicitly set
         conn.execute(
@@ -2016,7 +2056,7 @@ def manage_users():
                     for pid in prog_ids:
                         try:
                             conn.execute(
-                                "INSERT OR IGNORE INTO user_programme_map (user_id, programme_id) VALUES (?,?)",
+                                "INSERT INTO user_programme_map (user_id, programme_id) VALUES (?,?) ON CONFLICT (user_id, programme_id) DO NOTHING",
                                 (new_user["id"], int(pid))
                             )
                         except Exception:
@@ -2049,7 +2089,7 @@ def manage_users():
                 for pid in prog_ids:
                     try:
                         conn.execute(
-                            "INSERT OR IGNORE INTO user_programme_map (user_id, programme_id) VALUES (?,?)",
+                            "INSERT INTO user_programme_map (user_id, programme_id) VALUES (?,?) ON CONFLICT (user_id, programme_id) DO NOTHING",
                             (int(uid), int(pid))
                         )
                     except Exception:
@@ -4106,7 +4146,7 @@ def save_filter():
     conn = get_db()
     try:
         conn.execute(
-            "INSERT OR REPLACE INTO saved_filters (user_id, filter_name, filter_json, created_at) VALUES (?,?,?,?)",
+            "INSERT INTO saved_filters (user_id, filter_name, filter_json, created_at) VALUES (?,?,?,?) ON CONFLICT (user_id, filter_name) DO UPDATE SET filter_json=EXCLUDED.filter_json, created_at=EXCLUDED.created_at",
             (session["user_id"], data["name"][:60],
              json.dumps({"qs": data.get("qs", "")}),
              datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
@@ -4544,10 +4584,15 @@ def settings():
             hname = request.form.get("holiday_name", "").strip()
             if hdate and hname:
                 try:
-                    conn.execute(
-                        "INSERT OR IGNORE INTO holidays (holiday_date, name, board_id) VALUES (?,?,?)",
-                        (hdate, hname, _hbid)
-                    )
+                    _existing = conn.execute(
+                        "SELECT id FROM holidays WHERE holiday_date=? AND (board_id=? OR (board_id IS NULL AND ? IS NULL))",
+                        (hdate, _hbid, _hbid)
+                    ).fetchone()
+                    if not _existing:
+                        conn.execute(
+                            "INSERT INTO holidays (holiday_date, name, board_id) VALUES (?,?,?)",
+                            (hdate, hname, _hbid)
+                        )
                     conn.commit()
                     flash(f"Holiday '{hname}' added.", "success")
                 except Exception as e:
@@ -5349,8 +5394,9 @@ def email_templates_page():
             flash("Template saved.", "success")
         elif action == "save_stage_override":
             conn.execute(
-                "INSERT OR REPLACE INTO stage_email_override "
-                "(programme_name, stage_name, notification_type, subject_line, email_body) VALUES (?,?,?,?,?)",
+                "INSERT INTO stage_email_override "
+                "(programme_name, stage_name, notification_type, subject_line, email_body) VALUES (?,?,?,?,?) "
+                "ON CONFLICT (programme_name, stage_name, notification_type) DO UPDATE SET subject_line=EXCLUDED.subject_line, email_body=EXCLUDED.email_body",
                 (request.form["programme_name"], request.form["stage_name"],
                  request.form["notification_type"],
                  request.form["subject_line"], request.form["email_body"]),
@@ -7576,7 +7622,7 @@ def healthz():
         conn.close()
         return jsonify({
             "status": "ok",
-            "db_path": DB_PATH,
+            "db_path": DATABASE_URL[:30] + "..." if DATABASE_URL else "not set",
             "user_count": user_count,
             "admin_exists": admin_exists,
         })
