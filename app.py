@@ -24,7 +24,15 @@ from functools import wraps
 from cryptography.fernet import Fernet
 from flask import (Flask, flash, jsonify, redirect, render_template_string,
                    request, url_for, Response, session)
+from markupsafe import escape as _xe
 from werkzeug.security import check_password_hash as _check_pw
+
+
+def h(v):
+    """HTML-escape a value for safe injection into f-string HTML."""
+    if v is None:
+        return ""
+    return str(_xe(str(v)))
 
 def generate_password_hash(pw):
     from werkzeug.security import generate_password_hash as _gph
@@ -101,16 +109,62 @@ def set_app_setting(key: str, value: str):
 
 def log_audit(event_type: str, application_id: str = None, detail: str = "",
               user_name: str = None, board_id: int = None):
-    """Write a row to the audit_log table."""
+    """Write a tamper-evident row to audit_log. Each entry hashes previous entry + payload.
+    Never raises — audit failures must not crash the calling request."""
+    try:
+        conn = get_db()
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        # Hash-chaining: try to read previous hash (column may not exist on older DBs)
+        entry_hash = None
+        try:
+            prev_row = conn.execute(
+                "SELECT entry_hash FROM audit_log ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+            prev_hash = prev_row["entry_hash"] if prev_row and prev_row["entry_hash"] else "GENESIS"
+            raw = f"{prev_hash}|{timestamp}|{event_type}|{application_id}|{detail}|{user_name}"
+            entry_hash = hashlib.sha256(raw.encode()).hexdigest()
+        except Exception:
+            pass  # entry_hash column may not exist on older DBs — gracefully skip
+        # Try INSERT with entry_hash first; fall back to without if column missing
+        try:
+            conn.execute(
+                "INSERT INTO audit_log "
+                "(timestamp, application_id, event_type, detail, user_name, board_id, entry_hash) "
+                "VALUES (?,?,?,?,?,?,?)",
+                (timestamp, application_id, event_type,
+                 detail[:500] if detail else "", user_name, board_id, entry_hash)
+            )
+        except Exception:
+            # Fallback: insert without entry_hash (older schema)
+            conn.execute(
+                "INSERT INTO audit_log "
+                "(timestamp, application_id, event_type, detail, user_name, board_id) "
+                "VALUES (?,?,?,?,?,?)",
+                (timestamp, application_id, event_type,
+                 detail[:500] if detail else "", user_name, board_id)
+            )
+        conn.commit()
+        conn.close()
+    except Exception as _audit_err:
+        log.error("log_audit failed silently: %s", _audit_err)
+
+
+def _verify_api_key(request) -> dict:
+    """Check X-API-Key header. Returns api_key row or None."""
+    raw = request.headers.get("X-API-Key", "").strip()
+    if not raw:
+        return None
+    key_hash = hashlib.sha256(raw.encode()).hexdigest()
     conn = get_db()
-    conn.execute(
-        "INSERT INTO audit_log (timestamp, application_id, event_type, detail, user_name, board_id) "
-        "VALUES (?,?,?,?,?,?)",
-        (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), application_id, event_type,
-         detail[:500] if detail else "", user_name, board_id)
-    )
-    conn.commit()
+    row = conn.execute(
+        "SELECT * FROM api_keys WHERE key_hash=? AND is_active=1", (key_hash,)
+    ).fetchone()
+    if row:
+        conn.execute("UPDATE api_keys SET last_used=? WHERE id=?",
+                     (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), row["id"]))
+        conn.commit()
     conn.close()
+    return dict(row) if row else None
 
 
 def log_stage_transition(application_id: str, from_stage: str, to_stage: str,
@@ -174,14 +228,25 @@ def totp_provisioning_uri(secret: str, username: str) -> str:
 def queue_email(programme_name: str, notification_type: str, to_email: str,
                 cc_email: str, sender_email: str, sender_password_enc: str,
                 ph: dict, smtp_host: str, smtp_port: int,
-                application_id: str = None, board_id: int = None):
-    """Resolve template + placeholders and add to email_queue."""
+                application_id: str = None, board_id: int = None,
+                stage_name: str = None):
+    """Resolve template + placeholders and add to email_queue.
+    Per-stage overrides take priority over programme-level templates."""
     conn = get_db()
-    tmpl = conn.execute(
-        "SELECT subject_line, email_body FROM email_templates "
-        "WHERE programme_name=? AND notification_type=?",
-        (programme_name, notification_type)
-    ).fetchone()
+    # Check per-stage override first
+    tmpl = None
+    if stage_name:
+        tmpl = conn.execute(
+            "SELECT subject_line, email_body FROM stage_email_override "
+            "WHERE programme_name=? AND stage_name=? AND notification_type=?",
+            (programme_name, stage_name, notification_type)
+        ).fetchone()
+    if not tmpl:
+        tmpl = conn.execute(
+            "SELECT subject_line, email_body FROM email_templates "
+            "WHERE programme_name=? AND notification_type=?",
+            (programme_name, notification_type)
+        ).fetchone()
     if not tmpl:
         conn.close()
         return
@@ -204,45 +269,85 @@ def queue_email(programme_name: str, notification_type: str, to_email: str,
 
 
 def process_email_queue(max_retries: int = 3) -> dict:
-    """Process pending email_queue items. Returns counts."""
+    """Process pending email_queue items. Groups by sender credentials to reuse SMTP connections."""
     conn = get_db()
     pending = [dict(r) for r in conn.execute(
         "SELECT * FROM email_queue WHERE status='pending' AND attempts < ?", (max_retries,)
     ).fetchall()]
-    sent = failed = 0
+    conn.close()
+
+    if not pending:
+        return {"sent": 0, "failed": 0}
+
+    # Group by (sender_email, smtp_host, smtp_port, sender_password)
+    from collections import defaultdict
+    groups = defaultdict(list)
     for item in pending:
+        key = (item["sender_email"], item["smtp_host"], item["smtp_port"], item.get("sender_password",""))
+        groups[key].append(item)
+
+    sent = failed = 0
+    conn = get_db()
+
+    for (sender_email, smtp_host, smtp_port, sender_password_enc), items in groups.items():
+        pw = decrypt_str(sender_password_enc) if sender_password_enc else ""
+        smtp_conn = None
         try:
-            msg = MIMEMultipart("alternative")
-            msg["Subject"] = item["subject"] or ""
-            msg["From"] = item["sender_email"]
-            msg["To"] = item["to_email"]
-            recipients = [item["to_email"]]
-            if item.get("cc_email"):
-                for cc in item["cc_email"].split(","):
-                    cc = cc.strip()
-                    if cc:
-                        msg["Cc"] = cc
-                        recipients.append(cc)
-            msg.attach(MIMEText(item["body"] or "", "plain"))
-            pw = decrypt_str(item["sender_password"]) if item.get("sender_password") else ""
-            with smtplib.SMTP(item["smtp_host"], item["smtp_port"], timeout=15) as s:
-                s.starttls()
-                s.login(item["sender_email"], pw)
-                s.sendmail(item["sender_email"], recipients, msg.as_string())
-            conn.execute(
-                "UPDATE email_queue SET status='sent', last_attempt=? WHERE id=?",
-                (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), item["id"])
-            )
-            sent += 1
-        except Exception as e:
-            attempts = item["attempts"] + 1
-            new_status = "failed" if attempts >= max_retries else "pending"
-            conn.execute(
-                "UPDATE email_queue SET status=?, attempts=?, last_attempt=?, error_msg=? WHERE id=?",
-                (new_status, attempts, datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                 str(e)[:300], item["id"])
-            )
-            failed += 1
+            if smtp_port == 465:
+                smtp_conn = smtplib.SMTP_SSL(smtp_host, 465, timeout=20)
+            else:
+                smtp_conn = smtplib.SMTP(smtp_host, smtp_port, timeout=20)
+                smtp_conn.starttls()
+            smtp_conn.login(sender_email, pw)
+
+            for item in items:
+                try:
+                    msg = MIMEMultipart("alternative")
+                    msg["Subject"] = item["subject"] or ""
+                    msg["From"]    = sender_email
+                    msg["To"]      = item["to_email"]
+                    recipients     = [item["to_email"]]
+                    if item.get("cc_email"):
+                        for cc in item["cc_email"].split(","):
+                            cc = cc.strip()
+                            if cc:
+                                msg["Cc"] = cc
+                                recipients.append(cc)
+                    msg.attach(MIMEText(item["body"] or "", "plain"))
+                    smtp_conn.sendmail(sender_email, recipients, msg.as_string())
+                    conn.execute(
+                        "UPDATE email_queue SET status='sent', last_attempt=? WHERE id=?",
+                        (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), item["id"])
+                    )
+                    sent += 1
+                except Exception as e:
+                    attempts = item["attempts"] + 1
+                    new_status = "failed" if attempts >= max_retries else "pending"
+                    conn.execute(
+                        "UPDATE email_queue SET status=?, attempts=?, last_attempt=?, error_msg=? WHERE id=?",
+                        (new_status, attempts, datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                         str(e)[:300], item["id"])
+                    )
+                    failed += 1
+        except Exception as conn_err:
+            # Connection-level failure — mark all items in group as failed
+            log.error("SMTP connection failed for %s: %s", sender_email, conn_err)
+            for item in items:
+                attempts = item["attempts"] + 1
+                new_status = "failed" if attempts >= max_retries else "pending"
+                conn.execute(
+                    "UPDATE email_queue SET status=?, attempts=?, last_attempt=?, error_msg=? WHERE id=?",
+                    (new_status, attempts, datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                     str(conn_err)[:300], item["id"])
+                )
+                failed += 1
+        finally:
+            if smtp_conn:
+                try:
+                    smtp_conn.quit()
+                except Exception:
+                    pass
+
     conn.commit()
     conn.close()
     return {"sent": sent, "failed": failed}
@@ -296,7 +401,7 @@ def working_days_elapsed(start: str, end_d=None, hold_days: int = 0) -> int:
     count = 0
     cur = s
     while cur <= end_d:
-        if cur.weekday() < 5 and cur not in _HOLIDAYS:
+        if cur.weekday() < 5 and cur not in all_holidays:
             count += 1
         cur += timedelta(days=1)
     return max(0, count - 1 - hold_days)  # days elapsed after start date, minus hold days
@@ -340,6 +445,7 @@ class DBConn:
 
     def execute(self, sql, params=()):
         pg_sql = sql.replace("?", "%s")
+        pg_sql = pg_sql.replace("INSERT OR IGNORE INTO", "INSERT INTO").replace("INSERT OR REPLACE INTO", "INSERT INTO")
         if params:
             self._cur.execute(pg_sql, params)
         else:
@@ -402,6 +508,7 @@ def init_db():
             owner_type           TEXT,
             overdue_interval_days INTEGER NOT NULL DEFAULT 3,
             is_milestone         INTEGER NOT NULL DEFAULT 0,
+            is_optional          INTEGER NOT NULL DEFAULT 0,
             sender_email         TEXT,
             sender_password      TEXT,
             smtp_host            TEXT NOT NULL DEFAULT 'smtp.gmail.com',
@@ -491,6 +598,45 @@ def init_db():
             locked_at       TEXT NOT NULL,
             worker_id       TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS holidays (
+            id           SERIAL PRIMARY KEY,
+            holiday_date TEXT NOT NULL,
+            name         TEXT NOT NULL,
+            board_id     INTEGER REFERENCES boards(id),
+            UNIQUE(holiday_date, board_id)
+        );
+        CREATE TABLE IF NOT EXISTS user_programme_map (
+            id           SERIAL PRIMARY KEY,
+            user_id      INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            programme_id INTEGER NOT NULL REFERENCES programmes(id) ON DELETE CASCADE,
+            UNIQUE(user_id, programme_id)
+        );
+        CREATE TABLE IF NOT EXISTS saved_filters (
+            id          SERIAL PRIMARY KEY,
+            user_id     INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            filter_name TEXT NOT NULL,
+            filter_json TEXT NOT NULL,
+            created_at  TEXT NOT NULL,
+            UNIQUE(user_id, filter_name)
+        );
+        CREATE TABLE IF NOT EXISTS stage_email_override (
+            id                SERIAL PRIMARY KEY,
+            programme_name    TEXT NOT NULL,
+            stage_name        TEXT NOT NULL,
+            notification_type TEXT NOT NULL,
+            subject_line      TEXT NOT NULL,
+            email_body        TEXT NOT NULL,
+            UNIQUE(programme_name, stage_name, notification_type)
+        );
+        CREATE TABLE IF NOT EXISTS api_keys (
+            id         SERIAL PRIMARY KEY,
+            key_hash   TEXT NOT NULL UNIQUE,
+            name       TEXT NOT NULL,
+            board_id   INTEGER REFERENCES boards(id),
+            created_at TEXT NOT NULL,
+            last_used  TEXT,
+            is_active  INTEGER NOT NULL DEFAULT 1
+        );
     """)
     # Migrate existing DBs: add columns if absent (IF NOT EXISTS is safe to re-run)
     for sql in [
@@ -500,10 +646,22 @@ def init_db():
         "ALTER TABLE users ADD COLUMN IF NOT EXISTS board_id INTEGER",
         "ALTER TABLE users ADD COLUMN IF NOT EXISTS force_password_reset INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE users ADD COLUMN IF NOT EXISTS totp_secret TEXT",
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS last_login TEXT",
         "ALTER TABLE case_tracking ADD COLUMN IF NOT EXISTS board_id INTEGER",
         "ALTER TABLE case_tracking ADD COLUMN IF NOT EXISTS cc_emails TEXT",
         "ALTER TABLE case_tracking ADD COLUMN IF NOT EXISTS suppress_until TEXT",
+        "ALTER TABLE case_tracking ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'Active'",
         "ALTER TABLE email_templates ADD COLUMN IF NOT EXISTS board_id INTEGER",
+        "ALTER TABLE holidays ADD COLUMN IF NOT EXISTS board_id INTEGER",
+        "ALTER TABLE case_tracking ADD COLUMN IF NOT EXISTS hold_days INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE case_tracking ADD COLUMN IF NOT EXISTS hold_start_date TEXT",
+        "ALTER TABLE audit_log ADD COLUMN IF NOT EXISTS entry_hash TEXT",
+        "ALTER TABLE programme_config ADD COLUMN IF NOT EXISTS is_optional INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE programmes ADD COLUMN IF NOT EXISTS tat_days INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE programmes ADD COLUMN IF NOT EXISTS reminder1_days INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE programmes ADD COLUMN IF NOT EXISTS reminder2_days INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE programmes ADD COLUMN IF NOT EXISTS overdue_days INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE programmes ADD COLUMN IF NOT EXISTS notification_emails TEXT",
     ]:
         try:
             conn.execute(sql)
@@ -552,58 +710,58 @@ def board_admin_required(f):
 
 # ── Seed data ────────────────────────────────────────────────────────────────
 _SEED_STAGES = [
-    ("NABH Full Accreditation Hospitals", "Application In Progress", 1, 30, 15, 25, "Applicant", 3, 0),
-    ("NABH Full Accreditation Hospitals", "Application Fee Pending", 2, 10, 5, 8, "Applicant", 3, 0),
-    ("NABH Full Accreditation Hospitals", "Application Fee Paid", 3, 0, 0, 0, None, 0, 1),
-    ("NABH Full Accreditation Hospitals", "DR Allocated", 4, 3, 1, 2, "Program Officer", 1, 0),
-    ("NABH Full Accreditation Hospitals", "DR In Progress", 5, 10, 5, 7, "Assessor", 3, 0),
-    ("NABH Full Accreditation Hospitals", "DR NC Response", 6, 20, 10, 15, "Applicant", 3, 0),
-    ("NABH Full Accreditation Hospitals", "DR NC Review", 7, 10, 5, 7, "Assessor", 3, 0),
-    ("NABH Full Accreditation Hospitals", "DR Approval by NABH", 8, 3, 1, 2, "Program Officer", 1, 0),
-    ("NABH Full Accreditation Hospitals", "Assessment selection (if applicable)", 9, 5, 2, 4, "Applicant", 3, 0),
-    ("NABH Full Accreditation Hospitals", "PA Allocation", 10, 20, 10, 15, "Program Officer", 1, 0),
-    ("NABH Full Accreditation Hospitals", "PA date Accepted by Assessor", 11, 7, 3, 5, "Assessor", 3, 0),
-    ("NABH Full Accreditation Hospitals", "PA Scheduled", 12, 5, 2, 4, "Applicant", 1, 0),
-    ("NABH Full Accreditation Hospitals", "PA completed", 13, 3, 1, 2, "Assessor", 1, 0),
-    ("NABH Full Accreditation Hospitals", "PA Feedback", 14, 2, 1, 999, "Applicant", 1, 0),
-    ("NABH Full Accreditation Hospitals", "PA NC Response 1", 15, 50, 30, 40, "Applicant", 3, 0),
-    ("NABH Full Accreditation Hospitals", "PA NC Review 1", 16, 10, 5, 7, "Assessor", 3, 0),
-    ("NABH Full Accreditation Hospitals", "PA NC Response 2", 17, 30, 10, 20, "Applicant", 3, 0),
-    ("NABH Full Accreditation Hospitals", "PA NC Review 2", 18, 10, 5, 7, "Assessor", 3, 0),
-    ("NABH Full Accreditation Hospitals", "1st Annual Fee Pending", 19, 10, 5, 8, "Applicant", 3, 0),
-    ("NABH Full Accreditation Hospitals", "1st Annual Fee Paid", 20, 0, 0, 0, None, 0, 1),
-    ("NABH Full Accreditation Hospitals", "OA Allocated", 21, 20, 10, 15, "Program Officer", 1, 0),
-    ("NABH Full Accreditation Hospitals", "OA date Accepted by Assessor", 22, 7, 3, 5, "Assessor", 3, 0),
-    ("NABH Full Accreditation Hospitals", "OA Scheduled", 23, 5, 3, 4, "Applicant", 3, 0),
-    ("NABH Full Accreditation Hospitals", "OA completed", 24, 3, 1, 2, "Assessor", 2, 0),
-    ("NABH Full Accreditation Hospitals", "OA Feedback", 25, 2, 1, 999, "Applicant", 1, 0),
-    ("NABH Full Accreditation Hospitals", "OA NC Response 1", 26, 50, 30, 40, "Applicant", 3, 0),
-    ("NABH Full Accreditation Hospitals", "OA NC Review 1", 27, 10, 5, 7, "Assessor", 3, 0),
-    ("NABH Full Accreditation Hospitals", "OA NC Response 2", 28, 30, 10, 20, "Applicant", 3, 0),
-    ("NABH Full Accreditation Hospitals", "OA NC Review 2", 29, 10, 5, 7, "Assessor", 3, 0),
-    ("NABH Full Accreditation Hospitals", "OA NC Accepted", 30, 0, 0, 0, None, 0, 1),
-    ("NABH Full Accreditation Hospitals", "AC Allocated", 31, 15, 7, 10, "Program Officer", 2, 0),
-    ("NABH Full Accreditation Hospitals", "AC Document Pending", 32, 90, 30, 60, "Applicant", 3, 0),
-    ("NABH Full Accreditation Hospitals", "Pending Document Submitted", 33, 0, 0, 0, None, 0, 1),
-    ("NABH Full Accreditation Hospitals", "Accredited/ Accredited Renewed", 34, 30, 15, 20, "Program Officer", 1, 0),
-    ("NABH Full Accreditation Hospitals", "2nd Annual Fee Payment", 35, 90, 1, 10, "Applicant", 3, 0),
-    ("NABH Full Accreditation Hospitals", "2nd Annual Fee Paid", 36, 0, 0, 0, None, 0, 1),
-    ("NABH Full Accreditation Hospitals", "SA due", 37, 30, 15, 20, "Program Officer", 3, 0),
-    ("NABH Full Accreditation Hospitals", "SA - OA Allocated", 38, 20, 10, 15, "Program Officer", 1, 0),
-    ("NABH Full Accreditation Hospitals", "SA - OA date Accepted by Assessor", 39, 7, 3, 5, "Assessor", 3, 0),
-    ("NABH Full Accreditation Hospitals", "SA - OA Scheduled", 40, 5, 3, 4, "Applicant", 3, 0),
-    ("NABH Full Accreditation Hospitals", "SA - OA completed", 41, 3, 1, 2, "Assessor", 2, 0),
-    ("NABH Full Accreditation Hospitals", "SA - OA Feedback", 42, 2, 1, 999, "Applicant", 1, 0),
-    ("NABH Full Accreditation Hospitals", "SA - OA NC Response 1", 43, 25, 15, 20, "Applicant", 3, 0),
-    ("NABH Full Accreditation Hospitals", "SA - OA NC Review 1", 44, 10, 5, 7, "Assessor", 3, 0),
-    ("NABH Full Accreditation Hospitals", "SA - OA NC Response 2", 45, 15, 7, 10, "Applicant", 3, 0),
-    ("NABH Full Accreditation Hospitals", "SA - OA NC Review 2", 46, 10, 5, 7, "Assessor", 3, 0),
-    ("NABH Full Accreditation Hospitals", "SA - OA NC Accepted", 47, 0, 0, 0, None, 0, 1),
-    ("NABH Full Accreditation Hospitals", "SA - AC Allocated", 48, 15, 7, 10, "Program Officer", 2, 0),
-    ("NABH Full Accreditation Hospitals", "Accredited Continued", 49, 30, 15, 20, "Program Officer", 1, 0),
-    ("NABH Full Accreditation Hospitals", "3rd Annual Fee Payment", 50, 90, 1, 10, "Applicant", 3, 0),
-    ("NABH Full Accreditation Hospitals", "4th Annual Fee Payment", 51, 90, 1, 10, "Applicant", 3, 0),
-    ("NABH Full Accreditation Hospitals", "Renewal", 52, 90, 30, 60, "Applicant", 3, 0),
+    ("NABH Full Accreditation Hospitals", "Application In Progress", 1, 30, 15, 25, "Applicant", 3, 0, 0),
+    ("NABH Full Accreditation Hospitals", "Application Fee Pending", 2, 10, 5, 8, "Applicant", 3, 0, 0),
+    ("NABH Full Accreditation Hospitals", "Application Fee Paid", 3, 0, 0, 0, None, 0, 1, 0),
+    ("NABH Full Accreditation Hospitals", "DR Allocated", 4, 3, 1, 2, "Program Officer", 1, 0, 0),
+    ("NABH Full Accreditation Hospitals", "DR In Progress", 5, 10, 5, 7, "Assessor", 3, 0, 0),
+    ("NABH Full Accreditation Hospitals", "DR NC Response", 6, 20, 10, 15, "Applicant", 3, 0, 0),
+    ("NABH Full Accreditation Hospitals", "DR NC Review", 7, 10, 5, 7, "Assessor", 3, 0, 0),
+    ("NABH Full Accreditation Hospitals", "DR Approval by NABH", 8, 3, 1, 2, "Program Officer", 1, 0, 0),
+    ("NABH Full Accreditation Hospitals", "Assessment selection (if applicable)", 9, 5, 2, 4, "Applicant", 3, 0, 0),
+    ("NABH Full Accreditation Hospitals", "PA Allocation", 10, 20, 10, 15, "Program Officer", 1, 0, 0),
+    ("NABH Full Accreditation Hospitals", "PA date Accepted by Assessor", 11, 7, 3, 5, "Assessor", 3, 0, 0),
+    ("NABH Full Accreditation Hospitals", "PA Scheduled", 12, 5, 2, 4, "Applicant", 1, 0, 0),
+    ("NABH Full Accreditation Hospitals", "PA completed", 13, 3, 1, 2, "Assessor", 1, 0, 0),
+    ("NABH Full Accreditation Hospitals", "PA Feedback", 14, 2, 1, 999, "Applicant", 1, 0, 0),
+    ("NABH Full Accreditation Hospitals", "PA NC Response 1", 15, 50, 30, 40, "Applicant", 3, 0, 0),
+    ("NABH Full Accreditation Hospitals", "PA NC Review 1", 16, 10, 5, 7, "Assessor", 3, 0, 0),
+    ("NABH Full Accreditation Hospitals", "PA NC Response 2", 17, 30, 10, 20, "Applicant", 3, 0, 0),
+    ("NABH Full Accreditation Hospitals", "PA NC Review 2", 18, 10, 5, 7, "Assessor", 3, 0, 0),
+    ("NABH Full Accreditation Hospitals", "1st Annual Fee Pending", 19, 10, 5, 8, "Applicant", 3, 0, 0),
+    ("NABH Full Accreditation Hospitals", "1st Annual Fee Paid", 20, 0, 0, 0, None, 0, 1, 0),
+    ("NABH Full Accreditation Hospitals", "OA Allocated", 21, 20, 10, 15, "Program Officer", 1, 0, 0),
+    ("NABH Full Accreditation Hospitals", "OA date Accepted by Assessor", 22, 7, 3, 5, "Assessor", 3, 0, 0),
+    ("NABH Full Accreditation Hospitals", "OA Scheduled", 23, 5, 3, 4, "Applicant", 3, 0, 0),
+    ("NABH Full Accreditation Hospitals", "OA completed", 24, 3, 1, 2, "Assessor", 2, 0, 0),
+    ("NABH Full Accreditation Hospitals", "OA Feedback", 25, 2, 1, 999, "Applicant", 1, 0, 0),
+    ("NABH Full Accreditation Hospitals", "OA NC Response 1", 26, 50, 30, 40, "Applicant", 3, 0, 0),
+    ("NABH Full Accreditation Hospitals", "OA NC Review 1", 27, 10, 5, 7, "Assessor", 3, 0, 0),
+    ("NABH Full Accreditation Hospitals", "OA NC Response 2", 28, 30, 10, 20, "Applicant", 3, 0, 0),
+    ("NABH Full Accreditation Hospitals", "OA NC Review 2", 29, 10, 5, 7, "Assessor", 3, 0, 0),
+    ("NABH Full Accreditation Hospitals", "OA NC Accepted", 30, 0, 0, 0, None, 0, 1, 0),
+    ("NABH Full Accreditation Hospitals", "AC Allocated", 31, 15, 7, 10, "Program Officer", 2, 0, 0),
+    ("NABH Full Accreditation Hospitals", "AC Document Pending", 32, 90, 30, 60, "Applicant", 3, 0, 0),
+    ("NABH Full Accreditation Hospitals", "Pending Document Submitted", 33, 0, 0, 0, None, 0, 1, 0),
+    ("NABH Full Accreditation Hospitals", "Accredited/ Accredited Renewed", 34, 30, 15, 20, "Program Officer", 1, 0, 0),
+    ("NABH Full Accreditation Hospitals", "2nd Annual Fee Payment", 35, 90, 1, 10, "Applicant", 3, 0, 0),
+    ("NABH Full Accreditation Hospitals", "2nd Annual Fee Paid", 36, 0, 0, 0, None, 0, 1, 0),
+    ("NABH Full Accreditation Hospitals", "SA due", 37, 30, 15, 20, "Program Officer", 3, 0, 0),
+    ("NABH Full Accreditation Hospitals", "SA - OA Allocated", 38, 20, 10, 15, "Program Officer", 1, 0, 0),
+    ("NABH Full Accreditation Hospitals", "SA - OA date Accepted by Assessor", 39, 7, 3, 5, "Assessor", 3, 0, 0),
+    ("NABH Full Accreditation Hospitals", "SA - OA Scheduled", 40, 5, 3, 4, "Applicant", 3, 0, 0),
+    ("NABH Full Accreditation Hospitals", "SA - OA completed", 41, 3, 1, 2, "Assessor", 2, 0, 0),
+    ("NABH Full Accreditation Hospitals", "SA - OA Feedback", 42, 2, 1, 999, "Applicant", 1, 0, 0),
+    ("NABH Full Accreditation Hospitals", "SA - OA NC Response 1", 43, 25, 15, 20, "Applicant", 3, 0, 0),
+    ("NABH Full Accreditation Hospitals", "SA - OA NC Review 1", 44, 10, 5, 7, "Assessor", 3, 0, 0),
+    ("NABH Full Accreditation Hospitals", "SA - OA NC Response 2", 45, 15, 7, 10, "Applicant", 3, 0, 0),
+    ("NABH Full Accreditation Hospitals", "SA - OA NC Review 2", 46, 10, 5, 7, "Assessor", 3, 0, 0),
+    ("NABH Full Accreditation Hospitals", "SA - OA NC Accepted", 47, 0, 0, 0, None, 0, 1, 0),
+    ("NABH Full Accreditation Hospitals", "SA - AC Allocated", 48, 15, 7, 10, "Program Officer", 2, 0, 0),
+    ("NABH Full Accreditation Hospitals", "Accredited Continued", 49, 30, 15, 20, "Program Officer", 1, 0, 0),
+    ("NABH Full Accreditation Hospitals", "3rd Annual Fee Payment", 50, 90, 1, 10, "Applicant", 3, 0, 0),
+    ("NABH Full Accreditation Hospitals", "4th Annual Fee Payment", 51, 90, 1, 10, "Applicant", 3, 0, 0),
+    ("NABH Full Accreditation Hospitals", "Renewal", 52, 90, 30, 60, "Applicant", 3, 0, 0),
 ]
 
 _SEED_TEMPLATES = [
@@ -717,17 +875,34 @@ def migrate_data():
 
 def seed_data():
     conn = get_db()
-    if conn.execute("SELECT COUNT(*) FROM users").fetchone()[0] == 0:
+    # Always ensure admin exists; if ADMIN_PASSWORD env var is set, force-reset password
+    _admin_pw = os.environ.get("ADMIN_PASSWORD", "admin123")
+    existing_admin = conn.execute("SELECT id FROM users WHERE username='admin'").fetchone()
+    if not existing_admin:
         conn.execute(
             "INSERT INTO users (username, password_hash, role, full_name) VALUES (?,?,?,?)",
-            ("admin", generate_password_hash("admin123"), "super_admin", "Super Administrator"),
+            ("admin", generate_password_hash(_admin_pw), "super_admin", "Super Administrator"),
         )
+        conn.commit()
+        log.info("seed_data: admin user created")
+    elif os.environ.get("ADMIN_PASSWORD"):
+        # Force-reset password if env var explicitly set
+        conn.execute(
+            "UPDATE users SET password_hash=? WHERE username='admin'",
+            (generate_password_hash(_admin_pw),)
+        )
+        conn.commit()
+        log.info("seed_data: admin password reset from ADMIN_PASSWORD env var")
+
+    if conn.execute("SELECT COUNT(*) FROM users WHERE username='officer'").fetchone()[0] == 0:
         nabh = conn.execute("SELECT id FROM boards WHERE board_name='NABH'").fetchone()
         conn.execute(
             "INSERT INTO users (username, password_hash, role, full_name, board_id) VALUES (?,?,?,?,?)",
             ("officer", generate_password_hash("po123"), "program_officer", "Program Officer",
              nabh[0] if nabh else None),
         )
+        conn.commit()
+
     if conn.execute("SELECT COUNT(*) FROM programme_config").fetchone()[0] == 0:
         nabh = conn.execute("SELECT id FROM boards WHERE board_name='NABH'").fetchone()
         nabh_id = nabh[0] if nabh else None
@@ -741,7 +916,7 @@ def seed_data():
             conn.execute(
                 "INSERT INTO programme_config "
                 "(programme_name,stage_name,stage_order,tat_days,reminder1_day,reminder2_day,"
-                "owner_type,overdue_interval_days,is_milestone,board_id) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                "owner_type,overdue_interval_days,is_milestone,is_optional,board_id) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
                 (*row, nabh_id),
             )
     if conn.execute("SELECT COUNT(*) FROM email_templates").fetchone()[0] == 0:
@@ -756,12 +931,36 @@ def seed_data():
     conn.close()
 
 
-# ── Board scoping helper ──────────────────────────────────────────────────────
+# ── Role constants ────────────────────────────────────────────────────────────
+ROLE_META = {
+    "super_admin":    ("Super Admin",    "#dbeafe", "#1d4ed8"),
+    "board_admin":    ("Board Admin",    "#ede9fe", "#7c3aed"),
+    "board_ceo":      ("Board CEO",      "#fef3c7", "#92400e"),
+    "program_head":   ("Programme Head", "#dcfce7", "#166534"),
+    "program_officer":("Program Officer","#f1f5f9", "#475569"),
+}
+
+# ── Board / programme scoping helpers ─────────────────────────────────────────
 def user_board_id():
     """Returns board_id from session, or None for super_admin (sees all)."""
     if session.get("role") == "super_admin":
         return None
     return session.get("board_id")
+
+
+def user_programme_names():
+    """Returns list of programme names for program_head; None means 'see all in scope'."""
+    if session.get("role") != "program_head":
+        return None
+    conn = get_db()
+    rows = conn.execute(
+        """SELECT p.programme_name FROM user_programme_map upm
+           JOIN programmes p ON p.id = upm.programme_id
+           WHERE upm.user_id=?""",
+        (session["user_id"],)
+    ).fetchall()
+    conn.close()
+    return [r[0] for r in rows]
 
 
 # ── Email helpers ─────────────────────────────────────────────────────────────
@@ -831,28 +1030,55 @@ def send_notification(programme: str, ntype: str, to_email: str, cc_email: str,
 
 
 # ── Core daily check ─────────────────────────────────────────────────────────
-def run_daily_check() -> dict:
+def run_daily_check(board_id=None) -> dict:
     today = date.today()
     conn  = get_db()
-    cases = [dict(r) for r in conn.execute("SELECT * FROM case_tracking").fetchall()]
+    if board_id is not None:
+        cases = [dict(r) for r in conn.execute(
+            "SELECT * FROM case_tracking WHERE board_id=?", (board_id,)
+        ).fetchall()]
+    else:
+        cases = [dict(r) for r in conn.execute("SELECT * FROM case_tracking").fetchall()]
     summary = {"r1": 0, "r2": 0, "overdue": 0, "followup": 0,
                "skipped_milestone": 0, "errors": []}
 
+    # Pre-fetch programme_config to avoid N+1 queries per case
+    _pc_rows = conn.execute(
+        "SELECT programme_name, stage_name, overdue_interval_days, "
+        "sender_email, sender_password, smtp_host, smtp_port "
+        "FROM programme_config"
+    ).fetchall()
+    _pc_lookup = {(r["programme_name"], r["stage_name"]): dict(r) for r in _pc_rows}
+
+    # Pre-fetch programme → programme_head email mapping for escalations
+    _ph_rows = conn.execute(
+        """SELECT p.programme_name, u.email, u.full_name
+           FROM programmes p
+           JOIN user_programme_map upm ON upm.programme_id = p.id
+           JOIN users u ON u.id = upm.user_id
+           WHERE u.role='program_head' AND u.email IS NOT NULL"""
+    ).fetchall()
+    _ph_map: dict = {}
+    for _r in _ph_rows:
+        _ph_map.setdefault(_r["programme_name"], []).append(
+            {"email": _r["email"], "full_name": _r["full_name"]}
+        )
+
     for case in cases:
+        # Skip closed/withdrawn/suspended/on-hold cases
+        case_status = case.get("status", "Active")
+        if case_status and case_status not in ("Active", None, ""):
+            continue
         if case["is_milestone"]:
             summary["skipped_milestone"] += 1
             continue
 
-        elapsed = working_days_elapsed(case["stage_start_date"], today)
+        elapsed = working_days_elapsed(case["stage_start_date"], today, hold_days=case.get("hold_days", 0))
         tat     = case["tat_days"]
         r1_day  = case["reminder1_day"]
         r2_day  = case["reminder2_day"]
 
-        cfg = conn.execute(
-            "SELECT overdue_interval_days, sender_email, sender_password, smtp_host, smtp_port "
-            "FROM programme_config WHERE programme_name=? AND stage_name=?",
-            (case["programme_name"], case["current_stage"]),
-        ).fetchone()
+        cfg = _pc_lookup.get((case["programme_name"], case["current_stage"]))
 
         overdue_interval = cfg["overdue_interval_days"] if cfg else 3
         sender_email     = cfg["sender_email"] if cfg and cfg["sender_email"] else None
@@ -900,10 +1126,47 @@ def run_daily_check() -> dict:
                 case["action_owner_email"], cc,
                 sender_email, sender_pw_enc, ph,
                 smtp_host, smtp_port,
-                case["application_id"], case.get("board_id")
+                case["application_id"], case.get("board_id"),
+                stage_name=case["current_stage"]
             )
             fire_webhook(f"notification_{ntype.lower()}", {**webhook_ph, "type": ntype})
             return True
+
+        def _escalate_to_ph():
+            """Email all Programme Heads mapped to this programme if TAT severely breached."""
+            escalation_threshold = int(get_app_setting("ph_escalation_days", "5"))
+            days_overdue = elapsed - tat
+            if days_overdue < escalation_threshold:
+                return
+            ph_users = _ph_map.get(case["programme_name"], [])
+            for ph_user in ph_users:
+                if not ph_user["email"]:
+                    continue
+                esc_ph = {**ph,
+                          "Action_Owner_Name": ph_user["full_name"] or ph_user["email"],
+                          "Days_Overdue": days_overdue}
+                subj = f"[ESCALATION] {case['organisation_name']} overdue {days_overdue}d — {case['current_stage']}"
+                body = (f"Dear {ph_user['full_name'] or 'Programme Head'},\n\n"
+                        f"This is an escalation notice.\n\n"
+                        f"Case: {case['organisation_name']} ({case['application_id']})\n"
+                        f"Programme: {case['programme_name']}\n"
+                        f"Stage: {case['current_stage']}\n"
+                        f"Days overdue: {days_overdue}\n\n"
+                        f"Immediate intervention may be required.\n\nQCI Notification Engine")
+                if sender_email:
+                    try:
+                        msg = MIMEMultipart()
+                        msg["From"] = sender_email
+                        msg["To"] = ph_user["email"]
+                        msg["Subject"] = subj
+                        msg.attach(MIMEText(body, "plain"))
+                        pw = decrypt_str(sender_pw_enc) if sender_pw_enc else ""
+                        with smtplib.SMTP(smtp_host, smtp_port, timeout=15) as s:
+                            s.starttls()
+                            s.login(sender_email, pw)
+                            s.sendmail(sender_email, [ph_user["email"]], msg.as_string())
+                    except Exception as e:
+                        log.warning("PH escalation failed: %s", e)
 
         # R1
         if r1_day > 0 and elapsed >= r1_day and not case["r1_sent"]:
@@ -942,12 +1205,107 @@ def run_daily_check() -> dict:
                 conn.commit()
                 summary["followup"] += 1
 
+        # Escalation to Programme Head if severely overdue
+        if tat > 0 and elapsed > tat and case["overdue_sent"]:
+            _escalate_to_ph()
+
     conn.close()
     # Process queued emails
     q_result = process_email_queue()
     summary["emails_sent"] = q_result["sent"]
     summary["email_failures"] = q_result["failed"]
     return summary
+
+
+# ── Weekly digest ────────────────────────────────────────────────────────────
+def run_weekly_digest():
+    """Send a weekly summary email to board_ceo and board_admin users."""
+    if get_app_setting("digest_enabled", "1") != "1":
+        log.info("Weekly digest is disabled — skipping.")
+        return
+    conn = get_db()
+    today = date.today()
+    recipients = [dict(r) for r in conn.execute(
+        "SELECT u.*, b.board_name FROM users u LEFT JOIN boards b ON b.id=u.board_id "
+        "WHERE u.role IN ('board_ceo','board_admin','super_admin') AND u.email IS NOT NULL"
+    ).fetchall()]
+
+    for user in recipients:
+        bid = user["board_id"]
+        if user["role"] == "super_admin":
+            cases = [dict(r) for r in conn.execute(
+                "SELECT * FROM case_tracking WHERE (status='Active' OR status IS NULL)"
+            ).fetchall()]
+        else:
+            cases = [dict(r) for r in conn.execute(
+                "SELECT * FROM case_tracking WHERE board_id=? AND (status='Active' OR status IS NULL)", (bid,)
+            ).fetchall()]
+
+        if not cases:
+            continue
+
+        total = len(cases)
+        overdue = sum(1 for c in cases if not c["is_milestone"] and c["tat_days"] > 0
+                      and working_days_elapsed(c["stage_start_date"], today) >= c["tat_days"])
+        at_risk = sum(1 for c in cases if not c["is_milestone"] and c["tat_days"] > 0
+                      and working_days_elapsed(c["stage_start_date"], today) >= c["reminder2_day"]
+                      and working_days_elapsed(c["stage_start_date"], today) < c["tat_days"])
+        compliant = total - overdue - at_risk
+
+        body = (f"Weekly QCI Notification Engine Digest — {today.strftime('%d %b %Y')}\n\n"
+                f"Board: {user.get('board_name') or 'All Boards'}\n"
+                f"{'='*40}\n\n"
+                f"Total Active Cases  : {total}\n"
+                f"Overdue             : {overdue}\n"
+                f"At Risk             : {at_risk}\n"
+                f"On Track / Compliant: {compliant}\n\n")
+
+        # Top 5 most overdue
+        overdue_cases = [c for c in cases if not c["is_milestone"] and c["tat_days"] > 0
+                         and working_days_elapsed(c["stage_start_date"], today) >= c["tat_days"]]
+        overdue_cases.sort(key=lambda x: working_days_elapsed(x["stage_start_date"], today), reverse=True)
+        if overdue_cases:
+            body += "Top Overdue Cases:\n"
+            for c in overdue_cases[:5]:
+                days_late = working_days_elapsed(c["stage_start_date"], today) - c["tat_days"]
+                body += f"  • {c['organisation_name']} ({c['application_id']}) — {c['current_stage']} — {days_late}d late\n"
+            body += "\n"
+
+        body += "Log in to QCI Notify for full details.\n\nQCI Notification Engine (automated digest)"
+
+        # Get sender credentials from any programme in scope
+        cfg = None
+        if bid:
+            cfg = conn.execute(
+                "SELECT sender_email, sender_password, smtp_host, smtp_port "
+                "FROM programme_config WHERE board_id=? AND sender_email IS NOT NULL LIMIT 1", (bid,)
+            ).fetchone()
+        if not cfg:
+            cfg = conn.execute(
+                "SELECT sender_email, sender_password, smtp_host, smtp_port "
+                "FROM programme_config WHERE sender_email IS NOT NULL LIMIT 1"
+            ).fetchone()
+        if not cfg or not cfg["sender_email"]:
+            continue
+
+        try:
+            msg = MIMEMultipart()
+            msg["From"] = cfg["sender_email"]
+            msg["To"] = user["email"]
+            msg["Subject"] = f"[QCI Digest] Weekly Summary — {today.strftime('%d %b %Y')}"
+            msg.attach(MIMEText(body, "plain"))
+            pw = decrypt_str(cfg["sender_password"]) if cfg["sender_password"] else ""
+            smtp_host = cfg["smtp_host"] or "smtp.gmail.com"
+            smtp_port = cfg["smtp_port"] or 587
+            with smtplib.SMTP(smtp_host, smtp_port, timeout=15) as s:
+                s.starttls()
+                s.login(cfg["sender_email"], pw)
+                s.sendmail(cfg["sender_email"], [user["email"]], msg.as_string())
+            log.info("Weekly digest sent to %s", user["email"])
+        except Exception as e:
+            log.warning("Weekly digest failed for %s: %s", user["email"], e)
+
+    conn.close()
 
 
 # ── Case upsert helper ───────────────────────────────────────────────────────
@@ -1018,6 +1376,9 @@ def upsert_case(data: dict) -> str:
                                  data.get("_changed_by", ""), board_id)
             log_audit("stage_change", data["application_id"],
                       f"{old_stage} → {new_stage}", data.get("_changed_by", ""), board_id)
+            for _skipped in data.get("_skipped_stages", []):
+                log_audit("stage_skipped", data["application_id"],
+                          f"Optional stage skipped: {_skipped}", data.get("_changed_by", ""), board_id)
         else:
             log_audit("case_updated", data["application_id"],
                       f"Updated (stage: {new_stage})", data.get("_changed_by", ""), board_id)
@@ -1220,6 +1581,53 @@ body{background:var(--bg);margin:0}
 .accordion-button:focus{box-shadow:0 0 0 3px rgba(0,148,202,.12)}
 
 th{white-space:nowrap}
+
+/* ── Responsive ── */
+#sidebar-overlay{display:none;position:fixed;inset:0;background:rgba(0,0,0,.45);z-index:99}
+.hamburger{display:none;background:none;border:none;cursor:pointer;padding:4px 8px;color:var(--navy);font-size:20px}
+@media(max-width:991px){
+  #sidebar{transform:translateX(-100%);transition:transform .25s ease;z-index:200}
+  #sidebar.open{transform:translateX(0)}
+  #sidebar-overlay.open{display:block}
+  #main{margin-left:0}
+  .hamburger{display:flex;align-items:center}
+  .topbar{padding:0 16px}
+  .page-body{padding:16px}
+}
+@media(max-width:575px){
+  .stat-card .stat-val{font-size:24px}
+  .page-body{padding:12px 10px}
+  .topbar-title{font-size:13px}
+  .data-table th,.data-table td{padding:8px 10px;font-size:12px}
+  .card-header{font-size:13px;padding:12px 14px}
+  .btn-sm{font-size:11px;padding:4px 9px}
+  .modal-dialog{margin:10px}
+}
+@media(min-width:1600px){
+  #sidebar{width:240px}
+  #main{margin-left:240px}
+  .page-body{padding:28px 36px}
+  .stat-card .stat-val{font-size:34px}
+}
+/* ── Responsive (additional) ─────────────────────────────────────────────── */
+@media (max-width: 768px) {
+  .sidebar { transform: translateX(-260px); transition: transform .25s ease; position: fixed; z-index: 1050; height: 100vh; }
+  .sidebar.open { transform: translateX(0); }
+  .main-content { margin-left: 0 !important; padding: 16px 12px; }
+  .topbar { left: 0 !important; }
+  .mobile-menu-btn { display: flex !important; }
+  .stat-card { min-width: 140px; }
+  .data-table th, .data-table td { padding: 10px 8px; font-size: 12px; }
+  .card-header { font-size: 13px; }
+  .hide-mobile { display: none !important; }
+}
+@media (min-width: 769px) {
+  .mobile-menu-btn { display: none !important; }
+  .sidebar-overlay { display: none !important; }
+}
+@media (min-width: 1400px) {
+  .main-content { max-width: 1600px; }
+}
 </style>
 </head>
 <body>
@@ -1239,9 +1647,11 @@ th{white-space:nowrap}
     <a class="nav-link {{ 'active' if active_page=='dashboard' else '' }}" href="/">
       <i class="bi bi-speedometer2"></i> Dashboard
     </a>
+    {% if user_role in ('program_officer', 'program_head') %}
     <a class="nav-link {{ 'active' if active_page=='my_cases' else '' }}" href="/?my_cases=1">
       <i class="bi bi-person-check"></i> My Cases
     </a>
+    {% endif %}
     <a class="nav-link {{ 'active' if active_page=='log' else '' }}" href="/log-stage">
       <i class="bi bi-plus-circle"></i> Log Stage Change
     </a>
@@ -1252,11 +1662,19 @@ th{white-space:nowrap}
       <i class="bi bi-fast-forward-fill"></i> Bulk Advance
     </a>
     <div class="nav-section" style="margin-top:8px">Reports</div>
+    {% if user_role == 'board_ceo' %}
+    <a class="nav-link {{ 'active' if active_page=='ceo_dashboard' else '' }}" href="/ceo-dashboard">
+      <i class="bi bi-speedometer2"></i> CEO Dashboard
+    </a>
+    {% endif %}
     <a class="nav-link {{ 'active' if active_page=='reports' else '' }}" href="/reports">
       <i class="bi bi-graph-up"></i> Analytics
     </a>
-    <a class="nav-link" href="/export-excel">
-      <i class="bi bi-file-earmark-excel"></i> Export Excel
+    <a class="nav-link {{ 'active' if active_page=='export_excel' else '' }}" href="/export-excel">
+      <i class="bi bi-file-earmark-excel"></i> Export Report
+    </a>
+    <a class="nav-link {{ 'active' if active_page=='search' else '' }}" href="/search">
+      <i class="bi bi-search"></i> Search Cases
     </a>
     {% if user_role in ('super_admin', 'board_admin') %}
     <div class="nav-section" style="margin-top:8px">Admin</div>
@@ -1282,6 +1700,9 @@ th{white-space:nowrap}
     <a class="nav-link {{ 'active' if active_page=='system' else '' }}" href="/system-settings">
       <i class="bi bi-gear"></i> System Settings
     </a>
+    <a class="nav-link {{ 'active' if active_page=='api_keys' else '' }}" href="/api-keys">
+      <i class="bi bi-key-fill"></i> API Keys
+    </a>
     <a class="nav-link" href="/backup">
       <i class="bi bi-download"></i> Backup DB
     </a>
@@ -1299,6 +1720,8 @@ th{white-space:nowrap}
         <div style="color:rgba(255,255,255,.4);font-size:10px;text-transform:uppercase;letter-spacing:.5px">
           {% if user_role=='super_admin' %}Super Admin
           {% elif user_role=='board_admin' %}Board Admin · {{ board_name }}
+          {% elif user_role=='board_ceo' %}Board CEO · {{ board_name }}
+          {% elif user_role=='program_head' %}Programme Head · {{ board_name }}
           {% else %}Program Officer · {{ board_name }}{% endif %}
         </div>
       </div>
@@ -1317,11 +1740,17 @@ th{white-space:nowrap}
 </div>
 
 <!-- Main -->
+<div id="sidebar-overlay" onclick="closeSidebar()"></div>
 <div id="main">
   <div class="topbar">
-    <div>
-      <div class="topbar-title">{{ page_title }}</div>
-      {% if page_crumb %}<div class="page-crumb">{{ page_crumb | safe }}</div>{% endif %}
+    <div class="d-flex align-items-center gap-2">
+      <button class="hamburger" onclick="openSidebar()" title="Menu">
+        <i class="bi bi-list"></i>
+      </button>
+      <div>
+        <div class="topbar-title">{{ page_title }}</div>
+        {% if page_crumb %}<div class="page-crumb">{{ page_crumb | safe }}</div>{% endif %}
+      </div>
     </div>
     <div class="d-flex align-items-center gap-2">
       {{ topbar_actions | safe }}
@@ -1351,6 +1780,21 @@ th{white-space:nowrap}
 // Auto-dismiss toasts after 5s
 document.querySelectorAll('.toast.show').forEach(function(el){
   setTimeout(function(){ var t=bootstrap.Toast.getOrCreateInstance(el); t.hide(); }, 5000);
+});
+// Mobile sidebar
+function openSidebar(){
+  document.getElementById('sidebar').classList.add('open');
+  document.getElementById('sidebar-overlay').classList.add('open');
+  document.body.style.overflow='hidden';
+}
+function closeSidebar(){
+  document.getElementById('sidebar').classList.remove('open');
+  document.getElementById('sidebar-overlay').classList.remove('open');
+  document.body.style.overflow='';
+}
+// Close sidebar on nav link click (mobile)
+document.querySelectorAll('#sidebar .nav-link').forEach(function(a){
+  a.addEventListener('click', function(){ if(window.innerWidth<992) closeSidebar(); });
 });
 // Dark mode
 function toggleDark(){
@@ -1465,10 +1909,24 @@ _LOGIN_PAGE = """<!doctype html>
     {% endif %}
     <button type="submit" class="btn-login">Sign In</button>
   </form>
-  <div class="creds-hint">
-    <strong>Default credentials</strong><br>
-    Admin: <code>admin</code> / <code>admin123</code><br>
-    Program Officer: <code>officer</code> / <code>po123</code>
+  <div class="creds-hint" style="padding:14px 16px">
+    <div style="font-size:11px;font-weight:700;letter-spacing:.5px;color:#94a3b8;margin-bottom:10px">DEFAULT CREDENTIALS</div>
+    <table style="width:100%;font-size:12px;border-collapse:collapse">
+      <thead>
+        <tr style="color:#94a3b8;border-bottom:1px solid #e2e8f0">
+          <th style="text-align:left;padding-bottom:6px;font-weight:600">Role</th>
+          <th style="text-align:left;padding-bottom:6px;font-weight:600">Username</th>
+          <th style="text-align:left;padding-bottom:6px;font-weight:600">Password</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr><td style="padding:4px 0;color:#1e293b">Super Admin</td><td><code>admin</code></td><td><code>admin123</code></td></tr>
+        <tr><td style="padding:4px 0;color:#1e293b">Program Officer</td><td><code>officer</code></td><td><code>po123</code></td></tr>
+      </tbody>
+    </table>
+    <div style="font-size:10px;color:#94a3b8;margin-top:10px;border-top:1px solid #e2e8f0;padding-top:8px">
+      Board Admin, Board CEO &amp; Programme Head accounts are created by Super Admin.
+    </div>
   </div>
 </div>
 <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/js/bootstrap.bundle.min.js"></script>
@@ -1499,6 +1957,12 @@ def login():
                     flash("Invalid 2FA code.", "error")
                     return render_template_string(_LOGIN_PAGE, get_flashed_messages=gfm,
                                                   show_totp=True, prefill_user=username)
+            # Record last login
+            conn3 = get_db()
+            conn3.execute("UPDATE users SET last_login=? WHERE id=?",
+                         (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), user["id"]))
+            conn3.commit()
+            conn3.close()
             session["user_id"]   = user["id"]
             session["username"]  = user["username"]
             session["role"]      = user["role"]
@@ -1599,6 +2063,20 @@ def manage_users():
                      board_id),
                 )
                 conn.commit()
+                new_user = conn.execute(
+                    "SELECT id FROM users WHERE username=?", (request.form["username"].strip(),)
+                ).fetchone()
+                if new_user and role in ("program_head", "program_officer", "board_ceo"):
+                    prog_ids = request.form.getlist("programme_ids")
+                    for pid in prog_ids:
+                        try:
+                            conn.execute(
+                                "INSERT INTO user_programme_map (user_id, programme_id) VALUES (?,?) ON CONFLICT (user_id, programme_id) DO NOTHING",
+                                (new_user["id"], int(pid))
+                            )
+                        except Exception:
+                            pass
+                    conn.commit()
                 flash(f"User '{request.form['username']}' created.", "success")
             except Exception as e:
                 flash(f"Error: {e}", "error")
@@ -1618,6 +2096,21 @@ def manage_users():
                              (generate_password_hash(new_pw), uid))
                 conn.commit()
                 flash("Password updated.", "success")
+        elif action == "remap_ph":
+            uid = request.form.get("remap_user_id")
+            if uid:
+                conn.execute("DELETE FROM user_programme_map WHERE user_id=?", (uid,))
+                prog_ids = request.form.getlist("programme_ids")
+                for pid in prog_ids:
+                    try:
+                        conn.execute(
+                            "INSERT INTO user_programme_map (user_id, programme_id) VALUES (?,?) ON CONFLICT (user_id, programme_id) DO NOTHING",
+                            (int(uid), int(pid))
+                        )
+                    except Exception:
+                        pass
+                conn.commit()
+                flash("Programme mapping updated.", "success")
 
     users = [dict(r) for r in conn.execute(
         """SELECT u.*, b.board_name FROM users u
@@ -1625,46 +2118,98 @@ def manage_users():
            ORDER BY u.role, u.username"""
     ).fetchall()]
     boards = [dict(r) for r in conn.execute("SELECT * FROM boards ORDER BY board_name").fetchall()]
-    conn.close()
+    all_programmes = [dict(r) for r in conn.execute(
+        "SELECT p.*, b.board_name FROM programmes p JOIN boards b ON b.id=p.board_id ORDER BY b.board_name, p.programme_name"
+    ).fetchall()]
 
-    ROLE_LABELS = {
-        "super_admin": ("Super Admin", "#dbeafe", "#1d4ed8"),
-        "board_admin": ("Board Admin", "#ede9fe", "#7c3aed"),
-        "program_officer": ("Program Officer", "#f1f5f9", "#475569"),
-    }
+    # Build programme map per user (for program_head display)
+    ph_prog_map = {}
+    for row in conn.execute(
+        """SELECT upm.user_id, p.programme_name
+           FROM user_programme_map upm JOIN programmes p ON p.id=upm.programme_id"""
+    ).fetchall():
+        ph_prog_map.setdefault(row["user_id"], []).append(row["programme_name"])
+
+    conn.close()
 
     rows = ""
     for u in users:
-        rl, bg, fg = ROLE_LABELS.get(u["role"], (u["role"], "#f1f5f9", "#475569"))
+        rl, bg, fg = ROLE_META.get(u["role"], (u["role"], "#f1f5f9", "#475569"))
         role_pill = f'<span class="pill" style="background:{bg};color:{fg}">{rl}</span>'
         board_cell = u.get("board_name") or '<span style="color:#94a3b8">—</span>'
         is_self = u["id"] == session["user_id"]
+        _REMAP_ROLES = {"program_officer", "program_head", "board_ceo"}
+        prog_cell = ""
+        if u["role"] in _REMAP_ROLES:
+            progs = ph_prog_map.get(u["id"], [])
+            if progs:
+                prog_cell = " ".join(
+                    f'<span style="background:#ede9fe;color:#7c3aed;font-size:10px;padding:1px 6px;border-radius:10px;white-space:nowrap">{p}</span>'
+                    for p in progs
+                )
+            else:
+                prog_cell = '<span style="color:#f59e0b;font-size:11px">None mapped</span>'
+        last_login_cell = u.get("last_login") or '<span style="color:#94a3b8;font-size:11px">Never</span>'
+        _uid = u["id"]
+        _uname = u["username"]
+        _urole = u["role"]
+        remap_btn = (
+            '<button class="btn btn-sm btn-outline-primary" style="font-size:12px;padding:3px 8px" title="Map Programmes" '
+            f'onclick="showRemapPh({json.dumps(str(_uid))}, {json.dumps(str(_uname))}, {json.dumps(str(_urole))})">'
+            '<i class="bi bi-diagram-3"></i></button>'
+            if _urole in _REMAP_ROLES else ""
+        )
+        del_btn = (
+            '<button class="btn btn-sm btn-outline-danger" style="font-size:12px;padding:3px 8px" title="Delete User" '
+            f'onclick="confirmDeleteUser({_uid}, {json.dumps(_uname)})">'
+            '<i class="bi bi-trash"></i></button>'
+            if not is_self else ""
+        )
         rows += f"""<tr>
           <td style="font-weight:600">{u['username']}</td>
           <td>{u['full_name'] or '—'}</td>
           <td>{u['email'] or '—'}</td>
           <td>{role_pill}</td>
           <td>{board_cell}</td>
+          <td style="font-size:12px;color:#475569;max-width:180px">{prog_cell or '<span style="color:#94a3b8">—</span>'}</td>
+          <td style="font-size:11px;color:#64748b">{last_login_cell}</td>
           <td>
-            <button class="btn btn-sm btn-action btn-outline-secondary"
-              onclick="showResetPw({u['id']}, '{u['username']}')">Reset PW</button>
-            {"" if is_self else f'''<button class="btn btn-sm btn-action btn-outline-danger ms-1"
-              onclick="confirmDeleteUser({u['id']}, '{u['username']}')">Delete</button>'''}
+            <div class="d-flex gap-1 align-items-center" style="white-space:nowrap">
+              <button class="btn btn-sm btn-outline-secondary" style="font-size:12px;padding:3px 8px" title="Reset Password"
+                onclick="showResetPw({u['id']}, {json.dumps(u['username'])})">
+                <i class="bi bi-key"></i></button>
+              {remap_btn}
+              {del_btn}
+            </div>
           </td>
         </tr>"""
 
     board_opts = '<option value="">— None —</option>' + "".join(
         f'<option value="{b["id"]}">{b["board_name"]}</option>' for b in boards
     )
+    prog_opts_by_board = "".join(
+        f'<option value="{p["id"]}" data-board="{p["board_id"]}">[{p["board_name"]}] {p["programme_name"]}</option>'
+        for p in all_programmes
+    )
 
     content = f"""
 <div class="row g-4">
   <div class="col-lg-8">
     <div class="card">
-      <div class="card-header">All Users</div>
+      <div class="card-header d-flex justify-content-between align-items-center flex-wrap gap-2">
+        <span>All Users</span>
+        <div class="d-flex gap-2 align-items-center">
+          <input type="text" id="userSearch" class="form-control form-control-sm"
+                 placeholder="Search users..." oninput="filterUsers(this.value)"
+                 style="max-width:200px;font-size:12px">
+          <a href="/bulk-users" class="btn btn-sm btn-outline-primary">
+            <i class="bi bi-upload"></i> Bulk Import
+          </a>
+        </div>
+      </div>
       <div style="overflow-x:auto">
-        <table class="data-table">
-          <thead><tr><th>Username</th><th>Full Name</th><th>Email</th><th>Role</th><th>Board</th><th>Actions</th></tr></thead>
+        <table class="data-table" id="userTable">
+          <thead><tr><th>Username</th><th>Full Name</th><th>Email</th><th>Role</th><th>Board</th><th>Programmes</th><th>Last Login</th><th>Actions</th></tr></thead>
           <tbody>{rows}</tbody>
         </table>
       </div>
@@ -1690,17 +2235,26 @@ def manage_users():
           </div>
           <div class="mb-3">
             <label class="form-label">Role</label>
-            <select class="form-select" name="role" id="roleSelect" onchange="toggleBoardField()">
+            <select class="form-select" name="role" id="roleSelect" onchange="toggleRoleFields()">
               <option value="program_officer">Program Officer</option>
+              <option value="program_head">Programme Head</option>
+              <option value="board_ceo">Board CEO</option>
               <option value="board_admin">Board Admin</option>
               <option value="super_admin">Super Admin</option>
             </select>
           </div>
           <div class="mb-3" id="boardField">
-            <label class="form-label">Board <span style="color:#94a3b8;font-size:11px">(required for PO / Board Admin)</span></label>
-            <select class="form-select" name="board_id">
+            <label class="form-label">Board <span style="color:#94a3b8;font-size:11px">(required for all except Super Admin)</span></label>
+            <select class="form-select" name="board_id" id="boardSelect" onchange="filterProgsByBoard()">
               {board_opts}
             </select>
+          </div>
+          <div class="mb-3" id="progField" style="display:none">
+            <label class="form-label">Programmes <span style="color:#94a3b8;font-size:11px">(hold Ctrl/Cmd for multiple)</span></label>
+            <select class="form-select" name="programme_ids" id="progSelect" multiple size="5">
+              {prog_opts_by_board}
+            </select>
+            <div style="font-size:11px;color:#94a3b8;margin-top:4px">Only programmes for the selected board are shown.</div>
           </div>
           <div class="mb-3">
             <label class="form-label">Password</label>
@@ -1725,7 +2279,7 @@ def manage_users():
           <input type="password" class="form-control" name="new_password" placeholder="New password" required>
         </div>
         <div class="modal-footer border-0">
-          <button class="btn btn-sm btn-outline-secondary" data-bs-dismiss="modal">Cancel</button>
+          <button type="button" class="btn btn-sm btn-outline-secondary" data-bs-dismiss="modal">Cancel</button>
           <button class="btn btn-sm btn-primary" type="submit">Update</button>
         </div>
       </form>
@@ -1733,27 +2287,57 @@ def manage_users():
   </div>
 </div>
 
-<!-- Delete user modal -->
-<div class="modal fade" id="delUserModal" tabindex="-1">
-  <div class="modal-dialog modal-dialog-centered modal-sm">
+<!-- Programme Head Re-mapping Modal -->
+<div class="modal fade" id="remapPhModal" tabindex="-1">
+  <div class="modal-dialog modal-dialog-centered">
     <div class="modal-content">
-      <div class="modal-body text-center p-4">
-        <i class="bi bi-person-x" style="font-size:32px;color:#dc2626"></i>
-        <div style="font-weight:600;margin-top:10px">Delete user <span id="delUserName"></span>?</div>
+      <div class="modal-header border-0">
+        <h6 class="modal-title"><i class="bi bi-diagram-3-fill" style="color:#166534"></i> Re-map Programmes — <span id="remapPhUser"></span></h6>
+        <button class="btn-close" data-bs-dismiss="modal"></button>
       </div>
       <form method="post">
-        <input type="hidden" name="action" value="delete">
-        <input type="hidden" name="user_id" id="delUserId">
-        <div class="modal-footer border-0 justify-content-center gap-2">
-          <button class="btn btn-sm btn-outline-secondary" data-bs-dismiss="modal">Cancel</button>
-          <button class="btn btn-sm btn-danger" type="submit">Delete</button>
+        <input type="hidden" name="action" value="remap_ph">
+        <input type="hidden" name="remap_user_id" id="remapPhUserId">
+        <div class="modal-body pt-0">
+          <p style="font-size:12px;color:#64748b">Select all programmes this user should have access to (hold Ctrl/Cmd for multiple):</p>
+          <select class="form-select" name="programme_ids" id="remapProgSelect" multiple size="7">
+            {prog_opts_by_board}
+          </select>
+        </div>
+        <div class="modal-footer border-0">
+          <button type="button" class="btn btn-sm btn-outline-secondary" data-bs-dismiss="modal">Cancel</button>
+          <button class="btn btn-sm btn-success" type="submit">Save Mapping</button>
         </div>
       </form>
     </div>
   </div>
 </div>
+
+<!-- Delete user modal — form lives outside -->
+<div class="modal fade" id="delUserModal" tabindex="-1">
+  <div class="modal-dialog modal-dialog-centered modal-sm">
+    <div class="modal-content">
+      <div class="modal-body text-center p-4">
+        <i class="bi bi-person-x" style="font-size:32px;color:#dc2626"></i>
+        <div style="font-weight:600;margin-top:10px">Delete <span id="delUserName"></span>?</div>
+        <div style="font-size:12px;color:#94a3b8;margin-top:6px">This cannot be undone.</div>
+      </div>
+      <div class="modal-footer border-0 justify-content-center gap-2">
+        <button type="button" class="btn btn-sm btn-outline-secondary" data-bs-dismiss="modal">Cancel</button>
+        <button type="button" class="btn btn-sm btn-danger" onclick="submitDeleteUser()">Delete</button>
+      </div>
+    </div>
+  </div>
+</div>
+<!-- Hidden delete form — outside modal so Cancel cannot accidentally submit it -->
+<form method="post" id="deleteUserForm" style="display:none">
+  <input type="hidden" name="action" value="delete">
+  <input type="hidden" name="user_id" id="delUserId">
+</form>
 """
     scripts = """<script>
+var _PROG_ROLES = ['program_officer', 'program_head', 'board_ceo'];
+
 function showResetPw(id, name){
   document.getElementById('rpUserId').value = id;
   document.getElementById('rpUser').textContent = name;
@@ -1764,25 +2348,396 @@ function confirmDeleteUser(id, name){
   document.getElementById('delUserName').textContent = name;
   new bootstrap.Modal(document.getElementById('delUserModal')).show();
 }
-function toggleBoardField(){
+function submitDeleteUser(){
+  document.getElementById('deleteUserForm').submit();
+}
+function filterProgsByBoard(){
+  var bid = document.getElementById('boardSelect').value;
+  var opts = document.getElementById('progSelect').options;
+  for(var i=0; i<opts.length; i++){
+    var show = !bid || opts[i].dataset.board == bid;
+    opts[i].style.display = show ? '' : 'none';
+    if(bid && opts[i].dataset.board != bid) opts[i].selected = false;
+  }
+}
+function toggleRoleFields(){
   var role = document.getElementById('roleSelect').value;
   document.getElementById('boardField').style.display = role === 'super_admin' ? 'none' : '';
+  var showProg = _PROG_ROLES.indexOf(role) >= 0;
+  document.getElementById('progField').style.display = showProg ? '' : 'none';
+  if(showProg) filterProgsByBoard();
 }
-toggleBoardField();
+toggleRoleFields();
+function showRemapPh(id, name, role){
+  document.getElementById('remapPhUserId').value = id;
+  document.getElementById('remapPhUser').textContent = name + ' (' + role + ')';
+  new bootstrap.Modal(document.getElementById('remapPhModal')).show();
+}
+function filterUsers(q){
+  q = q.toLowerCase();
+  document.querySelectorAll('#userTable tbody tr').forEach(function(row){
+    row.style.display = row.textContent.toLowerCase().includes(q) ? '' : 'none';
+  });
+}
 </script>"""
     return render_page(content, scripts, active_page="users", page_title="Manage Users")
+
+
+@app.route("/bulk-users", methods=["GET", "POST"])
+@admin_required
+def bulk_users():
+    """Bulk import users from CSV. Columns: username, full_name, email, role, board_name, password"""
+    errors = []
+    created = 0
+    if request.method == "POST":
+        f = request.files.get("csv_file")
+        if not f:
+            flash("No file uploaded.", "error")
+            return redirect(url_for("bulk_users"))
+        conn = get_db()
+        boards = {r["board_name"].lower(): r["id"] for r in conn.execute("SELECT id, board_name FROM boards").fetchall()}
+        try:
+            fname_u = (f.filename or "").lower()
+            if fname_u.endswith(".xlsx") or fname_u.endswith(".xls"):
+                if not HAS_XLSX:
+                    flash("openpyxl not installed — cannot read Excel files.", "error")
+                    return redirect(url_for("bulk_users"))
+                wb_u = openpyxl.load_workbook(io.BytesIO(f.read()))
+                ws_u = wb_u.active
+                all_u_rows = list(ws_u.iter_rows(values_only=True))
+                if not all_u_rows:
+                    flash("The uploaded file is empty.", "error")
+                    return redirect(url_for("bulk_users"))
+                hdrs_u = [str(h).strip() if h else "" for h in all_u_rows[0]]
+                row_dicts_u = [
+                    {hdrs_u[j]: (str(v).strip() if v is not None else "")
+                     for j, v in enumerate(r) if j < len(hdrs_u)}
+                    for r in all_u_rows[1:]
+                ]
+                reader_iter = iter(row_dicts_u)
+            else:
+                content_bytes = f.read().decode("utf-8-sig")
+                reader_iter = csv.DictReader(io.StringIO(content_bytes))
+            for i, row in enumerate(reader_iter, 2):
+                uname = (row.get("username") or "").strip()
+                if not uname:
+                    errors.append(f"Row {i}: username missing")
+                    continue
+                role = (row.get("role") or "program_officer").strip()
+                if role not in ROLE_META:
+                    errors.append(f"Row {i} ({uname}): invalid role '{role}'")
+                    continue
+                board_name = (row.get("board_name") or "").strip().lower()
+                board_id = boards.get(board_name) if board_name else None
+                pw = (row.get("password") or "").strip() or secrets.token_hex(8)
+                try:
+                    conn.execute(
+                        "INSERT INTO users (username, password_hash, role, full_name, email, board_id) VALUES (?,?,?,?,?,?)",
+                        (uname, generate_password_hash(pw), role,
+                         (row.get("full_name") or "").strip(),
+                         (row.get("email") or "").strip() or None,
+                         board_id)
+                    )
+                    created += 1
+                except Exception as e:
+                    errors.append(f"Row {i} ({uname}): {e}")
+            conn.commit()
+        except Exception as e:
+            errors.append(f"File error: {e}")
+        conn.close()
+        if created:
+            flash(f"{created} user(s) imported successfully.", "success")
+        for err in errors[:10]:
+            flash(err, "error")
+        return redirect(url_for("bulk_users"))
+
+    # Build CSV template download
+    template_csv = "username,full_name,email,role,board_name,password\njohn_doe,John Doe,john@org.com,program_officer,NABH,changeme123\n"
+    content = f"""
+<div class="row g-4">
+  <div class="col-lg-7">
+    <div class="card">
+      <div class="card-header"><i class="bi bi-upload" style="color:var(--accent)"></i> Bulk User Import</div>
+      <div class="card-body p-4">
+        <p style="font-size:13px;color:#64748b">Upload a <strong>CSV or Excel (.xlsx)</strong> with columns: <code>username</code>, <code>full_name</code>, <code>email</code>, <code>role</code>, <code>board_name</code>, <code>password</code>.</p>
+        <form method="post" enctype="multipart/form-data">
+          <div class="upload-zone mb-3" onclick="document.getElementById('userCsvFile').click()">
+            <i class="bi bi-file-earmark-person" style="font-size:32px;color:#94a3b8"></i>
+            <div style="font-size:13px;color:#64748b;margin-top:8px">Click to select CSV or Excel file</div>
+            <div id="csvFileName" style="font-size:12px;color:var(--accent);margin-top:4px"></div>
+          </div>
+          <input type="file" id="userCsvFile" name="csv_file" accept=".csv,.xlsx,.xls" style="display:none"
+                 onchange="document.getElementById('csvFileName').textContent=this.files[0].name">
+          <button type="submit" class="btn btn-primary w-100">
+            <i class="bi bi-upload"></i> Import Users
+          </button>
+        </form>
+      </div>
+    </div>
+  </div>
+  <div class="col-lg-5">
+    <div class="card">
+      <div class="card-header">Valid Roles &amp; Boards</div>
+      <div class="card-body p-4" style="font-size:13px">
+        <strong>Roles:</strong> <code>super_admin</code>, <code>board_admin</code>, <code>board_ceo</code>, <code>program_head</code>, <code>program_officer</code><br><br>
+        <strong>Boards:</strong> NABH, NABL, NABCB, NABET (or any board you have added)<br><br>
+        <strong>Notes:</strong>
+        <ul style="font-size:12px;color:#64748b">
+          <li>If password is blank, a random password is set. Ask users to reset on first login.</li>
+          <li>Duplicate usernames will be skipped with an error.</li>
+          <li>Programme mappings for programme_head must be done separately via Remap.</li>
+        </ul>
+        <a href="data:text/csv;charset=utf-8,{template_csv}" download="user_import_template.csv"
+           class="btn btn-sm btn-outline-secondary w-100 mt-2">
+          <i class="bi bi-download"></i> Download Template CSV
+        </a>
+      </div>
+    </div>
+  </div>
+</div>"""
+    return render_page(content, active_page="users", page_title="Bulk User Import",
+                       page_crumb='<a href="/users">Manage Users</a> / Bulk Import')
+
+
+@app.route("/ceo-dashboard")
+@login_required
+def ceo_dashboard():
+    """Board CEO / super_admin high-level KPI dashboard."""
+    if session.get("role") not in ("board_ceo", "super_admin", "board_admin"):
+        return redirect(url_for("dashboard"))
+    conn = get_db()
+    bid = user_board_id()
+    today = date.today()
+
+    if bid is not None:
+        cases = [dict(r) for r in conn.execute(
+            "SELECT * FROM case_tracking WHERE board_id=? AND (status='Active' OR status IS NULL)", (bid,)
+        ).fetchall()]
+        programmes = [dict(r) for r in conn.execute(
+            "SELECT * FROM programmes WHERE board_id=? ORDER BY programme_name", (bid,)
+        ).fetchall()]
+    else:
+        cases = [dict(r) for r in conn.execute(
+            "SELECT * FROM case_tracking WHERE (status='Active' OR status IS NULL)"
+        ).fetchall()]
+        programmes = [dict(r) for r in conn.execute(
+            "SELECT p.*, b.board_name FROM programmes p JOIN boards b ON b.id=p.board_id ORDER BY b.board_name, p.programme_name"
+        ).fetchall()]
+    conn.close()
+
+    for c in cases:
+        c["days_elapsed"] = working_days_elapsed(c["stage_start_date"], today)
+
+    total_cases = len(cases)
+    overdue = [c for c in cases if not c["is_milestone"] and c["tat_days"] > 0 and c["days_elapsed"] >= c["tat_days"]]
+    at_risk  = [c for c in cases if not c["is_milestone"] and c["tat_days"] > 0
+                and c["days_elapsed"] >= c["reminder2_day"] and c["days_elapsed"] < c["tat_days"]]
+    sla_eligible = [c for c in cases if not c["is_milestone"] and c["tat_days"] > 0]
+    sla_within = len([c for c in sla_eligible if c["days_elapsed"] < c["tat_days"]])
+    sla_pct = int(sla_within / len(sla_eligible) * 100) if sla_eligible else 100
+    sla_color = "#00984C" if sla_pct >= 80 else ("#d97706" if sla_pct >= 60 else "#dc2626")
+    avg_elapsed = int(sum(c["days_elapsed"] for c in sla_eligible) / len(sla_eligible)) if sla_eligible else 0
+
+    # Per-programme SLA scorecard
+    prog_sla = {}
+    for c in cases:
+        pn = c["programme_name"]
+        if pn not in prog_sla:
+            prog_sla[pn] = {"total": 0, "overdue": 0, "at_risk": 0, "on_track": 0, "eligible": 0, "within": 0}
+        prog_sla[pn]["total"] += 1
+        if c["is_milestone"] or c["tat_days"] == 0:
+            continue
+        prog_sla[pn]["eligible"] += 1
+        if c["days_elapsed"] >= c["tat_days"]:
+            prog_sla[pn]["overdue"] += 1
+        elif c["days_elapsed"] >= c["reminder2_day"]:
+            prog_sla[pn]["at_risk"] += 1
+        else:
+            prog_sla[pn]["on_track"] += 1
+            prog_sla[pn]["within"] += 1
+        if c["days_elapsed"] < c["tat_days"]:
+            prog_sla[pn]["within"] += 0  # already counted above via on_track
+
+    # Fix within count (should be on_track)
+    for pn in prog_sla:
+        prog_sla[pn]["within"] = prog_sla[pn]["on_track"]
+
+    scorecard_rows = ""
+    chart_labels = []
+    chart_sla = []
+    chart_overdue = []
+    for pn, ps in sorted(prog_sla.items()):
+        pct = int(ps["within"] / ps["eligible"] * 100) if ps["eligible"] else 100
+        pct_color = "#00984C" if pct >= 80 else ("#d97706" if pct >= 60 else "#dc2626")
+        chart_labels.append(pn[:30])
+        chart_sla.append(pct)
+        chart_overdue.append(ps["overdue"])
+        scorecard_rows += f"""<tr>
+  <td style="font-weight:600;font-size:12.5px">{pn}</td>
+  <td class="text-center">{ps['total']}</td>
+  <td class="text-center" style="color:#00984C;font-weight:600">{ps['on_track']}</td>
+  <td class="text-center" style="color:#d97706;font-weight:600">{ps['at_risk']}</td>
+  <td class="text-center" style="color:#dc2626;font-weight:600">{ps['overdue']}</td>
+  <td>
+    <div class="d-flex align-items-center gap-2">
+      <div style="flex:1;height:8px;background:#f1f5f9;border-radius:4px;overflow:hidden">
+        <div style="width:{pct}%;height:100%;background:{pct_color};border-radius:4px"></div>
+      </div>
+      <span style="font-size:12px;font-weight:700;color:{pct_color};width:36px">{pct}%</span>
+    </div>
+  </td>
+</tr>"""
+
+    # Monthly trend (last 6 months cases created)
+    # Use stage_history first_entry as proxy for case creation
+    monthly_labels = []
+    monthly_new = []
+    for i in range(5, -1, -1):
+        d = today.replace(day=1) - timedelta(days=i * 28)
+        monthly_labels.append(d.strftime("%b %Y"))
+        ym = d.strftime("%Y-%m")
+        cnt = sum(1 for c in cases if c["stage_start_date"] and c["stage_start_date"][:7] == ym)
+        monthly_new.append(cnt)
+
+    # Assessor delay analysis
+    owner_delay = {}
+    for c in cases:
+        if not c["is_milestone"] and c["tat_days"] > 0 and c["days_elapsed"] >= c["tat_days"]:
+            ot = c.get("owner_type") or "Unassigned"
+            owner_delay[ot] = owner_delay.get(ot, 0) + 1
+
+    delay_rows = "".join(
+        f'<tr><td style="font-weight:500">{ot}</td>'
+        f'<td class="text-center"><span class="pill pill-danger">{cnt}</span></td></tr>'
+        for ot, cnt in sorted(owner_delay.items(), key=lambda x: -x[1])
+    ) or '<tr><td colspan="2" style="text-align:center;color:#94a3b8;padding:20px">No overdue cases</td></tr>'
+
+    chart_labels_json = json.dumps(chart_labels)
+    chart_sla_json = json.dumps(chart_sla)
+    chart_overdue_json = json.dumps(chart_overdue)
+    monthly_labels_json = json.dumps(monthly_labels)
+    monthly_new_json = json.dumps(monthly_new)
+
+    content = f"""
+<div class="row g-3 mb-4">
+  <div class="col-6 col-md-3">
+    <div class="stat-card">
+      <div class="d-flex justify-content-between">
+        <div><div class="stat-val">{total_cases}</div><div class="stat-label">Total Active Cases</div></div>
+        <div class="stat-icon" style="background:#e1eef8;color:#003356"><i class="bi bi-folder2-open"></i></div>
+      </div>
+    </div>
+  </div>
+  <div class="col-6 col-md-3">
+    <div class="stat-card">
+      <div class="d-flex justify-content-between">
+        <div><div class="stat-val" style="color:{sla_color}">{sla_pct}%</div><div class="stat-label">Overall SLA Compliance</div></div>
+        <div class="stat-icon" style="background:{sla_color}15;color:{sla_color}"><i class="bi bi-shield-check"></i></div>
+      </div>
+    </div>
+  </div>
+  <div class="col-6 col-md-3">
+    <div class="stat-card">
+      <div class="d-flex justify-content-between">
+        <div><div class="stat-val" style="color:#dc2626">{len(overdue)}</div><div class="stat-label">Overdue Cases</div></div>
+        <div class="stat-icon" style="background:#fee2e2;color:#dc2626"><i class="bi bi-exclamation-triangle-fill"></i></div>
+      </div>
+    </div>
+  </div>
+  <div class="col-6 col-md-3">
+    <div class="stat-card">
+      <div class="d-flex justify-content-between">
+        <div><div class="stat-val" style="color:var(--accent)">{avg_elapsed}d</div><div class="stat-label">Avg Days in Stage</div></div>
+        <div class="stat-icon" style="background:#d0f0ff;color:var(--accent)"><i class="bi bi-clock-history"></i></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="row g-3 mb-4">
+  <div class="col-lg-7">
+    <div class="card">
+      <div class="card-header"><i class="bi bi-shield-fill-check" style="color:var(--accent)"></i> Per-Programme SLA Scorecard</div>
+      <div style="overflow-x:auto">
+        <table class="data-table">
+          <thead><tr><th>Programme</th><th style="text-align:center">Cases</th>
+            <th style="text-align:center">On Track</th><th style="text-align:center">At Risk</th>
+            <th style="text-align:center">Overdue</th><th>SLA %</th></tr></thead>
+          <tbody>{scorecard_rows if scorecard_rows else '<tr><td colspan="6" style="text-align:center;color:#94a3b8;padding:20px">No data</td></tr>'}</tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+  <div class="col-lg-5">
+    <div class="card h-100">
+      <div class="card-header"><i class="bi bi-bar-chart-fill" style="color:#7c3aed"></i> Overdue by Owner Type</div>
+      <div class="card-body">
+        <table class="data-table">
+          <thead><tr><th>Owner Type</th><th style="text-align:center">Overdue Cases</th></tr></thead>
+          <tbody>{delay_rows}</tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="row g-3">
+  <div class="col-lg-8">
+    <div class="card">
+      <div class="card-header"><i class="bi bi-bar-chart-line" style="color:var(--accent)"></i> Programme SLA Compliance (%)</div>
+      <div class="card-body"><canvas id="slaChart" height="180"></canvas></div>
+    </div>
+  </div>
+  <div class="col-lg-4">
+    <div class="card">
+      <div class="card-header"><i class="bi bi-graph-up" style="color:#00984C"></i> Monthly New Cases (6 mo)</div>
+      <div class="card-body"><canvas id="trendChart" height="180"></canvas></div>
+    </div>
+  </div>
+</div>
+"""
+    scripts = f"""
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+<script>
+(function(){{
+  var labels = {chart_labels_json};
+  var slaData = {chart_sla_json};
+  var colors = slaData.map(v => v>=80?'#00984C':v>=60?'#d97706':'#dc2626');
+  new Chart(document.getElementById('slaChart'), {{
+    type: 'bar',
+    data: {{ labels: labels, datasets: [{{
+      label: 'SLA %', data: slaData, backgroundColor: colors, borderRadius: 5
+    }}]}},
+    options: {{ plugins: {{ legend: {{ display: false }} }}, scales: {{ y: {{ min:0, max:100 }} }},
+      responsive: true }}
+  }});
+  var mLabels = {monthly_labels_json};
+  var mData = {monthly_new_json};
+  new Chart(document.getElementById('trendChart'), {{
+    type: 'line',
+    data: {{ labels: mLabels, datasets: [{{
+      label: 'New Cases', data: mData, borderColor:'#0094ca', backgroundColor:'rgba(0,148,202,.1)',
+      fill:true, tension:0.3, pointRadius:4
+    }}]}},
+    options: {{ plugins: {{ legend: {{ display: false }} }}, responsive: true }}
+  }});
+}})();
+</script>"""
+    return render_page(content, scripts, active_page="ceo_dashboard", page_title="CEO Dashboard")
 
 
 @app.route("/")
 @login_required
 def dashboard():
     conn = get_db()
-    prog_filter  = request.args.get("programme", "")
-    owner_filter = request.args.get("owner_type", "")
-    my_cases     = request.args.get("my_cases", "")
-    sort         = request.args.get("sort", "elapsed_desc")
+    prog_filter   = request.args.get("programme", "")
+    owner_filter  = request.args.get("owner_type", "")
+    my_cases      = request.args.get("my_cases", "")
+    sort          = request.args.get("sort", "elapsed_desc")
+    status_filter = request.args.get("status", "Active")  # default: only Active
 
     bid = user_board_id()
+    ph_progs = user_programme_names()  # None unless program_head
     if bid is not None:
         programmes = [r[0] for r in conn.execute(
             "SELECT programme_name FROM programmes WHERE board_id=? ORDER BY programme_name", (bid,)
@@ -1796,6 +2751,19 @@ def dashboard():
         base_q = "SELECT * FROM case_tracking WHERE 1=1"
         base_params = []
 
+    # Restrict program_head to their mapped programmes
+    if ph_progs is not None:
+        programmes = [p for p in programmes if p in ph_progs]
+        if ph_progs:
+            placeholders = ",".join("?" * len(ph_progs))
+            base_q += f" AND programme_name IN ({placeholders})"
+            base_params.extend(ph_progs)
+        else:
+            base_q += " AND 1=0"  # no programmes mapped → no cases
+
+    if status_filter and status_filter != "All":
+        base_q += " AND (status=? OR (status IS NULL AND ?='Active'))"
+        base_params.extend([status_filter, status_filter])
     if prog_filter:
         base_q += " AND programme_name=?"
         base_params.append(prog_filter)
@@ -1809,13 +2777,17 @@ def dashboard():
         if po_email and po_email["email"]:
             base_q += " AND program_officer_email=?"
             base_params.append(po_email["email"])
+        else:
+            # No email on this account — return zero results with a flash hint
+            base_q += " AND 1=0"
+            flash("Your account has no email address set. Add one in your profile so 'My Cases' can filter correctly.", "info")
 
     cases = [dict(r) for r in conn.execute(base_q, base_params).fetchall()]
     conn.close()
 
     today = date.today()
     for c in cases:
-        c["days_elapsed"] = working_days_elapsed(c["stage_start_date"], today)
+        c["days_elapsed"] = working_days_elapsed(c["stage_start_date"], today, hold_days=c.get("hold_days", 0))
 
     reverse = sort.endswith("_desc")
     key = sort.replace("_desc", "").replace("_asc", "")
@@ -1823,7 +2795,7 @@ def dashboard():
     sort_key = key_map.get(key, "days_elapsed")
     cases.sort(key=lambda x: (x.get(sort_key) or 0), reverse=reverse)
 
-    # Compute stat card counts
+    # Compute stat card counts (on full set)
     n_total    = len(cases)
     n_overdue  = sum(1 for c in cases if not c["is_milestone"] and c["tat_days"] > 0 and c["days_elapsed"] >= c["tat_days"])
     n_at_risk  = sum(1 for c in cases if not c["is_milestone"] and c["tat_days"] > 0
@@ -1831,8 +2803,19 @@ def dashboard():
     n_ok       = n_total - n_overdue - n_at_risk - sum(1 for c in cases if c["is_milestone"])
     n_milestone= sum(1 for c in cases if c["is_milestone"])
 
+    # Paginate
+    PAGE_SIZE = 50
+    page = max(1, int(request.args.get("page", 1)))
+    total_count = n_total
+    start_idx = (page - 1) * PAGE_SIZE
+    page_cases = cases[start_idx : start_idx + PAGE_SIZE]
+    total_pages = max(1, (total_count + PAGE_SIZE - 1) // PAGE_SIZE)
+    page = min(page, total_pages)
+    start_idx = (page - 1) * PAGE_SIZE
+    page_cases = cases[start_idx : start_idx + PAGE_SIZE]
+
     rows_html = ""
-    for c in cases:
+    for c in page_cases:
         elapsed = c["days_elapsed"]
         tat     = c["tat_days"]
 
@@ -1865,28 +2848,45 @@ def dashboard():
             bg = colors.get(c["owner_type"], "#64748b")
             owner_type_badge = f'<span style="font-size:10px;padding:1px 7px;border-radius:4px;background:{bg}22;color:{bg};font-weight:600">{c["owner_type"]}</span> '
 
+        case_st = c.get("status") or "Active"
+        st_colors = {"Active": ("#00984C", "#d8f5e7"), "On Hold": ("#7c3aed", "#ede9fe"),
+                     "Closed": ("#64748b", "#f1f5f9"),
+                     "Withdrawn": ("#d97706", "#fef3c7"), "Suspended": ("#dc2626", "#fee2e2")}
+        st_fg, st_bg = st_colors.get(case_st, ("#64748b", "#f1f5f9"))
+        case_status_badge = f'<span style="font-size:10px;padding:1px 7px;border-radius:4px;background:{st_bg};color:{st_fg};font-weight:600">{case_st}</span>'
+        _app_id_h  = h(c['application_id'])
+        _org_h     = h(c['organisation_name'])
+        _prog_h    = h(c['programme_name'])
+        _stage_h   = h(c['current_stage'])
+        _owner_h   = h(c['action_owner_name']) if c['action_owner_name'] else '—'
+        _email_h   = h(c['action_owner_email']) if c['action_owner_email'] else ''
+        _sdate_h   = h(c['stage_start_date'])
+        _case_st_h = h(case_st)
         rows_html += f"""<tr class="{tr_cls}">
-          <td class="id-cell">{c['application_id']}</td>
-          <td><div style="font-weight:500;color:#1e293b">{c['organisation_name']}</div>
-              <div style="font-size:11px;color:#94a3b8">{c['programme_name']}</div></td>
-          <td><div style="font-size:13px">{c['current_stage']}</div>
-              <div style="font-size:11px;color:#94a3b8">{owner_type_badge}Start: {c['stage_start_date']}</div></td>
+          <td class="id-cell">{_app_id_h}<br>{case_status_badge}</td>
+          <td><div style="font-weight:500;color:#1e293b">{_org_h}</div>
+              <div style="font-size:11px;color:#94a3b8">{_prog_h}</div></td>
+          <td><div style="font-size:13px">{_stage_h}</div>
+              <div style="font-size:11px;color:#94a3b8">{owner_type_badge}Start: {_sdate_h}</div></td>
           <td><div>{status_pill}</div>{bar_html}</td>
           <td class="text-center">{yn(c['r1_sent'])}</td>
           <td class="text-center">{yn(c['r2_sent'])}</td>
           <td class="text-center">{yn(c['overdue_sent'])}</td>
           <td class="text-center" style="font-weight:600;color:{'#dc2626' if c['overdue_count'] else '#94a3b8'}">{c['overdue_count'] or '—'}</td>
-          <td><div style="font-size:12.5px">{c['action_owner_name'] or '—'}</div>
-              <div style="font-size:11px;color:#94a3b8">{c['action_owner_email'] or ''}</div></td>
+          <td><div style="font-size:12.5px">{_owner_h}</div>
+              <div style="font-size:11px;color:#94a3b8">{_email_h}</div></td>
           <td style="white-space:nowrap">
-            <a href="/case-history/{c['application_id']}" class="btn btn-sm btn-action btn-outline-secondary me-1"
+            <a href="/case-history/{_app_id_h}" class="btn btn-sm btn-action btn-outline-secondary me-1"
                title="History"><i class="bi bi-clock-history"></i></a>
             <button class="btn btn-sm btn-action btn-outline-success me-1" title="Quick Advance"
-               onclick="openQuickAdvance({c['id']}, '{c['application_id']}', '{c['programme_name']}')">
+               onclick="openQuickAdvance({c['id']}, {json.dumps(c['application_id'])}, {json.dumps(c['programme_name'])})">
                <i class="bi bi-arrow-right-circle"></i></button>
             <a href="/edit-case/{c['id']}" class="btn btn-sm btn-action btn-outline-primary me-1">Edit</a>
+            <button class="btn btn-sm btn-action btn-outline-warning me-1" title="Change Status"
+               onclick="openStatusModal({c['id']}, {json.dumps(c['application_id'])}, {json.dumps(case_st)})">
+               <i class="bi bi-toggles"></i></button>
             <button class="btn btn-sm btn-action btn-outline-danger"
-              onclick="confirmDelete('/delete-case/{c['id']}', '{c['application_id']}')">Close</button>
+              onclick="confirmDelete('/delete-case/{c['id']}', {json.dumps(c['application_id'])})">Delete</button>
           </td>
         </tr>"""
 
@@ -2140,15 +3140,59 @@ def dashboard():
   <a href="/?owner_type=Program+Officer">View PO</a>
 </div>"""
 
+    # Load saved filters for current user
+    conn2 = get_db()
+    saved_filters_list = [dict(r) for r in conn2.execute(
+        "SELECT id, filter_name, filter_json FROM saved_filters WHERE user_id=? ORDER BY filter_name",
+        (session["user_id"],)
+    ).fetchall()]
+    conn2.close()
+    saved_filter_opts = "".join(
+        f'<option value="{h(f["filter_json"])}">{h(f["filter_name"])} '
+        f'<a data-id="{f["id"]}" onclick="deleteFilter({f["id"]})">×</a></option>'
+        for f in saved_filters_list
+    )
+    saved_filter_btns = "".join(
+        f'<a href="/?{json.loads(f["filter_json"]).get("qs","")}" '
+        f'class="btn btn-sm btn-outline-secondary" style="font-size:12px">'
+        f'<i class="bi bi-bookmark-fill" style="color:#7c3aed"></i> {f["filter_name"]}</a>'
+        for f in saved_filters_list
+    )
+
+    # Build pagination HTML
+    if total_pages > 1:
+        prev_page = max(1, page - 1)
+        next_page = min(total_pages, page + 1)
+        def page_url(p):
+            args = request.args.to_dict()
+            args["page"] = p
+            return url_for("dashboard", **args)
+        _pagination_html = f'<div class="d-flex justify-content-between align-items-center mt-3 px-1"><div style="font-size:12px;color:#94a3b8">Showing {start_idx+1}–{min(start_idx+PAGE_SIZE, total_count)} of {total_count} cases</div><nav><ul class="pagination pagination-sm mb-0"><li class="page-item {"disabled" if page==1 else ""}"><a class="page-link" href="{page_url(prev_page)}">&#8249; Prev</a></li>'
+        for _p in range(max(1, page-2), min(total_pages+1, page+3)):
+            _pagination_html += f'<li class="page-item {"active" if _p==page else ""}"><a class="page-link" href="{page_url(_p)}">{_p}</a></li>'
+        _pagination_html += f'<li class="page-item {"disabled" if page==total_pages else ""}"><a class="page-link" href="{page_url(next_page)}">Next &#8250;</a></li></ul></nav></div>'
+    else:
+        _pagination_html = ""
+
     content = f"""
 {overdue_banner_html}
 {stat_cards}
 {analytics_section}
 
 <div class="card">
-  <div class="card-header d-flex justify-content-between align-items-center">
-    <span>Active Cases <span style="font-size:12px;font-weight:400;color:#94a3b8;margin-left:6px">{len(cases)} total</span></span>
-    <form method="get" class="d-flex gap-2 align-items-center flex-wrap">
+  <div class="card-header d-flex justify-content-between align-items-center flex-wrap gap-2">
+    <span>Cases <span style="font-size:12px;font-weight:400;color:#94a3b8;margin-left:6px">{total_count} total</span>
+    {"&nbsp;" + saved_filter_btns if saved_filter_btns else ""}
+    </span>
+    <form method="get" class="d-flex gap-2 align-items-center flex-wrap" id="filterForm">
+      <select name="status" class="form-select form-select-sm" style="width:auto">
+        <option value="Active" {"selected" if status_filter=="Active" else ""}>Active</option>
+        <option value="On Hold" {"selected" if status_filter=="On Hold" else ""}>On Hold</option>
+        <option value="Closed" {"selected" if status_filter=="Closed" else ""}>Closed</option>
+        <option value="Withdrawn" {"selected" if status_filter=="Withdrawn" else ""}>Withdrawn</option>
+        <option value="Suspended" {"selected" if status_filter=="Suspended" else ""}>Suspended</option>
+        <option value="All" {"selected" if status_filter=="All" else ""}>All Statuses</option>
+      </select>
       <select name="programme" class="form-select form-select-sm" style="width:auto">
         <option value="">All Programmes</option>
         {opt_programmes}
@@ -2166,7 +3210,10 @@ def dashboard():
         <option value="org_asc"      {"selected" if sort=="org_asc" else ""}>Organisation</option>
       </select>
       <button class="btn btn-sm btn-primary" type="submit">Filter</button>
-      {"" if not (prog_filter or owner_filter) else '<a class="btn btn-sm btn-outline-secondary" href="/">Clear</a>'}
+      <button type="button" class="btn btn-sm btn-outline-secondary" onclick="saveCurrentFilter()" title="Save this filter">
+        <i class="bi bi-bookmark-plus"></i>
+      </button>
+      {"" if not (prog_filter or owner_filter or status_filter not in ("Active","")) else '<a class="btn btn-sm btn-outline-secondary" href="/">Clear</a>'}
     </form>
   </div>
   <div style="overflow-x:auto">
@@ -2190,6 +3237,7 @@ def dashboard():
       </tbody>
     </table>
   </div>
+  {_pagination_html}
 </div>
 
 <!-- Delete confirmation modal -->
@@ -2202,7 +3250,7 @@ def dashboard():
         <div style="font-size:13px;color:#64748b;margin-top:4px" id="deleteModalMsg"></div>
       </div>
       <div class="modal-footer border-0 pt-0 justify-content-center gap-2">
-        <button class="btn btn-sm btn-outline-secondary" data-bs-dismiss="modal">Cancel</button>
+        <button type="button" class="btn btn-sm btn-outline-secondary" data-bs-dismiss="modal">Cancel</button>
         <a id="deleteConfirmBtn" href="#" class="btn btn-sm btn-danger">Close Case</a>
       </div>
     </div>
@@ -2238,12 +3286,61 @@ def dashboard():
           </div>
         </div>
         <div class="modal-footer border-0">
-          <button class="btn btn-sm btn-outline-secondary" data-bs-dismiss="modal">Cancel</button>
+          <button type="button" class="btn btn-sm btn-outline-secondary" data-bs-dismiss="modal">Cancel</button>
           <button class="btn btn-sm btn-success" type="submit">
             <i class="bi bi-arrow-right-circle"></i> Advance Stage
           </button>
         </div>
       </form>
+    </div>
+  </div>
+</div>
+
+<!-- Case Status Change Modal -->
+<div class="modal fade" id="statusModal" tabindex="-1">
+  <div class="modal-dialog modal-dialog-centered modal-sm">
+    <div class="modal-content">
+      <div class="modal-header border-0">
+        <h6 class="modal-title"><i class="bi bi-toggles" style="color:#7c3aed"></i> Change Case Status</h6>
+        <button class="btn-close" data-bs-dismiss="modal"></button>
+      </div>
+      <form method="post" action="/update-case-status">
+        <input type="hidden" name="application_id" id="sc_case_id">
+        <div class="modal-body pt-0">
+          <div style="font-size:13px;color:#64748b;margin-bottom:12px">Case: <strong id="sc_app_id"></strong></div>
+          <select class="form-select" name="status" id="sc_status_select">
+            <option value="Active">Active</option>
+            <option value="On Hold">&#9646;&#9646; On Hold (TAT paused)</option>
+            <option value="Closed">Closed</option>
+            <option value="Withdrawn">Withdrawn</option>
+            <option value="Suspended">Suspended</option>
+          </select>
+        </div>
+        <div class="modal-footer border-0">
+          <button type="button" class="btn btn-sm btn-outline-secondary" data-bs-dismiss="modal">Cancel</button>
+          <button class="btn btn-sm btn-primary" type="submit">Update Status</button>
+        </div>
+      </form>
+    </div>
+  </div>
+</div>
+
+<!-- Save Filter Modal -->
+<div class="modal fade" id="saveFilterModal" tabindex="-1">
+  <div class="modal-dialog modal-dialog-centered modal-sm">
+    <div class="modal-content">
+      <div class="modal-header border-0">
+        <h6 class="modal-title"><i class="bi bi-bookmark-plus" style="color:#7c3aed"></i> Save Filter</h6>
+        <button class="btn-close" data-bs-dismiss="modal"></button>
+      </div>
+      <div class="modal-body pt-0">
+        <label class="form-label">Filter name</label>
+        <input type="text" class="form-control" id="filterNameInput" placeholder="e.g. My NABH Overdue">
+      </div>
+      <div class="modal-footer border-0">
+        <button type="button" class="btn btn-sm btn-outline-secondary" data-bs-dismiss="modal">Cancel</button>
+        <button class="btn btn-sm btn-primary" onclick="confirmSaveFilter()">Save</button>
+      </div>
     </div>
   </div>
 </div>
@@ -2259,7 +3356,7 @@ def dashboard():
 </div>
 """
     topbar_actions = """
-<a href="/export-dashboard" class="btn btn-sm btn-outline-secondary">
+<a href="/export" class="btn btn-sm btn-outline-secondary">
   <i class="bi bi-download"></i> Export CSV
 </a>
 <a href="/log-stage" class="btn btn-sm btn-navy">
@@ -2271,9 +3368,35 @@ def dashboard():
 
     scripts = """<script>
 function confirmDelete(url, appId){
-  document.getElementById('deleteModalMsg').textContent = 'This will close case ' + appId + '.';
+  document.getElementById('deleteModalMsg').textContent = 'Delete case ' + appId + '? This cannot be undone.';
   document.getElementById('deleteConfirmBtn').href = url;
   new bootstrap.Modal(document.getElementById('deleteModal')).show();
+}
+function openStatusModal(caseId, appId, currentStatus){
+  document.getElementById('sc_case_id').value = appId;
+  document.getElementById('sc_app_id').textContent = appId;
+  document.getElementById('sc_status_select').value = currentStatus;
+  new bootstrap.Modal(document.getElementById('statusModal')).show();
+}
+function saveCurrentFilter(){
+  new bootstrap.Modal(document.getElementById('saveFilterModal')).show();
+}
+function confirmSaveFilter(){
+  var name = document.getElementById('filterNameInput').value.trim();
+  if(!name){ alert('Please enter a name.'); return; }
+  var form = document.getElementById('filterForm');
+  var data = new FormData(form);
+  var qs = new URLSearchParams(data).toString();
+  fetch('/save-filter', {method:'POST',headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({name: name, qs: qs})
+  }).then(r=>r.json()).then(d=>{
+    if(d.ok){ bootstrap.Modal.getInstance(document.getElementById('saveFilterModal')).hide(); location.reload(); }
+    else { alert(d.error || 'Error saving filter'); }
+  });
+}
+function deleteFilter(id){
+  if(!confirm('Delete this saved filter?')) return;
+  fetch('/delete-filter/'+id, {method:'POST'}).then(()=>location.reload());
 }
 document.getElementById('runBtn').addEventListener('click', function(){
   var btn = this;
@@ -2327,7 +3450,7 @@ def log_stage():
             data["_changed_by"] = session.get("full_name") or session.get("username", "")
             action = upsert_case(data)
             flash(f"Case {data['application_id']} {action} successfully.", "success")
-            return redirect(url_for("dashboard"))
+            return redirect(url_for("log_stage"))
         except ValueError as e:
             flash(str(e), "error")
 
@@ -2365,6 +3488,8 @@ def log_stage():
                 <div><span style="font-size:11px;color:#64748b">Owner</span><br><strong id="si_owner">—</strong></div>
                 <div id="si_ms_div" style="display:none"><span style="font-size:11px;color:#64748b">Type</span><br>
                   <span class="pill pill-milestone" style="font-size:11px"><i class="bi bi-flag-fill"></i> Milestone</span></div>
+                <div id="si_opt_div" style="display:none"><span style="font-size:11px;color:#64748b">Stage Type</span><br>
+                  <span style="background:#e0f2fe;color:#0369a1;font-size:11px;padding:2px 8px;border-radius:4px"><i class="bi bi-skip-forward-fill"></i> Optional — can be skipped</span></div>
               </div>
             </div>
           </div>
@@ -2427,6 +3552,7 @@ def log_stage():
           <li>If it's new, a <strong>new case</strong> is created.</li>
           <li>TAT, reminders, and owner type are pulled from the selected programme configuration.</li>
           <li>Milestone stages receive <strong>no emails</strong>.</li>
+          <li><i class="bi bi-skip-forward-fill" style="color:#0891b2"></i> <strong>Optional stages</strong> (marked ○) can be skipped — you may advance directly past them to the next required stage.</li>
           <li>The daily scheduler runs at the configured time (IST); change it in <strong>Settings → Scheduler Settings</strong>. Use Run Check on the dashboard to trigger immediately.</li>
         </ul>
         <div style="margin-top:16px;padding:12px 14px;background:#fff;border-radius:8px;border:1px solid #e2e8f0">
@@ -2457,7 +3583,7 @@ document.getElementById('progSelect').addEventListener('change', function(){
       _stageData = {};
       data.forEach(function(s){ _stageData[s.stage_name] = s; });
       sel.innerHTML = '<option value="">Select a stage…</option>' +
-        data.map(s=>'<option value="'+s.stage_name+'">'+(s.is_milestone ? '⬥ ' : '')+s.stage_name+'</option>').join('');
+        data.map(s=>'<option value="'+s.stage_name+'">'+(s.is_milestone ? '⬥ ' : '')+(s.is_optional ? '○ ' : '')+s.stage_name+(s.is_optional ? ' (optional)' : '')+'</option>').join('');
     });
 });
 document.getElementById('stageSelect').addEventListener('change', function(){
@@ -2468,7 +3594,8 @@ document.getElementById('stageSelect').addEventListener('change', function(){
   document.getElementById('si_r1').textContent    = s.reminder1_day || '—';
   document.getElementById('si_r2').textContent    = s.reminder2_day || '—';
   document.getElementById('si_owner').textContent = s.owner_type || '—';
-  document.getElementById('si_ms_div').style.display = s.is_milestone ? '' : 'none';
+  document.getElementById('si_ms_div').style.display  = s.is_milestone ? '' : 'none';
+  document.getElementById('si_opt_div').style.display = s.is_optional  ? '' : 'none';
   box.classList.add('show');
 });
 </script>"""
@@ -2492,7 +3619,7 @@ def api_stages():
             conn.close()
             return jsonify([])
     rows = conn.execute(
-        "SELECT stage_name, stage_order, is_milestone, tat_days, reminder1_day, reminder2_day, owner_type "
+        "SELECT stage_name, stage_order, is_milestone, is_optional, tat_days, reminder1_day, reminder2_day, owner_type "
         "FROM programme_config WHERE programme_name=? ORDER BY stage_order",
         (programme,),
     ).fetchall()
@@ -2567,6 +3694,26 @@ def bulk_upload():
                 }
                 if not data["application_id"]:
                     raise ValueError("Application_ID is empty")
+                # Validate date format (YYYY-MM-DD required)
+                _raw_date = data["stage_start_date"]
+                if not _raw_date:
+                    data["stage_start_date"] = date.today().isoformat()
+                else:
+                    try:
+                        datetime.strptime(_raw_date, "%Y-%m-%d")
+                    except ValueError:
+                        # Try common alternate formats: DD/MM/YYYY, MM/DD/YYYY
+                        _parsed = None
+                        for _fmt in ("%d/%m/%Y", "%m/%d/%Y", "%d-%m-%Y"):
+                            try:
+                                _parsed = datetime.strptime(_raw_date, _fmt).date().isoformat()
+                                break
+                            except ValueError:
+                                pass
+                        if _parsed:
+                            data["stage_start_date"] = _parsed
+                        else:
+                            raise ValueError(f"Date_of_Stage_Change '{_raw_date}' must be YYYY-MM-DD")
                 action = upsert_case(data)
                 if action == "created":
                     created += 1
@@ -2773,6 +3920,10 @@ def edit_case(case_id):
     case = dict(case)
 
     bid = user_board_id()
+    if bid is not None and case.get("board_id") != bid:
+        conn.close()
+        flash("Access denied.", "error")
+        return redirect(url_for("dashboard"))
     if bid is not None:
         programmes = [r[0] for r in conn.execute(
             "SELECT programme_name FROM programmes WHERE board_id=? ORDER BY programme_name", (bid,)
@@ -2924,18 +4075,113 @@ loadStages("{case['programme_name']}", _currentStage);
 @login_required
 def delete_case(case_id):
     conn = get_db()
-    row = conn.execute("SELECT application_id FROM case_tracking WHERE id=?", (case_id,)).fetchone()
-    if row:
-        conn.execute("DELETE FROM case_tracking WHERE id=?", (case_id,))
-        conn.commit()
-        flash(f"Case {row['application_id']} closed.", "success")
+    row = conn.execute("SELECT application_id, board_id FROM case_tracking WHERE id=?", (case_id,)).fetchone()
+    if not row:
         conn.close()
-        log_audit("case_closed", row["application_id"], "Case closed/removed",
-                  session.get("full_name") or session.get("username", ""),
-                  user_board_id())
-    else:
+        flash("Case not found.", "error")
+        return redirect(url_for("dashboard"))
+    bid = user_board_id()
+    if bid is not None and row["board_id"] != bid:
         conn.close()
+        flash("Access denied.", "error")
+        return redirect(url_for("dashboard"))
+    conn.execute("DELETE FROM case_tracking WHERE id=?", (case_id,))
+    conn.commit()
+    flash(f"Case {row['application_id']} closed.", "success")
+    conn.close()
+    log_audit("case_closed", row["application_id"], "Case closed/removed",
+              session.get("full_name") or session.get("username", ""),
+              bid)
     return redirect(url_for("dashboard"))
+
+
+@app.route("/update-case-status", methods=["POST"])
+@login_required
+def update_case_status():
+    conn = get_db()
+    app_id = request.form.get("application_id")
+    new_status = request.form.get("status")
+    valid = {"Active", "On Hold", "Closed", "Withdrawn", "Suspended"}
+    if new_status not in valid:
+        conn.close()
+        flash("Invalid status.", "error")
+        return redirect(url_for("dashboard"))
+
+    case = conn.execute("SELECT * FROM case_tracking WHERE application_id=?", (app_id,)).fetchone()
+    if not case:
+        conn.close()
+        flash("Case not found.", "error")
+        return redirect(url_for("dashboard"))
+    case = dict(case)
+
+    bid = user_board_id()
+    if bid is not None and case.get("board_id") != bid:
+        conn.close()
+        flash("Access denied.", "error")
+        return redirect(url_for("dashboard"))
+
+    if new_status == "On Hold":
+        # Start hold — record hold_start_date
+        conn.execute(
+            "UPDATE case_tracking SET status=?, hold_start_date=? WHERE application_id=?",
+            ("On Hold", date.today().isoformat(), app_id)
+        )
+    elif case.get("status") == "On Hold" and new_status != "On Hold":
+        # Ending hold — calculate working days held and accumulate
+        hold_start = case.get("hold_start_date")
+        extra_hold = 0
+        if hold_start:
+            extra_hold = working_days_elapsed(hold_start, date.today())
+        new_hold_days = (case.get("hold_days") or 0) + extra_hold
+        conn.execute(
+            "UPDATE case_tracking SET status=?, hold_start_date=NULL, hold_days=? WHERE application_id=?",
+            (new_status, new_hold_days, app_id)
+        )
+    else:
+        conn.execute(
+            "UPDATE case_tracking SET status=? WHERE application_id=?",
+            (new_status, app_id)
+        )
+
+    conn.commit()
+    log_audit("status_change", app_id,
+              f"Status → {new_status}", session.get("full_name") or session.get("username", ""),
+              case.get("board_id"))
+    conn.close()
+    flash(f"Case {app_id} status updated to {new_status}.", "success")
+    return redirect(url_for("dashboard"))
+
+
+@app.route("/save-filter", methods=["POST"])
+@login_required
+def save_filter():
+    data = request.get_json()
+    if not data or not data.get("name"):
+        return jsonify({"ok": False, "error": "Name required"})
+    conn = get_db()
+    try:
+        conn.execute(
+            "INSERT INTO saved_filters (user_id, filter_name, filter_json, created_at) VALUES (?,?,?,?) ON CONFLICT (user_id, filter_name) DO UPDATE SET filter_json=EXCLUDED.filter_json, created_at=EXCLUDED.created_at",
+            (session["user_id"], data["name"][:60],
+             json.dumps({"qs": data.get("qs", "")}),
+             datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+        )
+        conn.commit()
+        conn.close()
+        return jsonify({"ok": True})
+    except Exception as e:
+        conn.close()
+        return jsonify({"ok": False, "error": str(e)})
+
+
+@app.route("/delete-filter/<int:filter_id>", methods=["POST"])
+@login_required
+def delete_filter(filter_id):
+    conn = get_db()
+    conn.execute("DELETE FROM saved_filters WHERE id=? AND user_id=?", (filter_id, session["user_id"]))
+    conn.commit()
+    conn.close()
+    return jsonify({"ok": True})
 
 
 @app.route("/settings", methods=["GET", "POST"])
@@ -2980,6 +4226,39 @@ def settings():
                     except Exception as e:
                         flash(f"Error: {e}", "error")
 
+        elif action == "edit_programme":
+            ep_name = request.form.get("programme_name", "").strip()
+            if not ep_name:
+                flash("Programme name missing.", "error")
+            else:
+                ep_row = conn.execute(
+                    "SELECT board_id FROM programmes WHERE programme_name=?", (ep_name,)
+                ).fetchone()
+                if not ep_row:
+                    flash("Programme not found.", "error")
+                elif session.get("role") == "board_admin" and ep_row["board_id"] != session.get("board_id"):
+                    flash("Cannot edit a programme from another board.", "error")
+                else:
+                    try:
+                        conn.execute(
+                            """UPDATE programmes SET
+                               tat_days=?, reminder1_days=?, reminder2_days=?,
+                               overdue_days=?, notification_emails=?
+                               WHERE programme_name=?""",
+                            (
+                                int(request.form.get("tat_days", 0) or 0),
+                                int(request.form.get("reminder1_days", 0) or 0),
+                                int(request.form.get("reminder2_days", 0) or 0),
+                                int(request.form.get("overdue_days", 0) or 0),
+                                request.form.get("notification_emails", "").strip() or None,
+                                ep_name,
+                            )
+                        )
+                        conn.commit()
+                        flash(f"Programme '{ep_name}' updated.", "success")
+                    except Exception as e:
+                        flash(f"Error updating programme: {e}", "error")
+
         elif action == "add_stage":
             pname = request.form.get("programme_name", "").strip()
             sname = request.form.get("stage_name", "").strip()
@@ -2994,26 +4273,287 @@ def settings():
                 if session.get("role") == "board_admin" and prog_board_id != session.get("board_id"):
                     flash("Cannot add stages to a programme in another board.", "error")
                 else:
-                    try:
+                    _new_order = int(request.form.get("stage_order", 1))
+                    _dup = conn.execute(
+                        "SELECT id FROM programme_config WHERE programme_name=? AND stage_order=?",
+                        (pname, _new_order)
+                    ).fetchone()
+                    if _dup:
+                        flash(f"Stage order #{_new_order} already exists in '{pname}'. Choose a different order number.", "error")
+                    else:
+                        try:
+                            conn.execute(
+                                """INSERT INTO programme_config
+                                   (programme_name,stage_name,stage_order,tat_days,reminder1_day,
+                                    reminder2_day,owner_type,overdue_interval_days,is_milestone,is_optional,board_id)
+                                   VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+                                (pname, sname,
+                                 _new_order,
+                                 int(request.form.get("tat_days", 0)),
+                                 int(request.form.get("reminder1_day", 0)),
+                                 int(request.form.get("reminder2_day", 0)),
+                                 request.form.get("owner_type") or None,
+                                 int(request.form.get("overdue_interval_days", 3)),
+                                 1 if request.form.get("is_milestone") else 0,
+                                 1 if request.form.get("is_optional") else 0,
+                                 prog_board_id),
+                            )
+                            conn.commit()
+                            flash(f"Stage '{sname}' added to {pname}.", "success")
+                        except Exception as e:
+                            flash(f"Error: {e}", "error")
+
+        elif action == "delete_board":
+            if session.get("role") != "super_admin":
+                flash("Only Super Admin can delete boards.", "error")
+            else:
+                bid_del = request.form.get("board_id")
+                if bid_del:
+                    prog_count = conn.execute(
+                        "SELECT COUNT(*) FROM programmes WHERE board_id=?", (bid_del,)
+                    ).fetchone()[0]
+                    if prog_count > 0:
+                        flash(f"Cannot delete board — {prog_count} programme(s) still exist. Delete them first.", "error")
+                    else:
+                        user_count = conn.execute(
+                            "SELECT COUNT(*) FROM users WHERE board_id=?", (bid_del,)
+                        ).fetchone()[0]
+                        if user_count > 0:
+                            flash(f"Cannot delete board — {user_count} user(s) are assigned to it. Reassign them first.", "error")
+                        else:
+                            conn.execute("DELETE FROM boards WHERE id=?", (bid_del,))
+                            conn.commit()
+                            flash("Board deleted.", "success")
+
+        elif action == "delete_programme":
+            pname_del = request.form.get("programme_name", "").strip()
+            if not pname_del:
+                flash("Programme name missing.", "error")
+            else:
+                prog_row = conn.execute(
+                    "SELECT board_id FROM programmes WHERE programme_name=?", (pname_del,)
+                ).fetchone()
+                if not prog_row:
+                    flash("Programme not found.", "error")
+                elif session.get("role") == "board_admin" and prog_row["board_id"] != session.get("board_id"):
+                    flash("Cannot delete a programme from another board.", "error")
+                else:
+                    case_count = conn.execute(
+                        "SELECT COUNT(*) FROM case_tracking WHERE programme_name=?", (pname_del,)
+                    ).fetchone()[0]
+                    if case_count > 0:
+                        flash(f"Cannot delete '{pname_del}' — {case_count} active case(s) exist. Close them first.", "error")
+                    else:
+                        conn.execute("DELETE FROM programme_config WHERE programme_name=?", (pname_del,))
+                        conn.execute("DELETE FROM email_templates WHERE programme_name=?", (pname_del,))
                         conn.execute(
-                            """INSERT INTO programme_config
-                               (programme_name,stage_name,stage_order,tat_days,reminder1_day,
-                                reminder2_day,owner_type,overdue_interval_days,is_milestone,board_id)
-                               VALUES (?,?,?,?,?,?,?,?,?,?)""",
-                            (pname, sname,
-                             int(request.form.get("stage_order", 1)),
-                             int(request.form.get("tat_days", 0)),
-                             int(request.form.get("reminder1_day", 0)),
-                             int(request.form.get("reminder2_day", 0)),
-                             request.form.get("owner_type") or None,
-                             int(request.form.get("overdue_interval_days", 3)),
-                             1 if request.form.get("is_milestone") else 0,
-                             prog_board_id),
+                            "DELETE FROM user_programme_map WHERE programme_id IN "
+                            "(SELECT id FROM programmes WHERE programme_name=?)", (pname_del,)
+                        )
+                        conn.execute("DELETE FROM programmes WHERE programme_name=?", (pname_del,))
+                        conn.commit()
+                        flash(f"Programme '{pname_del}' and all its stages deleted.", "success")
+
+        elif action == "delete_stage":
+            pname_del = request.form.get("programme_name", "").strip()
+            sname_del = request.form.get("stage_name", "").strip()
+            if not pname_del or not sname_del:
+                flash("Programme or stage name missing.", "error")
+            else:
+                prog_row = conn.execute(
+                    "SELECT board_id FROM programmes WHERE programme_name=?", (pname_del,)
+                ).fetchone()
+                if session.get("role") == "board_admin" and prog_row and prog_row["board_id"] != session.get("board_id"):
+                    flash("Cannot delete stages from another board's programme.", "error")
+                else:
+                    case_count = conn.execute(
+                        "SELECT COUNT(*) FROM case_tracking WHERE programme_name=? AND current_stage=?",
+                        (pname_del, sname_del)
+                    ).fetchone()[0]
+                    if case_count > 0:
+                        flash(f"Cannot delete stage '{sname_del}' — {case_count} case(s) are currently at this stage.", "error")
+                    else:
+                        conn.execute(
+                            "DELETE FROM programme_config WHERE programme_name=? AND stage_name=?",
+                            (pname_del, sname_del)
                         )
                         conn.commit()
-                        flash(f"Stage '{sname}' added to {pname}.", "success")
-                    except Exception as e:
-                        flash(f"Error: {e}", "error")
+                        flash(f"Stage '{sname_del}' deleted.", "success")
+
+        elif action == "update_stage":
+            sid = request.form.get("stage_id", "").strip()
+            if not sid:
+                flash("Stage ID missing.", "error")
+            else:
+                stage_row = conn.execute(
+                    "SELECT programme_name, board_id FROM programme_config WHERE id=?", (sid,)
+                ).fetchone()
+                if not stage_row:
+                    flash("Stage not found.", "error")
+                elif session.get("role") == "board_admin" and stage_row["board_id"] != session.get("board_id"):
+                    flash("Cannot edit stages from another board.", "error")
+                else:
+                    _us_name = request.form.get("stage_name", "").strip()
+                    _us_order = int(request.form.get("stage_order", 1))
+                    # Check duplicate order (excluding self)
+                    _dup2 = conn.execute(
+                        "SELECT id FROM programme_config WHERE programme_name=? AND stage_order=? AND id!=?",
+                        (stage_row["programme_name"], _us_order, sid)
+                    ).fetchone()
+                    if not _us_name:
+                        flash("Stage name is required.", "error")
+                    elif _dup2:
+                        flash(f"Stage order #{_us_order} is already used by another stage in this programme.", "error")
+                    else:
+                        try:
+                            conn.execute(
+                                """UPDATE programme_config SET
+                                   stage_name=?, stage_order=?, tat_days=?, reminder1_day=?,
+                                   reminder2_day=?, owner_type=?, overdue_interval_days=?,
+                                   is_milestone=?, is_optional=?
+                                   WHERE id=?""",
+                                (_us_name,
+                                 _us_order,
+                                 int(request.form.get("tat_days", 0)),
+                                 int(request.form.get("reminder1_day", 0)),
+                                 int(request.form.get("reminder2_day", 0)),
+                                 request.form.get("owner_type") or None,
+                                 int(request.form.get("overdue_interval_days", 3)),
+                                 1 if request.form.get("is_milestone") else 0,
+                                 1 if request.form.get("is_optional") else 0,
+                                 sid)
+                            )
+                            conn.commit()
+                            flash(f"Stage '{_us_name}' updated.", "success")
+                        except Exception as e:
+                            flash(f"Error updating stage: {e}", "error")
+
+        elif action == "copy_stages":
+            src_prog = request.form.get("source_programme", "").strip()
+            dst_prog = request.form.get("dest_programme", "").strip()
+            overwrite = request.form.get("overwrite_existing") == "1"
+            if not src_prog or not dst_prog:
+                flash("Source and destination programmes are required.", "error")
+            elif src_prog == dst_prog:
+                flash("Source and destination cannot be the same programme.", "error")
+            else:
+                dst_row = conn.execute(
+                    "SELECT id, board_id FROM programmes WHERE programme_name=?", (dst_prog,)
+                ).fetchone()
+                if not dst_row:
+                    flash("Destination programme not found.", "error")
+                elif session.get("role") == "board_admin" and dst_row["board_id"] != session.get("board_id"):
+                    flash("Cannot copy stages to a programme in another board.", "error")
+                else:
+                    src_stages = conn.execute(
+                        "SELECT * FROM programme_config WHERE programme_name=? ORDER BY stage_order",
+                        (src_prog,)
+                    ).fetchall()
+                    if not src_stages:
+                        flash(f"Source programme '{src_prog}' has no stages to copy.", "error")
+                    else:
+                        if overwrite:
+                            conn.execute(
+                                "DELETE FROM programme_config WHERE programme_name=?", (dst_prog,)
+                            )
+                            conn.commit()
+                        copied = 0
+                        skipped = 0
+                        for _ss in src_stages:
+                            _exist = conn.execute(
+                                "SELECT id FROM programme_config WHERE programme_name=? AND stage_order=?",
+                                (dst_prog, _ss["stage_order"])
+                            ).fetchone()
+                            if _exist and not overwrite:
+                                skipped += 1
+                                continue
+                            try:
+                                conn.execute(
+                                    """INSERT INTO programme_config
+                                       (programme_name, stage_name, stage_order, tat_days,
+                                        reminder1_day, reminder2_day, owner_type,
+                                        overdue_interval_days, is_milestone, is_optional, board_id)
+                                       VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+                                    (dst_prog, _ss["stage_name"], _ss["stage_order"],
+                                     _ss["tat_days"], _ss["reminder1_day"], _ss["reminder2_day"],
+                                     _ss["owner_type"], _ss["overdue_interval_days"],
+                                     _ss["is_milestone"], _ss["is_optional"],
+                                     dst_row["board_id"])
+                                )
+                                copied += 1
+                            except Exception:
+                                skipped += 1
+                        conn.commit()
+                        msg = f"Copied {copied} stage(s) from '{src_prog}' to '{dst_prog}'."
+                        if skipped:
+                            msg += f" {skipped} skipped (order conflict)."
+                        flash(msg, "success")
+
+        elif action == "copy_stages_from":
+            src_prog = request.form.get("source_programme_name", "").strip()
+            dst_prog = request.form.get("current_programme_name", "").strip()
+            confirm_replace = request.form.get("confirm_replace") == "1"
+            if not src_prog or not dst_prog:
+                flash("Source and current programme names are required.", "error")
+            elif src_prog == dst_prog:
+                flash("Source and destination cannot be the same programme.", "error")
+            else:
+                src_row = conn.execute(
+                    "SELECT id, board_id FROM programmes WHERE programme_name=?", (src_prog,)
+                ).fetchone()
+                dst_row2 = conn.execute(
+                    "SELECT id, board_id FROM programmes WHERE programme_name=?", (dst_prog,)
+                ).fetchone()
+                if not src_row or not dst_row2:
+                    flash("Programme not found.", "error")
+                elif src_row["board_id"] != dst_row2["board_id"]:
+                    flash("Both programmes must belong to the same board.", "error")
+                elif session.get("role") == "board_admin" and dst_row2["board_id"] != session.get("board_id"):
+                    flash("Cannot copy stages to a programme in another board.", "error")
+                else:
+                    src_stages = conn.execute(
+                        "SELECT * FROM programme_config WHERE programme_name=? ORDER BY stage_order",
+                        (src_prog,)
+                    ).fetchall()
+                    if not src_stages:
+                        flash(f"Source programme '{src_prog}' has no stages to copy.", "error")
+                    else:
+                        if confirm_replace:
+                            conn.execute(
+                                "DELETE FROM programme_config WHERE programme_name=?", (dst_prog,)
+                            )
+                            conn.commit()
+                        copied2 = 0
+                        skipped2 = 0
+                        for _ss2 in src_stages:
+                            _exist2 = conn.execute(
+                                "SELECT id FROM programme_config WHERE programme_name=? AND stage_order=?",
+                                (dst_prog, _ss2["stage_order"])
+                            ).fetchone()
+                            if _exist2 and not confirm_replace:
+                                skipped2 += 1
+                                continue
+                            try:
+                                conn.execute(
+                                    """INSERT INTO programme_config
+                                       (programme_name, stage_name, stage_order, tat_days,
+                                        reminder1_day, reminder2_day, owner_type,
+                                        overdue_interval_days, is_milestone, is_optional, board_id)
+                                       VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+                                    (dst_prog, _ss2["stage_name"], _ss2["stage_order"],
+                                     _ss2["tat_days"], _ss2["reminder1_day"], _ss2["reminder2_day"],
+                                     _ss2["owner_type"], _ss2["overdue_interval_days"],
+                                     _ss2["is_milestone"], _ss2["is_optional"],
+                                     dst_row2["board_id"])
+                                )
+                                copied2 += 1
+                            except Exception:
+                                skipped2 += 1
+                        conn.commit()
+                        msg2 = f"Copied {copied2} stage(s) from '{src_prog}' to '{dst_prog}'."
+                        if skipped2:
+                            msg2 += f" {skipped2} skipped (order conflict)."
+                        flash(msg2, "success")
 
         elif action == "update_schedule":
             if session.get("role") != "super_admin":
@@ -3053,6 +4593,37 @@ def settings():
             conn.commit()
             flash(f"Sender credentials updated for {prog}.", "success")
 
+        elif action == "add_board_holiday":
+            _hbid = user_board_id()
+            hdate = request.form.get("holiday_date", "").strip()
+            hname = request.form.get("holiday_name", "").strip()
+            if hdate and hname:
+                try:
+                    _existing = conn.execute(
+                        "SELECT id FROM holidays WHERE holiday_date=? AND (board_id=? OR (board_id IS NULL AND ? IS NULL))",
+                        (hdate, _hbid, _hbid)
+                    ).fetchone()
+                    if not _existing:
+                        conn.execute(
+                            "INSERT INTO holidays (holiday_date, name, board_id) VALUES (?,?,?)",
+                            (hdate, hname, _hbid)
+                        )
+                    conn.commit()
+                    flash(f"Holiday '{hname}' added.", "success")
+                except Exception as e:
+                    flash(f"Error: {e}", "error")
+
+        elif action == "delete_board_holiday":
+            _hbid = user_board_id()
+            hid = request.form.get("holiday_id")
+            if hid:
+                conn.execute(
+                    "DELETE FROM holidays WHERE id=? AND (board_id=? OR board_id IS NULL)",
+                    (hid, _hbid)
+                )
+                conn.commit()
+                flash("Holiday removed.", "success")
+
     # Build Board → Programme → Stage hierarchy
     bid = user_board_id()
     all_boards = [dict(r) for r in conn.execute(
@@ -3087,6 +4658,17 @@ def settings():
             p["smtp_host"] = first[0].get("smtp_host", "smtp.gmail.com") if first else "smtp.gmail.com"
             p["smtp_port"] = first[0].get("smtp_port", 587) if first else 587
 
+    # Load board-specific holidays
+    if bid is not None:
+        _board_holidays = [dict(r) for r in conn.execute(
+            "SELECT * FROM holidays WHERE board_id=? OR board_id IS NULL ORDER BY holiday_date",
+            (bid,)
+        ).fetchall()]
+    else:
+        _board_holidays = [dict(r) for r in conn.execute(
+            "SELECT * FROM holidays ORDER BY holiday_date"
+        ).fetchall()]
+
     conn.close()
 
     # Programmes list for "Add Stage" dropdown (scoped to user's boards)
@@ -3111,46 +4693,137 @@ def settings():
                 if sender_status else
                 '<span class="pill pill-warn" style="font-size:11px"><i class="bi bi-exclamation-circle"></i> No sender configured</span>'
             )
-            stages_rows = "".join(
-                f"""<tr>
-                  <td style="color:#94a3b8;font-size:12px">{s['stage_order']}</td>
-                  <td style="font-weight:500">{'<i class="bi bi-flag-fill" style="color:#7c3aed;font-size:11px"></i> ' if s['is_milestone'] else ''}{s['stage_name']}</td>
-                  <td style="text-align:center">{s['tat_days'] or '—'}</td>
-                  <td style="text-align:center;color:#2563eb">{s['reminder1_day'] or '—'}</td>
-                  <td style="text-align:center;color:#d97706">{s['reminder2_day'] or '—'}</td>
-                  <td>{s['owner_type'] or '—'}</td>
-                  <td style="text-align:center">{s['overdue_interval_days']}</td>
+            is_ba = session.get("role") in ("super_admin", "board_admin")
+            stages_rows = ""
+            for s in stages:
+                stage_flags = ""
+                if s["is_milestone"]:
+                    stage_flags += '<span style="background:#ede9fe;color:#5b21b6;font-size:10px;padding:1px 6px;border-radius:4px;margin-left:4px"><i class="bi bi-flag-fill"></i> Milestone</span>'
+                if s.get("is_optional"):
+                    stage_flags += '<span style="background:#e0f2fe;color:#0369a1;font-size:10px;padding:1px 6px;border-radius:4px;margin-left:4px"><i class="bi bi-skip-forward-fill"></i> Optional</span>'
+                sname_js = s["stage_name"].replace("'", "\\'").replace('"', '&quot;')
+                if is_ba:
+                    edit_stage_btn = (
+                        f'<button class="btn btn-sm btn-outline-primary py-0 px-1 me-1" style="font-size:11px" '
+                        f'title="Edit stage" '
+                        f'data-sid="{s["id"]}" '
+                        f'data-name="{h(s["stage_name"])}" '
+                        f'data-order="{s["stage_order"]}" '
+                        f'data-tat="{s["tat_days"]}" '
+                        f'data-r1="{s["reminder1_day"]}" '
+                        f'data-r2="{s["reminder2_day"]}" '
+                        f'data-owner="{h(s["owner_type"] or "")}" '
+                        f'data-odi="{s["overdue_interval_days"]}" '
+                        f'data-ms="{s["is_milestone"]}" '
+                        f'data-opt="{int(s.get("is_optional", 0))}" '
+                        f'onclick="editStageFromBtn(this)">'
+                        f'<i class="bi bi-pencil"></i></button>'
+                    )
+                    del_stage_btn = (
+                        f'<form method="post" style="display:inline" '
+                        f'onsubmit="return confirm(\'Delete stage &quot;{sname_js}&quot;?\')">'
+                        f'<input type="hidden" name="action" value="delete_stage">'
+                        f'<input type="hidden" name="programme_name" value="{pname}">'
+                        f'<input type="hidden" name="stage_name" value="{s["stage_name"]}">'
+                        f'<button class="btn btn-sm btn-outline-danger py-0 px-1" style="font-size:11px">'
+                        f'<i class="bi bi-trash"></i></button></form>'
+                    )
+                else:
+                    edit_stage_btn = ""
+                    del_stage_btn = ""
+                stages_rows += f"""<tr>
+                  <td style="color:#94a3b8;font-size:12px">{s["stage_order"]}</td>
+                  <td style="font-weight:500">{s["stage_name"]}{stage_flags}</td>
+                  <td style="text-align:center">{s["tat_days"] or "—"}</td>
+                  <td style="text-align:center;color:#2563eb">{s["reminder1_day"] or "—"}</td>
+                  <td style="text-align:center;color:#d97706">{s["reminder2_day"] or "—"}</td>
+                  <td>{s["owner_type"] or "—"}</td>
+                  <td style="text-align:center">{s["overdue_interval_days"]}</td>
+                  <td style="white-space:nowrap">{edit_stage_btn}{del_stage_btn}</td>
                 </tr>"""
-                for s in stages
-            )
             th_center = 'style="text-align:center"'
+            del_col_header = '<th style="width:72px"></th>' if is_ba else ''
             if stages:
                 stages_table_html = (
                     '<div style="overflow-x:auto"><table class="data-table"><thead><tr>'
                     '<th>#</th><th>Stage Name</th>'
                     f'<th {th_center}>TAT</th><th {th_center}>R1 Day</th>'
                     f'<th {th_center}>R2 Day</th><th>Owner</th><th {th_center}>OD Interval</th>'
+                    + del_col_header +
                     '</tr></thead><tbody>' + stages_rows + '</tbody></table></div>'
                 )
             else:
                 stages_table_html = '<div style="padding:16px 20px;color:#94a3b8;font-size:13px">No stages configured yet.</div>'
 
+            del_prog_btn = ""
+            edit_prog_btn = ""
+            if is_ba:
+                _p_tat = p.get("tat_days") or 0
+                _p_r1 = p.get("reminder1_days") or 0
+                _p_r2 = p.get("reminder2_days") or 0
+                _p_od = p.get("overdue_days") or 0
+                _p_emails = h(p.get("notification_emails") or "")
+                edit_prog_btn = (
+                    f'<button class="btn btn-sm btn-outline-secondary ms-2 flex-shrink-0" '
+                    f'style="font-size:11px;padding:4px 10px;white-space:nowrap" '
+                    f'onclick="editProgramme({json.dumps(pname)}, {_p_tat}, {_p_r1}, {_p_r2}, {_p_od}, {json.dumps(_p_emails)})">'
+                    f'<i class="bi bi-gear"></i> Edit</button>'
+                )
+                del_prog_btn = f"""
+    <form method="post" class="ms-2 flex-shrink-0"
+          onsubmit="return confirm('Delete programme &quot;{pname}&quot; and ALL its stages? This cannot be undone.')">
+      <input type="hidden" name="action" value="delete_programme">
+      <input type="hidden" name="programme_name" value="{pname}">
+      <button class="btn btn-sm btn-danger" style="font-size:11px;padding:4px 10px;white-space:nowrap">
+        <i class="bi bi-trash"></i> Delete
+      </button>
+    </form>"""
             prog_inner += f"""
 <div class="accordion-item" style="border:1px solid #e2e8f0;border-radius:8px;margin-bottom:8px;overflow:hidden">
-  <h2 class="accordion-header">
-    <button class="accordion-button collapsed py-2" type="button" data-bs-toggle="collapse"
-            data-bs-target="#prog_{pid_safe}" style="background:#f8fafc;font-size:14px">
-      <div class="d-flex align-items-center gap-3 w-100 me-3">
+  <div class="d-flex align-items-center" style="background:#f8fafc;padding-right:8px;border-bottom:1px solid #e2e8f0">
+    <button class="accordion-button collapsed flex-grow-1 py-2" type="button" data-bs-toggle="collapse"
+            data-bs-target="#prog_{pid_safe}"
+            style="background:transparent;font-size:14px;border:none;box-shadow:none">
+      <div class="d-flex align-items-center gap-3 w-100">
         <i class="bi bi-list-task" style="color:#7c3aed"></i>
         <span style="font-weight:600">{pname}</span>
         <span>{credential_badge}</span>
         <span class="ms-auto" style="font-size:12px;color:#94a3b8">{len(stages)} stages</span>
       </div>
     </button>
-  </h2>
+    {edit_prog_btn}
+    {del_prog_btn}
+  </div>
   <div id="prog_{pid_safe}" class="accordion-collapse collapse">
     <div class="accordion-body p-0">
       {stages_table_html}
+      <div style="padding:12px 20px;background:#f0fdf4;border-top:1px solid #e2e8f0">
+        <div style="font-size:12px;font-weight:600;color:#64748b;text-transform:uppercase;letter-spacing:.5px;margin-bottom:8px">
+          <i class="bi bi-copy"></i> Copy Stages From Another Programme
+        </div>
+        <form method="post" class="row g-2 align-items-end">
+          <input type="hidden" name="action" value="copy_stages_from">
+          <input type="hidden" name="current_programme_name" value="{pname}">
+          <div class="col">
+            <label class="form-label" style="font-size:11px">Source Programme (same board)</label>
+            <select class="form-select form-select-sm" name="source_programme_name" required>
+              <option value="">— select source —</option>
+              {''.join(f'<option value="{h(op["programme_name"])}">{h(op["programme_name"])}</option>' for op in board_programmes[b["id"]] if op["programme_name"] != pname)}
+            </select>
+          </div>
+          <div class="col-auto d-flex align-items-end gap-2">
+            <div class="form-check mb-0" style="white-space:nowrap">
+              <input class="form-check-input" type="checkbox" name="confirm_replace" value="1"
+                     id="cr_{pid_safe}" onchange="return this.checked ? confirm('This will DELETE all existing stages in &quot;{pname}&quot; first. Are you sure?') : true">
+              <label class="form-check-label" style="font-size:11px" for="cr_{pid_safe}">Replace existing</label>
+            </div>
+            <button class="btn btn-sm btn-outline-success" type="submit"
+                    onclick="return confirm('Copy stages from selected programme into &quot;{pname}&quot;?')">
+              <i class="bi bi-copy"></i> Copy
+            </button>
+          </div>
+        </form>
+      </div>
       <div style="padding:16px 20px;background:#f8fafc;border-top:1px solid #e2e8f0">
         <div style="font-size:12px;font-weight:600;color:#64748b;text-transform:uppercase;letter-spacing:.5px;margin-bottom:12px">
           <i class="bi bi-envelope-at"></i> Outbound Email Settings
@@ -3190,18 +4863,31 @@ def settings():
   </div>
 </div>"""
 
+        del_board_btn = ""
+        if session.get("role") == "super_admin":
+            del_board_btn = f"""
+    <form method="post" class="ms-2 flex-shrink-0"
+          onsubmit="return confirm('Delete board &quot;{b['board_name']}&quot;? All programmes must be deleted first.')">
+      <input type="hidden" name="action" value="delete_board">
+      <input type="hidden" name="board_id" value="{b['id']}">
+      <button class="btn btn-sm btn-danger" style="font-size:11px;padding:4px 10px;white-space:nowrap">
+        <i class="bi bi-trash"></i> Delete Board
+      </button>
+    </form>"""
         board_sections += f"""
 <div class="accordion-item" style="border:2px solid #e2e8f0;border-radius:12px;margin-bottom:16px;overflow:hidden">
-  <h2 class="accordion-header">
-    <button class="accordion-button" type="button" data-bs-toggle="collapse"
-            data-bs-target="#board_{bid_safe}" style="background:linear-gradient(135deg,#003356,#0094ca);color:#fff;font-weight:700;font-size:15px">
-      <div class="d-flex align-items-center gap-3 w-100 me-3">
+  <div class="d-flex align-items-center" style="background:linear-gradient(135deg,#003356,#0094ca);padding-right:12px">
+    <button class="accordion-button flex-grow-1" type="button" data-bs-toggle="collapse"
+            data-bs-target="#board_{bid_safe}"
+            style="background:transparent;color:#fff;font-weight:700;font-size:15px;border:none;box-shadow:none">
+      <div class="d-flex align-items-center gap-3 w-100">
         <i class="bi bi-building" style="font-size:18px"></i>
         <span>{b['board_name']}</span>
         <span class="ms-auto" style="font-size:12px;opacity:.8">{prog_count} programme{"s" if prog_count != 1 else ""}</span>
       </div>
     </button>
-  </h2>
+    {del_board_btn}
+  </div>
   <div id="board_{bid_safe}" class="accordion-collapse collapse show">
     <div class="accordion-body" style="background:#fafbfc;padding:16px">
       <div class="accordion" id="progAccordion_{bid_safe}">
@@ -3223,39 +4909,121 @@ def settings():
     )
 
     is_super = session.get("role") == "super_admin"
+    is_board_admin = session.get("role") in ("board_admin", "super_admin")
+    _settings_bid = user_board_id()
 
-    # Current schedule for display
-    cur_hour   = int(get_app_setting("scheduler_hour",   "8"))
-    cur_minute = int(get_app_setting("scheduler_minute", "0"))
-    cur_time_val = f"{cur_hour:02d}:{cur_minute:02d}"
+    # Per-board scheduler setting (used by board admins)
+    if request.method == "POST" and request.form.get("action") == "save_board_schedule":
+        if _settings_bid and is_board_admin:
+            _bh = request.form.get("board_sched_hour", "8")
+            _bm = request.form.get("board_sched_minute", "0")
+            set_app_setting(f"sched_hour_board_{_settings_bid}", _bh)
+            set_app_setting(f"sched_minute_board_{_settings_bid}", _bm)
+            flash("Board notification schedule updated.", "success")
 
-    scheduler_html = f"""
+    _board_sched_hour = int(get_app_setting(
+        f"sched_hour_board_{_settings_bid}" if _settings_bid else "scheduler_hour",
+        get_app_setting("scheduler_hour", "8")
+    ))
+    _board_sched_minute = int(get_app_setting(
+        f"sched_minute_board_{_settings_bid}" if _settings_bid else "scheduler_minute",
+        get_app_setting("scheduler_minute", "0")
+    ))
+    _bsh_opts = "".join(
+        f'<option value="{h}" {"selected" if h==_board_sched_hour else ""}>{h:02d}:00</option>'
+        for h in range(24)
+    )
+    _bsm_opts = "".join(
+        f'<option value="{m}" {"selected" if m==_board_sched_minute else ""}>{m:02d}</option>'
+        for m in [0, 15, 30, 45]
+    )
+
+    board_schedule_html = f"""
       <div class="card mb-3">
         <div class="card-header d-flex justify-content-between align-items-center" style="cursor:pointer"
-             onclick="togglePanel('schedBody')">
-          <span><i class="bi bi-clock" style="color:#0891b2"></i> Scheduler Settings</span>
+             onclick="togglePanel('boardSchedBody')">
+          <span><i class="bi bi-clock" style="color:#0891b2"></i> Board Notification Schedule</span>
           <i class="bi bi-chevron-down" style="color:#94a3b8"></i>
         </div>
-        <div id="schedBody" style="display:none">
+        <div id="boardSchedBody" style="display:none">
           <div class="card-body p-3">
             <form method="post">
-              <input type="hidden" name="action" value="update_schedule">
-              <div class="mb-2">
-                <label class="form-label" style="font-size:12px">
-                  Daily run time <span style="color:#94a3b8">(IST, 24-hr)</span>
-                </label>
-                <input type="time" class="form-control form-control-sm"
-                       name="schedule_time" value="{cur_time_val}" required>
+              <input type="hidden" name="action" value="save_board_schedule">
+              <div class="row g-2 mb-2">
+                <div class="col-6">
+                  <label class="form-label" style="font-size:12px">Hour (IST)</label>
+                  <select class="form-select form-select-sm" name="board_sched_hour">{_bsh_opts}</select>
+                </div>
+                <div class="col-6">
+                  <label class="form-label" style="font-size:12px">Minute</label>
+                  <select class="form-select form-select-sm" name="board_sched_minute">{_bsm_opts}</select>
+                </div>
               </div>
               <div style="font-size:11px;color:#94a3b8;margin-bottom:10px">
-                Currently set to <strong>{cur_hour:02d}:{cur_minute:02d} IST</strong>.
-                Change takes effect immediately — no restart needed.
+                Currently: <strong>{_board_sched_hour:02d}:{_board_sched_minute:02d} IST</strong>.
+                Notifications for this board will run at this time daily.
               </div>
-              <button class="btn btn-sm btn-primary w-100" type="submit">Update Schedule</button>
+              <button class="btn btn-sm btn-primary w-100" type="submit">Save Schedule</button>
             </form>
           </div>
         </div>
-      </div>""" if is_super else ""
+      </div>""" if is_board_admin else ""
+
+    scheduler_html = ""  # Removed — managed in System Settings (super admin only)
+
+    # Board holiday calendar card
+    _hol_rows = ""
+    for _hol in _board_holidays:
+        scope = '<span style="font-size:10px;color:#94a3b8">(global)</span>' if not _hol.get("board_id") else ""
+        _hol_rows += f"""<tr>
+  <td style="font-size:12px">{_hol['holiday_date']}</td>
+  <td style="font-size:12px">{_hol['name']} {scope}</td>
+  <td>
+    <form method="post" style="display:inline">
+      <input type="hidden" name="action" value="delete_board_holiday">
+      <input type="hidden" name="holiday_id" value="{_hol['id']}">
+      <button type="submit" class="btn btn-xs btn-outline-danger" style="font-size:10px;padding:1px 6px"
+              onclick="return confirm('Remove holiday?')"><i class="bi bi-trash"></i></button>
+    </form>
+  </td>
+</tr>"""
+    if not _hol_rows:
+        _hol_rows = '<tr><td colspan="3" style="text-align:center;color:#94a3b8;padding:16px;font-size:12px">No holidays added yet.</td></tr>'
+
+    board_holiday_html = f"""
+      <div class="card mb-3">
+        <div class="card-header d-flex justify-content-between align-items-center" style="cursor:pointer"
+             onclick="togglePanel('boardHolBody')">
+          <span><i class="bi bi-calendar3-event" style="color:#d97706"></i> Holiday Calendar</span>
+          <i class="bi bi-chevron-down" style="color:#94a3b8"></i>
+        </div>
+        <div id="boardHolBody" style="display:none">
+          <div class="card-body p-3">
+            <form method="post" class="row g-2 mb-3">
+              <input type="hidden" name="action" value="add_board_holiday">
+              <div class="col-5">
+                <input type="date" class="form-control form-control-sm" name="holiday_date" required>
+              </div>
+              <div class="col-5">
+                <input type="text" class="form-control form-control-sm" name="holiday_name"
+                       placeholder="e.g. Diwali" required>
+              </div>
+              <div class="col-2">
+                <button class="btn btn-sm btn-success w-100" type="submit">Add</button>
+              </div>
+            </form>
+            <div style="max-height:180px;overflow-y:auto">
+              <table class="data-table">
+                <thead><tr><th>Date</th><th>Name</th><th style="width:40px"></th></tr></thead>
+                <tbody>{_hol_rows}</tbody>
+              </table>
+            </div>
+            <div style="font-size:10px;color:#94a3b8;margin-top:6px">
+              TAT calculation skips these dates + all weekends.
+            </div>
+          </div>
+        </div>
+      </div>""" if is_board_admin else ""
 
     add_board_html = f"""
       <div class="card mb-3">
@@ -3285,7 +5053,8 @@ def settings():
 <div class="row g-4">
   <div class="col-lg-4">
     <!-- Action panels -->
-    {scheduler_html}
+    {board_schedule_html}
+    {board_holiday_html}
     {add_board_html}
 
     <div class="card mb-3">
@@ -3370,11 +5139,68 @@ def settings():
                 <option>Program Officer</option>
               </select>
             </div>
-            <div class="form-check mb-3">
-              <input class="form-check-input" type="checkbox" name="is_milestone" id="msCheck">
-              <label class="form-check-label" style="font-size:12px" for="msCheck">Milestone stage (no emails)</label>
+            <div class="d-flex gap-3 mb-3">
+              <div class="form-check">
+                <input class="form-check-input" type="checkbox" name="is_milestone" id="msCheck">
+                <label class="form-check-label" style="font-size:12px" for="msCheck">
+                  <i class="bi bi-flag-fill" style="color:#7c3aed;font-size:11px"></i> Milestone <span style="color:#94a3b8">(no emails)</span>
+                </label>
+              </div>
+              <div class="form-check">
+                <input class="form-check-input" type="checkbox" name="is_optional" id="optCheck">
+                <label class="form-check-label" style="font-size:12px" for="optCheck">
+                  <i class="bi bi-skip-forward-fill" style="color:#0891b2;font-size:11px"></i> Optional <span style="color:#94a3b8">(can skip)</span>
+                </label>
+              </div>
             </div>
             <button class="btn btn-sm btn-success w-100" type="submit">Add Stage</button>
+          </form>
+        </div>
+      </div>
+    </div>
+
+    <div class="card mt-3">
+      <div class="card-header d-flex justify-content-between align-items-center" style="cursor:pointer"
+           onclick="togglePanel('copyStageBody')">
+        <span><i class="bi bi-copy" style="color:#7c3aed"></i> Copy Stages from Programme</span>
+        <i class="bi bi-chevron-down" style="color:#94a3b8"></i>
+      </div>
+      <div id="copyStageBody" style="display:none">
+        <div class="card-body p-3">
+          <p style="font-size:12px;color:#64748b;margin-bottom:12px">
+            Clone all stages (TAT, reminders, owner) from one programme into another.
+            Useful when creating a new programme with a similar workflow.
+          </p>
+          <form method="post">
+            <input type="hidden" name="action" value="copy_stages">
+            <div class="mb-2">
+              <label class="form-label" style="font-size:12px">
+                <i class="bi bi-box-arrow-right" style="color:#059669"></i> Source Programme <span style="color:#94a3b8">(copy from)</span>
+              </label>
+              <select class="form-select form-select-sm" name="source_programme" required>
+                <option value="">— select —</option>
+                {prog_opts}
+              </select>
+            </div>
+            <div class="mb-2">
+              <label class="form-label" style="font-size:12px">
+                <i class="bi bi-box-arrow-in-right" style="color:#2563eb"></i> Destination Programme <span style="color:#94a3b8">(copy to)</span>
+              </label>
+              <select class="form-select form-select-sm" name="dest_programme" required>
+                <option value="">— select —</option>
+                {prog_opts}
+              </select>
+            </div>
+            <div class="form-check mb-3">
+              <input class="form-check-input" type="checkbox" name="overwrite_existing" value="1" id="overwriteChk">
+              <label class="form-check-label" style="font-size:12px" for="overwriteChk">
+                Replace existing stages in destination
+              </label>
+            </div>
+            <button class="btn btn-sm btn-primary w-100" type="submit"
+                    onclick="return confirm('Copy all stages from the source? If overwrite is checked, existing stages in the destination will be replaced.')">
+              <i class="bi bi-copy"></i> Copy Stages
+            </button>
           </form>
         </div>
       </div>
@@ -3389,12 +5215,169 @@ def settings():
   </div>
 </div>
 """
-    scripts = """<script>
+    scripts = """
+<!-- Edit Stage Modal -->
+<div class="modal fade" id="editStageModal" tabindex="-1">
+  <div class="modal-dialog modal-dialog-centered">
+    <div class="modal-content">
+      <div class="modal-header" style="background:#f8fafc;border-bottom:1px solid #e2e8f0">
+        <h6 class="modal-title" style="font-weight:600">
+          <i class="bi bi-pencil-square" style="color:#2563eb"></i> Edit Stage
+        </h6>
+        <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+      </div>
+      <form method="post" id="editStageForm">
+        <input type="hidden" name="action" value="update_stage">
+        <input type="hidden" name="stage_id" id="es_id">
+        <div class="modal-body">
+          <div class="mb-3">
+            <label class="form-label" style="font-size:12px;font-weight:600">Stage Name</label>
+            <input type="text" class="form-control form-control-sm" name="stage_name" id="es_name" required>
+          </div>
+          <div class="row g-2 mb-3">
+            <div class="col-4">
+              <label class="form-label" style="font-size:12px;font-weight:600">Order #</label>
+              <input type="number" class="form-control form-control-sm" name="stage_order" id="es_order" min="1">
+            </div>
+            <div class="col-4">
+              <label class="form-label" style="font-size:12px;font-weight:600">TAT Days</label>
+              <input type="number" class="form-control form-control-sm" name="tat_days" id="es_tat" min="0">
+            </div>
+            <div class="col-4">
+              <label class="form-label" style="font-size:12px;font-weight:600">OD Interval</label>
+              <input type="number" class="form-control form-control-sm" name="overdue_interval_days" id="es_odi" min="1">
+            </div>
+          </div>
+          <div class="row g-2 mb-3">
+            <div class="col-6">
+              <label class="form-label" style="font-size:12px;font-weight:600">R1 Reminder Day</label>
+              <input type="number" class="form-control form-control-sm" name="reminder1_day" id="es_r1" min="0">
+            </div>
+            <div class="col-6">
+              <label class="form-label" style="font-size:12px;font-weight:600">R2 Reminder Day</label>
+              <input type="number" class="form-control form-control-sm" name="reminder2_day" id="es_r2" min="0">
+            </div>
+          </div>
+          <div class="mb-3">
+            <label class="form-label" style="font-size:12px;font-weight:600">Owner Type</label>
+            <select class="form-select form-select-sm" name="owner_type" id="es_owner">
+              <option value="">—</option>
+              <option>Applicant</option>
+              <option>Assessor</option>
+              <option>Program Officer</option>
+            </select>
+          </div>
+          <div class="d-flex gap-4">
+            <div class="form-check">
+              <input class="form-check-input" type="checkbox" name="is_milestone" id="es_ms">
+              <label class="form-check-label" style="font-size:12px" for="es_ms">
+                <i class="bi bi-flag-fill" style="color:#7c3aed;font-size:11px"></i> Milestone <span style="color:#94a3b8">(no emails)</span>
+              </label>
+            </div>
+            <div class="form-check">
+              <input class="form-check-input" type="checkbox" name="is_optional" id="es_opt">
+              <label class="form-check-label" style="font-size:12px" for="es_opt">
+                <i class="bi bi-skip-forward-fill" style="color:#0891b2;font-size:11px"></i> Optional <span style="color:#94a3b8">(can skip)</span>
+              </label>
+            </div>
+          </div>
+        </div>
+        <div class="modal-footer" style="background:#f8fafc;border-top:1px solid #e2e8f0">
+          <button type="button" class="btn btn-sm btn-outline-secondary" data-bs-dismiss="modal">Cancel</button>
+          <button type="submit" class="btn btn-sm btn-primary">
+            <i class="bi bi-check-lg"></i> Save Changes
+          </button>
+        </div>
+      </form>
+    </div>
+  </div>
+</div>
+<script>
 function togglePanel(id){
   var el = document.getElementById(id);
   el.style.display = el.style.display === 'none' ? '' : 'none';
 }
-</script>"""
+function editStageFromBtn(btn) {
+  var d = btn.dataset;
+  editStage(d.sid, d.name, d.order, d.tat, d.r1, d.r2, d.owner, d.odi, d.ms, d.opt);
+}
+function editStage(id, name, order, tat, r1, r2, owner, odi, ms, opt) {
+  document.getElementById('es_id').value = id;
+  document.getElementById('es_name').value = name;
+  document.getElementById('es_order').value = order;
+  document.getElementById('es_tat').value = tat;
+  document.getElementById('es_r1').value = r1;
+  document.getElementById('es_r2').value = r2;
+  document.getElementById('es_odi').value = odi;
+  var ownerSel = document.getElementById('es_owner');
+  for (var i = 0; i < ownerSel.options.length; i++) {
+    ownerSel.options[i].selected = (ownerSel.options[i].value === owner);
+  }
+  document.getElementById('es_ms').checked = (ms == 1);
+  document.getElementById('es_opt').checked = (opt == 1);
+  new bootstrap.Modal(document.getElementById('editStageModal')).show();
+}
+function editProgramme(name, tat, r1, r2, od, emails) {
+  document.getElementById('ep_name').value = name;
+  document.getElementById('ep_tat').value = tat;
+  document.getElementById('ep_r1').value = r1;
+  document.getElementById('ep_r2').value = r2;
+  document.getElementById('ep_od').value = od;
+  document.getElementById('ep_emails').value = emails;
+  new bootstrap.Modal(document.getElementById('editProgModal')).show();
+}
+</script>
+<!-- Edit Programme Modal -->
+<div class="modal fade" id="editProgModal" tabindex="-1">
+  <div class="modal-dialog modal-dialog-centered">
+    <div class="modal-content">
+      <div class="modal-header" style="background:#f8fafc;border-bottom:1px solid #e2e8f0">
+        <h6 class="modal-title" style="font-weight:600">
+          <i class="bi bi-gear" style="color:#7c3aed"></i> Edit Programme Settings
+        </h6>
+        <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+      </div>
+      <form method="post" id="editProgForm">
+        <input type="hidden" name="action" value="edit_programme">
+        <input type="hidden" name="programme_name" id="ep_name">
+        <div class="modal-body">
+          <div class="row g-2 mb-3">
+            <div class="col-6">
+              <label class="form-label" style="font-size:12px;font-weight:600">Default TAT Days</label>
+              <input type="number" class="form-control form-control-sm" name="tat_days" id="ep_tat" min="0" value="0">
+            </div>
+            <div class="col-6">
+              <label class="form-label" style="font-size:12px;font-weight:600">Overdue Days</label>
+              <input type="number" class="form-control form-control-sm" name="overdue_days" id="ep_od" min="0" value="0">
+            </div>
+          </div>
+          <div class="row g-2 mb-3">
+            <div class="col-6">
+              <label class="form-label" style="font-size:12px;font-weight:600">Reminder 1 Days</label>
+              <input type="number" class="form-control form-control-sm" name="reminder1_days" id="ep_r1" min="0" value="0">
+            </div>
+            <div class="col-6">
+              <label class="form-label" style="font-size:12px;font-weight:600">Reminder 2 Days</label>
+              <input type="number" class="form-control form-control-sm" name="reminder2_days" id="ep_r2" min="0" value="0">
+            </div>
+          </div>
+          <div class="mb-3">
+            <label class="form-label" style="font-size:12px;font-weight:600">Notification Emails <span style="color:#94a3b8;font-weight:400">(comma-separated)</span></label>
+            <input type="text" class="form-control form-control-sm" name="notification_emails" id="ep_emails"
+                   placeholder="admin@org.com, manager@org.com">
+            <div style="font-size:11px;color:#94a3b8;margin-top:4px">These addresses receive programme-level notification copies.</div>
+          </div>
+        </div>
+        <div class="modal-footer" style="background:#f8fafc;border-top:1px solid #e2e8f0">
+          <button type="button" class="btn btn-sm btn-outline-secondary" data-bs-dismiss="modal">Cancel</button>
+          <button type="submit" class="btn btn-sm btn-primary">
+            <i class="bi bi-check-lg"></i> Save Changes
+          </button>
+        </div>
+      </form>
+    </div>
+  </div>
+</div>"""
     return render_page(content, scripts, active_page="settings",
                        page_title="Programme Settings")
 
@@ -3424,6 +5407,21 @@ def email_templates_page():
                 )
             conn.commit()
             flash("Template saved.", "success")
+        elif action == "save_stage_override":
+            conn.execute(
+                "INSERT INTO stage_email_override "
+                "(programme_name, stage_name, notification_type, subject_line, email_body) VALUES (?,?,?,?,?) "
+                "ON CONFLICT (programme_name, stage_name, notification_type) DO UPDATE SET subject_line=EXCLUDED.subject_line, email_body=EXCLUDED.email_body",
+                (request.form["programme_name"], request.form["stage_name"],
+                 request.form["notification_type"],
+                 request.form["subject_line"], request.form["email_body"]),
+            )
+            conn.commit()
+            flash(f"Stage override saved for '{request.form['stage_name']}'.", "success")
+        elif action == "delete_stage_override":
+            conn.execute("DELETE FROM stage_email_override WHERE id=?", (request.form["override_id"],))
+            conn.commit()
+            flash("Stage override deleted.", "success")
 
     et_bid = user_board_id()
     if et_bid is not None:
@@ -3435,6 +5433,18 @@ def email_templates_page():
             "SELECT programme_name FROM programmes WHERE board_id=? ORDER BY programme_name",
             (et_bid,)
         ).fetchall()]
+        stage_overrides = [dict(r) for r in conn.execute(
+            "SELECT seo.* FROM stage_email_override seo "
+            "JOIN programmes p ON seo.programme_name = p.programme_name "
+            "WHERE p.board_id=? ORDER BY seo.programme_name, seo.stage_name",
+            (et_bid,)
+        ).fetchall()]
+        stages_rows = conn.execute(
+            "SELECT DISTINCT programme_name, stage_name FROM programme_config "
+            "WHERE programme_name IN (SELECT programme_name FROM programmes WHERE board_id=?) "
+            "ORDER BY programme_name, stage_order",
+            (et_bid,)
+        ).fetchall()
     else:
         templates = [dict(r) for r in conn.execute(
             "SELECT * FROM email_templates ORDER BY programme_name, notification_type"
@@ -3442,7 +5452,18 @@ def email_templates_page():
         programmes = [r[0] for r in conn.execute(
             "SELECT DISTINCT programme_name FROM programme_config ORDER BY programme_name"
         ).fetchall()]
+        stage_overrides = [dict(r) for r in conn.execute(
+            "SELECT * FROM stage_email_override ORDER BY programme_name, stage_name"
+        ).fetchall()]
+        stages_rows = conn.execute(
+            "SELECT DISTINCT programme_name, stage_name FROM programme_config ORDER BY programme_name, stage_order"
+        ).fetchall()
     conn.close()
+
+    stages_by_prog = {}
+    for _r in stages_rows:
+        stages_by_prog.setdefault(_r[0], []).append(_r[1])
+    stages_json = json.dumps(stages_by_prog)
 
     PLACEHOLDER_HELP = (
         "{{Organisation_Name}}, {{Stage_Name}}, {{Action_Owner_Name}}, "
@@ -3496,6 +5517,32 @@ def email_templates_page():
 
     prog_opts = "".join(f'<option value="{p}">{p}</option>' for p in programmes)
 
+    # ── Stage override rows ────────────────────────────────────────────────────
+    sov_rows = ""
+    for sov in stage_overrides:
+        safe_subj = sov['subject_line'].replace('"', '&quot;')
+        sov_rows += f"""<tr>
+  <td style="font-weight:500">{sov['programme_name']}</td>
+  <td>{sov['stage_name']}</td>
+  <td><span class="badge" style="background:#ede9fe;color:#7c3aed">{sov['notification_type']}</span></td>
+  <td style="font-size:12px;max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{sov['subject_line']}</td>
+  <td>
+    <button class="btn btn-xs btn-outline-primary" style="font-size:11px;padding:2px 8px"
+            onclick="editOverride({sov['id']},'{sov['programme_name'].replace(chr(39),'&#39;')}','{sov['stage_name'].replace(chr(39),'&#39;')}','{sov['notification_type']}','{safe_subj}',this)">
+      <i class="bi bi-pencil"></i>
+    </button>
+    <form method="post" style="display:inline" onsubmit="return confirm('Delete this stage override?')">
+      <input type="hidden" name="action" value="delete_stage_override">
+      <input type="hidden" name="override_id" value="{sov['id']}">
+      <button type="submit" class="btn btn-xs btn-outline-danger" style="font-size:11px;padding:2px 8px">
+        <i class="bi bi-trash"></i>
+      </button>
+    </form>
+  </td>
+</tr>"""
+    if not sov_rows:
+        sov_rows = '<tr><td colspan="5" style="text-align:center;color:#94a3b8;padding:24px">No stage-specific overrides yet.</td></tr>'
+
     ph_chips = " ".join(
         f'<span class="ph-chip" onclick="insertPH(this.textContent)">{{{{{p}}}}}</span>'
         for p in ["Organisation_Name","Stage_Name","Action_Owner_Name","Days_Remaining",
@@ -3503,6 +5550,82 @@ def email_templates_page():
     )
 
     content = f"""
+<!-- ── Stage-level overrides ─────────────────────────────────────────────── -->
+<div class="card mb-4">
+  <div class="card-header d-flex justify-content-between align-items-center">
+    <span><i class="bi bi-layers" style="color:#7c3aed"></i> Per-Stage Template Overrides
+      <span style="font-size:12px;color:#94a3b8;font-weight:400;margin-left:8px">
+        — override a programme template for a specific stage</span>
+    </span>
+    <button class="btn btn-sm btn-outline-primary" data-bs-toggle="collapse"
+            data-bs-target="#stageOverrideForm">
+      <i class="bi bi-plus-circle"></i> Add Override
+    </button>
+  </div>
+
+  <!-- Add/Edit form (collapsed by default) -->
+  <div id="stageOverrideForm" class="collapse">
+    <div class="card-body border-bottom" style="background:#f8fafc">
+      <form method="post" id="overrideForm">
+        <input type="hidden" name="action" value="save_stage_override">
+        <input type="hidden" name="override_edit_id" id="overrideEditId" value="">
+        <div class="row g-3">
+          <div class="col-md-3">
+            <label class="form-label">Programme</label>
+            <select class="form-select form-select-sm" name="programme_name" id="sovProg" onchange="loadSovStages()" required>
+              <option value="">— select —</option>
+              {prog_opts}
+            </select>
+          </div>
+          <div class="col-md-3">
+            <label class="form-label">Stage</label>
+            <select class="form-select form-select-sm" name="stage_name" id="sovStage" required>
+              <option value="">— select programme first —</option>
+            </select>
+          </div>
+          <div class="col-md-2">
+            <label class="form-label">Notification Type</label>
+            <select class="form-select form-select-sm" name="notification_type" required>
+              <option value="R1">R1 — Reminder 1</option>
+              <option value="R2">R2 — Reminder 2</option>
+              <option value="Overdue">Overdue</option>
+              <option value="Followup">Followup</option>
+            </select>
+          </div>
+          <div class="col-md-4">
+            <label class="form-label">Subject Line</label>
+            <input type="text" class="form-control form-control-sm" name="subject_line" id="sovSubject" required>
+          </div>
+          <div class="col-12">
+            <label class="form-label">Email Body</label>
+            <textarea class="form-control form-control-sm" name="email_body" id="sovBody"
+                      rows="8" style="font-family:monospace;font-size:12px" required></textarea>
+          </div>
+          <div class="col-12">
+            <button type="submit" class="btn btn-sm btn-primary">
+              <i class="bi bi-save"></i> Save Stage Override
+            </button>
+            <button type="button" class="btn btn-sm btn-outline-secondary ms-2"
+                    onclick="document.getElementById('overrideForm').reset();document.getElementById('stageOverrideForm').classList.remove('show')">
+              Cancel
+            </button>
+          </div>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- Existing overrides table -->
+  <div style="overflow-x:auto">
+    <table class="data-table">
+      <thead><tr>
+        <th>Programme</th><th>Stage</th><th>Type</th><th>Subject</th><th>Actions</th>
+      </tr></thead>
+      <tbody>{sov_rows}</tbody>
+    </table>
+  </div>
+</div>
+
 <div class="row g-4">
   <div class="col-xl-8">
 
@@ -3555,17 +5678,44 @@ def email_templates_page():
   </div>
 </div>
 """
-    scripts = """<script>
-function insertPH(text){
-  navigator.clipboard.writeText(text).then(function(){
+    scripts = f"""<script>
+var _STAGES_BY_PROG = {stages_json};
+
+function insertPH(text){{
+  navigator.clipboard.writeText(text).then(function(){{
     var t = document.createElement('div');
     t.className = 'toast qci-toast show align-items-center text-white bg-primary border-0';
     t.style.cssText = 'position:fixed;bottom:24px;right:24px;z-index:9999;min-width:220px';
     t.innerHTML = '<div class="d-flex"><div class="toast-body">Copied: '+text+'</div></div>';
     document.body.appendChild(t);
-    setTimeout(function(){ t.remove(); }, 2000);
-  });
-}
+    setTimeout(function(){{ t.remove(); }}, 2000);
+  }});
+}}
+
+function loadSovStages(){{
+  var prog = document.getElementById('sovProg').value;
+  var sel = document.getElementById('sovStage');
+  sel.innerHTML = '';
+  var stages = _STAGES_BY_PROG[prog] || [];
+  if(!stages.length){{ sel.innerHTML='<option value="">— no stages —</option>'; return; }}
+  stages.forEach(function(s){{
+    var o = document.createElement('option'); o.value=s; o.textContent=s; sel.appendChild(o);
+  }});
+}}
+
+function editOverride(id, prog, stage, notifType, subject, btn){{
+  // populate form and expand
+  document.getElementById('overrideEditId').value = id;
+  document.getElementById('sovProg').value = prog;
+  loadSovStages();
+  document.getElementById('sovStage').value = stage;
+  document.querySelector('#overrideForm select[name=notification_type]').value = notifType;
+  document.getElementById('sovSubject').value = subject;
+  // expand panel
+  var panel = document.getElementById('stageOverrideForm');
+  panel.classList.add('show');
+  panel.scrollIntoView({{behavior:'smooth', block:'nearest'}});
+}}
 </script>"""
     return render_page(content, scripts, active_page="templates",
                        page_title="Email Templates")
@@ -3591,6 +5741,7 @@ def audit_log_page():
         "case_updated": ("bi-pencil-fill", "#0094ca"),
         "case_closed":  ("bi-x-circle-fill", "#dc2626"),
         "stage_change": ("bi-arrow-right-circle-fill", "#7c3aed"),
+        "stage_skipped":("bi-skip-forward-fill",       "#0891b2"),
         "email_sent":   ("bi-envelope-check-fill", "#00984C"),
         "email_error":  ("bi-envelope-x-fill", "#dc2626"),
         "bulk_upload":  ("bi-upload", "#0094ca"),
@@ -3602,12 +5753,12 @@ def audit_log_page():
         r = dict(r)
         icon, clr = EVENT_ICONS.get(r["event_type"], ("bi-circle", "#94a3b8"))
         tbl_rows += f"""<tr>
-  <td style="white-space:nowrap;font-size:12px;color:#64748b">{r['timestamp']}</td>
+  <td style="white-space:nowrap;font-size:12px;color:#64748b">{h(r['timestamp'])}</td>
   <td><i class="bi {icon}" style="color:{clr};margin-right:4px"></i>
-    <span style="font-size:12px;font-weight:600">{r['event_type'].replace('_',' ').title()}</span></td>
-  <td style="font-weight:500">{r['application_id'] or '—'}</td>
-  <td style="font-size:12.5px">{r['detail'] or ''}</td>
-  <td style="font-size:12px;color:#94a3b8">{r['user_name'] or 'system'}</td>
+    <span style="font-size:12px;font-weight:600">{h(r['event_type'].replace('_',' ').title())}</span></td>
+  <td style="font-weight:500">{h(r['application_id']) if r['application_id'] else '—'}</td>
+  <td style="font-size:12.5px">{h(r['detail']) if r['detail'] else ''}</td>
+  <td style="font-size:12px;color:#94a3b8">{h(r['user_name']) if r['user_name'] else 'system'}</td>
 </tr>"""
 
     content = f"""
@@ -3631,6 +5782,19 @@ def audit_log_page():
 @login_required
 def case_history(app_id):
     conn = get_db()
+    # IDOR: verify the case belongs to the caller's board
+    _ch_case = conn.execute(
+        "SELECT board_id FROM case_tracking WHERE application_id=?", (app_id,)
+    ).fetchone()
+    if not _ch_case:
+        conn.close()
+        flash("Case not found.", "error")
+        return redirect(url_for("dashboard"))
+    _ch_bid = user_board_id()
+    if _ch_bid is not None and _ch_case["board_id"] != _ch_bid:
+        conn.close()
+        flash("Access denied.", "error")
+        return redirect(url_for("dashboard"))
     transitions = [dict(r) for r in conn.execute(
         "SELECT * FROM stage_history WHERE application_id=? ORDER BY id ASC", (app_id,)
     ).fetchall()]
@@ -3641,23 +5805,37 @@ def case_history(app_id):
 
     timeline_html = ""
     for t in transitions:
-        from_lbl = t["from_stage"] or '<em style="color:#94a3b8">New Case</em>'
+        from_lbl = h(t["from_stage"]) if t["from_stage"] else '<em style="color:#94a3b8">New Case</em>'
         timeline_html += f"""
 <div class="d-flex align-items-start gap-3 mb-3">
   <div style="width:12px;height:12px;border-radius:50%;background:#7c3aed;margin-top:4px;flex-shrink:0"></div>
   <div>
     <div style="font-size:13px"><span style="color:#94a3b8">{from_lbl}</span>
       <i class="bi bi-arrow-right" style="margin:0 6px;color:#7c3aed"></i>
-      <strong>{t['to_stage']}</strong></div>
-    <div style="font-size:11px;color:#94a3b8">{t['timestamp']} · by {t['changed_by'] or 'system'}</div>
+      <strong>{h(t['to_stage'])}</strong></div>
+    <div style="font-size:11px;color:#94a3b8">{h(t['timestamp'])} · by {h(t['changed_by']) if t['changed_by'] else 'system'}</div>
   </div>
 </div>"""
 
+    _AH_ICONS = {
+        "stage_change":  ("bi-arrow-right-circle-fill", "#7c3aed"),
+        "stage_skipped": ("bi-skip-forward-fill",       "#0891b2"),
+        "case_created":  ("bi-plus-circle-fill",        "#00984C"),
+        "case_updated":  ("bi-pencil-fill",             "#0094ca"),
+        "email_sent":    ("bi-envelope-check-fill",     "#00984C"),
+        "email_error":   ("bi-envelope-x-fill",         "#dc2626"),
+        "bulk_upload":   ("bi-upload",                  "#0094ca"),
+    }
     audit_rows = ""
     for a in audits:
-        audit_rows += f"""<tr>
+        _ah_icon, _ah_clr = _AH_ICONS.get(a["event_type"], ("bi-circle", "#94a3b8"))
+        _ah_label = a['event_type'].replace('_', ' ').title()
+        _ah_bg = "background:#f0f9ff" if a["event_type"] == "stage_skipped" else ""
+        audit_rows += f"""<tr style="{_ah_bg}">
   <td style="font-size:12px;color:#64748b">{a['timestamp']}</td>
-  <td style="font-size:12.5px;font-weight:500">{a['event_type'].replace('_',' ').title()}</td>
+  <td style="font-size:12.5px;font-weight:500">
+    <i class="bi {_ah_icon}" style="color:{_ah_clr};margin-right:4px"></i>{_ah_label}
+  </td>
   <td style="font-size:12.5px">{a['detail'] or ''}</td>
   <td style="font-size:12px;color:#94a3b8">{a['user_name'] or 'system'}</td>
 </tr>"""
@@ -3900,10 +6078,10 @@ def bulk_advance():
         for c in pcases:
             rows += f"""<tr>
   <td><input type="checkbox" name="case_ids" value="{c['id']}" class="form-check-input case-cb"></td>
-  <td class="id-cell">{c['application_id']}</td>
-  <td>{c['organisation_name']}</td>
-  <td>{c['current_stage']}</td>
-  <td style="font-size:12px;color:#94a3b8">{c['stage_start_date']}</td>
+  <td class="id-cell">{h(c['application_id'])}</td>
+  <td>{h(c['organisation_name'])}</td>
+  <td>{h(c['current_stage'])}</td>
+  <td style="font-size:12px;color:#94a3b8">{h(c['stage_start_date'])}</td>
 </tr>"""
         case_list_html += f"""
 <div class="mb-3">
@@ -4023,6 +6201,7 @@ def quick_advance_post():
 def search():
     q = request.args.get("q", "").strip()
     bid = user_board_id()
+    ph_progs = user_programme_names()
     results = []
     if q:
         conn = get_db()
@@ -4032,6 +6211,13 @@ def search():
         if bid is not None:
             base += " AND board_id=?"
             params.append(bid)
+        if ph_progs is not None:
+            if ph_progs:
+                placeholders = ",".join("?" * len(ph_progs))
+                base += f" AND programme_name IN ({placeholders})"
+                params.extend(ph_progs)
+            else:
+                base += " AND 1=0"
         base += " LIMIT 50"
         results = [dict(r) for r in conn.execute(base, params).fetchall()]
         conn.close()
@@ -4051,13 +6237,13 @@ def search():
         else:
             badge = f'<span class="pill pill-ok">On Track·{elapsed}d</span>'
         rows += f"""<tr>
-  <td class="id-cell">{c['application_id']}</td>
-  <td>{c['organisation_name']}</td>
-  <td style="font-size:12px;color:#64748b">{c['programme_name']}</td>
-  <td>{c['current_stage']}</td>
+  <td class="id-cell">{h(c['application_id'])}</td>
+  <td>{h(c['organisation_name'])}</td>
+  <td style="font-size:12px;color:#64748b">{h(c['programme_name'])}</td>
+  <td>{h(c['current_stage'])}</td>
   <td>{badge}</td>
   <td><a href="/edit-case/{c['id']}" class="btn btn-sm btn-action btn-outline-primary me-1">Edit</a>
-      <a href="/case-history/{c['application_id']}" class="btn btn-sm btn-action btn-outline-secondary">History</a></td>
+      <a href="/case-history/{h(c['application_id'])}" class="btn btn-sm btn-action btn-outline-secondary">History</a></td>
 </tr>"""
 
     content = f"""
@@ -4088,15 +6274,30 @@ def search():
 def reports():
     conn = get_db()
     bid = user_board_id()
+    ph_progs = user_programme_names()
     today = date.today()
 
     if bid is not None:
-        cases = [dict(r) for r in conn.execute(
-            "SELECT * FROM case_tracking WHERE board_id=?", (bid,)
-        ).fetchall()]
-        history = [dict(r) for r in conn.execute(
-            "SELECT * FROM stage_history WHERE board_id=? ORDER BY timestamp DESC", (bid,)
-        ).fetchall()]
+        if ph_progs is not None:
+            # program_head: filter by mapped programmes within board
+            if ph_progs:
+                placeholders = ",".join("?" * len(ph_progs))
+                cases = [dict(r) for r in conn.execute(
+                    f"SELECT * FROM case_tracking WHERE board_id=? AND programme_name IN ({placeholders})",
+                    [bid] + ph_progs
+                ).fetchall()]
+                history = [dict(r) for r in conn.execute(
+                    "SELECT * FROM stage_history WHERE board_id=? ORDER BY timestamp DESC", (bid,)
+                ).fetchall()]
+            else:
+                cases, history = [], []
+        else:
+            cases = [dict(r) for r in conn.execute(
+                "SELECT * FROM case_tracking WHERE board_id=?", (bid,)
+            ).fetchall()]
+            history = [dict(r) for r in conn.execute(
+                "SELECT * FROM stage_history WHERE board_id=? ORDER BY timestamp DESC", (bid,)
+            ).fetchall()]
     else:
         cases = [dict(r) for r in conn.execute("SELECT * FROM case_tracking").fetchall()]
         history = [dict(r) for r in conn.execute(
@@ -4268,21 +6469,246 @@ def reports():
     return render_page(content, active_page="reports", page_title="Analytics & Reports")
 
 
-# ── Multi-sheet Excel Export ──────────────────────────────────────────────────
-@app.route("/export-excel")
-@login_required
-def export_excel():
-    if not HAS_XLSX:
-        flash("openpyxl not installed.", "error")
-        return redirect(url_for("dashboard"))
+def _export_csv_filtered():
+    """CSV export helper called from export_excel when fmt=csv."""
     conn = get_db()
     bid = user_board_id()
+    ph_progs = user_programme_names()
+    today = date.today()
+    prog_filter = request.form.getlist("prog_filter")
+    case_status_f = request.form.get("case_status", "")
+    date_from = request.form.get("date_from", "")
+    date_to = request.form.get("date_to", "")
+    q = "SELECT * FROM case_tracking WHERE 1=1"
+    params = []
+    if bid is not None:
+        q += " AND board_id=?"; params.append(bid)
+    if case_status_f:
+        q += " AND (status=? OR (status IS NULL AND ?='Active'))"; params += [case_status_f, case_status_f]
+    if date_from:
+        q += " AND stage_start_date >= ?"; params.append(date_from)
+    if date_to:
+        q += " AND stage_start_date <= ?"; params.append(date_to)
+    cases = [dict(r) for r in conn.execute(q, params).fetchall()]
+    conn.close()
+    if prog_filter:
+        cases = [c for c in cases if c["programme_name"] in prog_filter]
+    if ph_progs is not None:
+        cases = [c for c in cases if c["programme_name"] in ph_progs]
+    output = io.StringIO()
+    w = csv.writer(output)
+    w.writerow(["Application ID","Organisation","Programme","Stage","Owner Type",
+                "Action Owner","Email","Stage Start","TAT Days","Days Elapsed",
+                "SLA Status","Case Status","R1 Sent","R2 Sent","Overdue Sent","Follow-ups"])
+    for c in cases:
+        elapsed = working_days_elapsed(c["stage_start_date"], today)
+        tat = c["tat_days"]
+        if c["is_milestone"]: sla = "Milestone"
+        elif tat > 0 and elapsed >= tat: sla = "Overdue"
+        elif tat > 0 and elapsed >= c.get("reminder2_day", 0): sla = "At Risk"
+        else: sla = "On Track"
+        w.writerow([c["application_id"], c["organisation_name"], c["programme_name"],
+                    c["current_stage"], c["owner_type"] or "", c["action_owner_name"] or "",
+                    c["action_owner_email"] or "", c["stage_start_date"], tat, elapsed,
+                    sla, c.get("status","Active"),
+                    "Yes" if c["r1_sent"] else "No", "Yes" if c["r2_sent"] else "No",
+                    "Yes" if c["overdue_sent"] else "No", c["overdue_count"]])
+    return Response(output.getvalue(), mimetype="text/csv",
+                    headers={"Content-Disposition": f"attachment;filename=qci_report_{today}.csv"})
+
+
+# ── Export Report Config Page ─────────────────────────────────────────────────
+@app.route("/export-excel", methods=["GET"])
+@login_required
+def export_excel_page():
+    """Show export configuration form."""
+    conn = get_db()
+    bid = user_board_id()
+    ph_progs = user_programme_names()
+    if bid is not None:
+        programmes = [r[0] for r in conn.execute(
+            "SELECT DISTINCT programme_name FROM programmes WHERE board_id=? ORDER BY programme_name", (bid,)
+        ).fetchall()]
+        stages = [r[0] for r in conn.execute(
+            "SELECT DISTINCT stage_name FROM programme_config WHERE board_id=? ORDER BY stage_name", (bid,)
+        ).fetchall()]
+    else:
+        programmes = [r[0] for r in conn.execute(
+            "SELECT DISTINCT programme_name FROM programmes ORDER BY programme_name"
+        ).fetchall()]
+        stages = [r[0] for r in conn.execute(
+            "SELECT DISTINCT stage_name FROM programme_config ORDER BY stage_name"
+        ).fetchall()]
+    if ph_progs is not None:
+        programmes = [p for p in programmes if p in ph_progs]
+    conn.close()
+
+    prog_checkboxes = "".join(
+        f'<div class="form-check"><input class="form-check-input" type="checkbox" name="prog_filter" value="{p}" id="p_{i}" checked>'
+        f'<label class="form-check-label" for="p_{i}" style="font-size:12px">{p}</label></div>'
+        for i, p in enumerate(programmes)
+    )
+    status_opts = "".join(
+        f'<div class="form-check"><input class="form-check-input" type="checkbox" name="status_filter" value="{s}" checked>'
+        f'<label class="form-check-label" style="font-size:12px">{s}</label></div>'
+        for s in ["Active", "Closed", "Withdrawn", "Suspended", "All"]
+    )
+
+    col_opts = ""
+    for col_id, col_label in [
+        ("app_id","Application ID"),("org","Organisation"),("programme","Programme"),
+        ("stage","Current Stage"),("owner_type","Owner Type"),("owner_name","Action Owner"),
+        ("owner_email","Owner Email"),("po_email","PO Email"),("stage_start","Stage Start"),
+        ("tat","TAT Days"),("elapsed","Days Elapsed"),("sla_status","SLA Status"),
+        ("r1","R1 Sent"),("r2","R2 Sent"),("overdue","Overdue Sent"),("followups","Follow-ups"),
+        ("case_status","Case Status"),
+    ]:
+        col_opts += (f'<div class="form-check form-check-inline">'
+                     f'<input class="form-check-input" type="checkbox" name="cols" value="{col_id}" id="c_{col_id}" checked>'
+                     f'<label class="form-check-label" for="c_{col_id}" style="font-size:12px">{col_label}</label></div>')
+
+    content = f"""
+<div class="row g-4">
+  <div class="col-lg-8">
+    <form method="post" action="/export-excel/download">
+      <div class="card mb-4">
+        <div class="card-header"><i class="bi bi-funnel" style="color:var(--accent)"></i> Filter Data</div>
+        <div class="card-body p-4">
+          <div class="row g-3">
+            <div class="col-md-6">
+              <label class="form-label">Date Range (Stage Start)</label>
+              <div class="d-flex gap-2">
+                <input type="date" class="form-control form-control-sm" name="date_from" placeholder="From">
+                <input type="date" class="form-control form-control-sm" name="date_to" placeholder="To">
+              </div>
+            </div>
+            <div class="col-md-3">
+              <label class="form-label">Case Status</label>
+              <select class="form-select form-select-sm" name="case_status">
+                <option value="">All</option>
+                <option>Active</option><option>Closed</option>
+                <option>Withdrawn</option><option>Suspended</option>
+              </select>
+            </div>
+            <div class="col-md-3">
+              <label class="form-label">SLA Status</label>
+              <select class="form-select form-select-sm" name="sla_status">
+                <option value="">All</option>
+                <option>On Track</option><option>At Risk</option>
+                <option>Overdue</option><option>Milestone</option>
+              </select>
+            </div>
+          </div>
+          <div class="mt-3">
+            <label class="form-label">Programmes
+              <button type="button" class="btn btn-xs ms-2" style="font-size:10px;padding:1px 6px;border:1px solid #cbd5e1"
+                      onclick="document.querySelectorAll('[name=prog_filter]').forEach(c=>c.checked=true)">All</button>
+              <button type="button" class="btn btn-xs ms-1" style="font-size:10px;padding:1px 6px;border:1px solid #cbd5e1"
+                      onclick="document.querySelectorAll('[name=prog_filter]').forEach(c=>c.checked=false)">None</button>
+            </label>
+            <div class="row g-1">{prog_checkboxes or '<span style="color:#94a3b8;font-size:12px">No programmes available.</span>'}</div>
+          </div>
+        </div>
+      </div>
+
+      <div class="card mb-4">
+        <div class="card-header"><i class="bi bi-table" style="color:#7c3aed"></i> Columns to Include</div>
+        <div class="card-body p-4">
+          <button type="button" class="btn btn-xs mb-2" style="font-size:11px;padding:2px 8px;border:1px solid #cbd5e1"
+                  onclick="document.querySelectorAll('[name=cols]').forEach(c=>c.checked=true)">Select All</button>
+          <button type="button" class="btn btn-xs mb-2 ms-1" style="font-size:11px;padding:2px 8px;border:1px solid #cbd5e1"
+                  onclick="document.querySelectorAll('[name=cols]').forEach(c=>c.checked=false)">Deselect All</button>
+          <div>{col_opts}</div>
+        </div>
+      </div>
+
+      <div class="card mb-4">
+        <div class="card-header"><i class="bi bi-file-earmark-excel" style="color:#059669"></i> Export Format</div>
+        <div class="card-body p-4">
+          <div class="d-flex gap-3">
+            <div class="form-check">
+              <input class="form-check-input" type="radio" name="fmt" value="xlsx" id="fmtXlsx" checked>
+              <label class="form-check-label" for="fmtXlsx">Excel (.xlsx) — multi-sheet with formatting</label>
+            </div>
+            <div class="form-check">
+              <input class="form-check-input" type="radio" name="fmt" value="csv" id="fmtCsv">
+              <label class="form-check-label" for="fmtCsv">CSV — simple flat file</label>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <button type="submit" class="btn btn-primary px-5">
+        <i class="bi bi-download"></i> Generate &amp; Download Report
+      </button>
+    </form>
+  </div>
+
+  <div class="col-lg-4">
+    <div class="card" style="position:sticky;top:72px">
+      <div class="card-header"><i class="bi bi-info-circle" style="color:#0891b2"></i> About This Export</div>
+      <div class="card-body p-4" style="font-size:13px;color:#475569">
+        <p>Select the filters and columns you need, then click <strong>Generate &amp; Download</strong>.</p>
+        <ul style="font-size:12px">
+          <li><strong>Excel (.xlsx)</strong> — includes Active Cases, Stage History, and Audit Log sheets with colour-coded headers.</li>
+          <li><strong>CSV</strong> — flat file, easy to open in any spreadsheet tool.</li>
+          <li>Data is scoped to your board/programmes.</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+</div>"""
+    return render_page(content, active_page="export_excel", page_title="Export Report")
+
+
+# ── Multi-sheet Excel Export (download) ───────────────────────────────────────
+@app.route("/export-excel/download", methods=["POST"])
+@login_required
+def export_excel():
+    """Handles parameterised export — filters applied from POST form."""
+    fmt = request.form.get("fmt", "xlsx")
+    if fmt == "csv":
+        return _export_csv_filtered()
+
+    if not HAS_XLSX:
+        flash("openpyxl not installed.", "error")
+        return redirect(url_for("export_excel_page"))
+    conn = get_db()
+    bid = user_board_id()
+    ph_progs = user_programme_names()
     today = date.today()
 
+    # Build filter conditions from POST params
+    prog_filter = request.form.getlist("prog_filter")
+    case_status_f = request.form.get("case_status", "")
+    sla_status_f = request.form.get("sla_status", "")
+    date_from = request.form.get("date_from", "")
+    date_to = request.form.get("date_to", "")
+    selected_cols = set(request.form.getlist("cols")) or {
+        "app_id","org","programme","stage","owner_type","owner_name",
+        "stage_start","tat","elapsed","sla_status","case_status"
+    }
+
+    q = "SELECT * FROM case_tracking WHERE 1=1"
+    params = []
     if bid is not None:
-        cases = [dict(r) for r in conn.execute(
-            "SELECT * FROM case_tracking WHERE board_id=?", (bid,)
-        ).fetchall()]
+        q += " AND board_id=?"; params.append(bid)
+    if case_status_f:
+        q += " AND (status=? OR (status IS NULL AND ?='Active'))"; params += [case_status_f, case_status_f]
+    if date_from:
+        q += " AND stage_start_date >= ?"; params.append(date_from)
+    if date_to:
+        q += " AND stage_start_date <= ?"; params.append(date_to)
+
+    cases = [dict(r) for r in conn.execute(q, params).fetchall()]
+
+    # Filter by programme
+    if prog_filter:
+        cases = [c for c in cases if c["programme_name"] in prog_filter]
+    if ph_progs is not None:
+        cases = [c for c in cases if c["programme_name"] in ph_progs]
+
+    if bid is not None:
         history = [dict(r) for r in conn.execute(
             "SELECT * FROM stage_history WHERE board_id=? ORDER BY timestamp DESC LIMIT 2000", (bid,)
         ).fetchall()]
@@ -4290,7 +6716,6 @@ def export_excel():
             "SELECT * FROM audit_log WHERE board_id=? ORDER BY id DESC LIMIT 2000", (bid,)
         ).fetchall()]
     else:
-        cases = [dict(r) for r in conn.execute("SELECT * FROM case_tracking").fetchall()]
         history = [dict(r) for r in conn.execute(
             "SELECT * FROM stage_history ORDER BY timestamp DESC LIMIT 2000"
         ).fetchall()]
@@ -4311,6 +6736,10 @@ def export_excel():
             c["status"] = "At Risk"
         else:
             c["status"] = "On Track"
+
+    # Apply SLA status filter
+    if sla_status_f:
+        cases = [c for c in cases if c.get("status") == sla_status_f]
 
     wb = openpyxl.Workbook()
 
@@ -4489,9 +6918,9 @@ def system_settings():
         if action == "save_scheduler":
             hour = int(request.form.get("sched_hour", 8))
             minute = int(request.form.get("sched_minute", 0))
-            set_app_setting("sched_hour", str(hour))
-            set_app_setting("sched_minute", str(minute))
-            # Reschedule
+            set_app_setting("scheduler_hour", str(hour))    # key must match startup read
+            set_app_setting("scheduler_minute", str(minute))
+            # Reschedule live
             try:
                 scheduler.reschedule_job("daily_check", trigger="cron",
                                          hour=hour, minute=minute)
@@ -4531,12 +6960,46 @@ def system_settings():
             conn.close()
             flash("User will be required to reset password on next login.", "success")
 
-    sched_hour   = int(get_app_setting("sched_hour", "8"))
-    sched_minute = int(get_app_setting("sched_minute", "0"))
+        elif action == "add_holiday":
+            hdate = request.form.get("holiday_date", "").strip()
+            hname = request.form.get("holiday_name", "").strip()
+            if hdate and hname:
+                conn = get_db()
+                try:
+                    conn.execute("INSERT INTO holidays (holiday_date, name) VALUES (?,?)", (hdate, hname))
+                    conn.commit()
+                    flash(f"Holiday '{hname}' on {hdate} added.", "success")
+                except Exception as e:
+                    flash(f"Error: {e}", "error")
+                conn.close()
+
+        elif action == "delete_holiday":
+            hid = request.form.get("holiday_id")
+            conn = get_db()
+            conn.execute("DELETE FROM holidays WHERE id=?", (hid,))
+            conn.commit()
+            conn.close()
+            flash("Holiday removed.", "success")
+
+        elif action == "save_digest":
+            set_app_setting("digest_enabled", "1" if request.form.get("digest_enabled") else "0")
+            set_app_setting("ph_escalation_days", request.form.get("ph_escalation_days", "5"))
+            flash("Notification settings saved.", "success")
+            try:
+                scheduler.reschedule_job("weekly_digest", trigger="cron",
+                                         day_of_week="mon", hour=8, minute=0)
+            except Exception:
+                pass
+
+    sched_hour   = int(get_app_setting("scheduler_hour", "8"))
+    sched_minute = int(get_app_setting("scheduler_minute", "0"))
     webhook_url  = get_app_setting("webhook_url", "")
+    digest_enabled = get_app_setting("digest_enabled", "1") == "1"
+    ph_escalation_days = get_app_setting("ph_escalation_days", "5")
 
     conn = get_db()
     users = [dict(r) for r in conn.execute("SELECT id, username, totp_secret, force_password_reset FROM users ORDER BY username").fetchall()]
+    holidays_list = [dict(r) for r in conn.execute("SELECT * FROM holidays ORDER BY holiday_date").fetchall()]
     conn.close()
 
     user_rows = ""
@@ -4572,6 +7035,16 @@ def system_settings():
         for h in range(24)
     )
 
+    holiday_rows = "".join(
+        f'<tr><td style="font-size:13px">{h["holiday_date"]}</td><td style="font-size:13px">{h["name"]}</td>'
+        f'<td><form method="post" class="d-inline">'
+        f'<input type="hidden" name="action" value="delete_holiday">'
+        f'<input type="hidden" name="holiday_id" value="{h["id"]}">'
+        f'<button class="btn btn-sm btn-action btn-outline-danger" type="submit"><i class="bi bi-trash"></i></button>'
+        f'</form></td></tr>'
+        for h in holidays_list
+    ) or '<tr><td colspan="3" style="text-align:center;color:#94a3b8;padding:16px;font-size:13px">No custom holidays added (built-in Indian holidays are always applied)</td></tr>'
+
     content = f"""
 <div class="row g-4">
   <div class="col-lg-5">
@@ -4598,6 +7071,36 @@ def system_settings():
       </div>
     </div>
 
+    <div class="card mb-4">
+      <div class="card-header"><i class="bi bi-envelope-at" style="color:#00984C"></i> Notifications &amp; Digest</div>
+      <div class="card-body p-4">
+        <form method="post">
+          <input type="hidden" name="action" value="save_digest">
+          <div class="mb-3 d-flex align-items-center gap-3">
+            <div class="form-check form-switch mb-0">
+              <input class="form-check-input" type="checkbox" name="digest_enabled"
+                     {"checked" if digest_enabled else ""} id="digestSwitch">
+              <label class="form-check-label" for="digestSwitch" style="font-size:13px">
+                Weekly Digest Email (Board CEO &amp; Admin — every Monday)
+              </label>
+            </div>
+          </div>
+          <div class="mb-3">
+            <label class="form-label" style="font-size:12px">
+              Programme Head Escalation Threshold (days overdue)
+            </label>
+            <input type="number" class="form-control" name="ph_escalation_days"
+                   value="{ph_escalation_days}" min="1" max="30"
+                   style="width:100px">
+            <div style="font-size:11px;color:#94a3b8;margin-top:4px">
+              Email Programme Head when a case is this many days past TAT.
+            </div>
+          </div>
+          <button class="btn btn-primary w-100" type="submit">Save Settings</button>
+        </form>
+      </div>
+    </div>
+
     <div class="card">
       <div class="card-header"><i class="bi bi-send-arrow-up" style="color:#7c3aed"></i> Outbound Webhook</div>
       <div class="card-body p-4">
@@ -4619,6 +7122,53 @@ def system_settings():
   </div>
 
   <div class="col-lg-7">
+    <div class="card mb-4">
+      <div class="card-header d-flex justify-content-between align-items-center">
+        <span><i class="bi bi-calendar3-event" style="color:#d97706"></i> Holiday Calendar</span>
+        <span style="font-size:11px;color:#94a3b8">TAT calculation skips these + weekends</span>
+      </div>
+      <div class="card-body p-4">
+        <form method="post" class="row g-2 mb-3">
+          <input type="hidden" name="action" value="add_holiday">
+          <div class="col-5">
+            <input type="date" class="form-control form-control-sm" name="holiday_date" required>
+          </div>
+          <div class="col-5">
+            <input type="text" class="form-control form-control-sm" name="holiday_name"
+                   placeholder="e.g. Diwali" required>
+          </div>
+          <div class="col-2">
+            <button class="btn btn-sm btn-success w-100" type="submit">Add</button>
+          </div>
+        </form>
+        <div style="max-height:220px;overflow-y:auto">
+          <table class="data-table">
+            <thead><tr><th>Date</th><th>Name</th><th style="width:40px"></th></tr></thead>
+            <tbody>{holiday_rows}</tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
+    <div class="card mb-4">
+      <div class="card-header"><i class="bi bi-plug-fill" style="color:#0094ca"></i> SMTP Connection Test</div>
+      <div class="card-body p-4">
+        <div class="row g-2 mb-2">
+          <div class="col-6"><input type="email" class="form-control form-control-sm" id="test_smtp_user" placeholder="sender@gmail.com"></div>
+          <div class="col-6"><input type="password" class="form-control form-control-sm" id="test_smtp_pass" placeholder="App password"></div>
+        </div>
+        <div class="row g-2 mb-3">
+          <div class="col-5"><input type="text" class="form-control form-control-sm" id="test_smtp_host" value="smtp.gmail.com"></div>
+          <div class="col-3"><input type="number" class="form-control form-control-sm" id="test_smtp_port" value="587"></div>
+          <div class="col-4"><input type="email" class="form-control form-control-sm" id="test_smtp_to" placeholder="Test recipient"></div>
+        </div>
+        <button class="btn btn-primary btn-sm" onclick="testSmtp()" id="smtpTestBtn">
+          <i class="bi bi-send"></i> Send Test Email
+        </button>
+        <div id="smtpTestResult" style="font-size:13px;margin-top:10px"></div>
+      </div>
+    </div>
+
     <div class="card">
       <div class="card-header"><i class="bi bi-shield-lock-fill" style="color:#7c3aed"></i> User Security</div>
       <div style="overflow-x:auto">
@@ -4630,7 +7180,71 @@ def system_settings():
     </div>
   </div>
 </div>"""
-    return render_page(content, active_page="system", page_title="System Settings")
+    scripts = """<script>
+function testSmtp(){
+  var btn = document.getElementById('smtpTestBtn');
+  btn.innerHTML = '<span class="spinner-border spinner-border-sm"></span> Testing…';
+  btn.disabled = true;
+  fetch('/test-smtp', {
+    method: 'POST',
+    headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({
+      email: document.getElementById('test_smtp_user').value,
+      password: document.getElementById('test_smtp_pass').value,
+      host: document.getElementById('test_smtp_host').value,
+      port: parseInt(document.getElementById('test_smtp_port').value),
+      to: document.getElementById('test_smtp_to').value
+    })
+  }).then(r=>r.json()).then(d=>{
+    var res = document.getElementById('smtpTestResult');
+    if(d.ok){
+      res.innerHTML = '<span style="color:#00984C"><i class="bi bi-check-circle-fill"></i> Test email sent successfully!</span>';
+    } else {
+      res.innerHTML = '<span style="color:#dc2626"><i class="bi bi-x-circle-fill"></i> Failed: ' + (d.error||'Unknown error') + '</span>';
+    }
+    btn.innerHTML = '<i class="bi bi-send"></i> Send Test Email';
+    btn.disabled = false;
+  }).catch(e=>{
+    document.getElementById('smtpTestResult').innerHTML = '<span style="color:#dc2626">Network error: '+e+'</span>';
+    btn.innerHTML = '<i class="bi bi-send"></i> Send Test Email';
+    btn.disabled = false;
+  });
+}
+</script>"""
+    return render_page(content, scripts, active_page="system", page_title="System Settings")
+
+
+@app.route("/test-smtp", methods=["POST"])
+@admin_required
+def test_smtp():
+    data = request.get_json()
+    if not data:
+        return jsonify({"ok": False, "error": "No data"})
+    sender = data.get("email", "").strip()
+    password = data.get("password", "").strip()
+    host = data.get("host", "smtp.gmail.com").strip()
+    port = int(data.get("port", 587))
+    to = data.get("to", "").strip() or sender
+    if not sender or not password:
+        return jsonify({"ok": False, "error": "Sender email and password required"})
+    try:
+        msg = MIMEMultipart()
+        msg["From"] = sender
+        msg["To"] = to
+        msg["Subject"] = "QCI Notify — SMTP Test"
+        msg.attach(MIMEText("This is a test email from QCI Notification Engine. SMTP is working correctly.", "plain"))
+        if port == 465:
+            with smtplib.SMTP_SSL(host, 465, timeout=15) as s:
+                s.login(sender, password)
+                s.sendmail(sender, [to], msg.as_string())
+        else:
+            with smtplib.SMTP(host, port, timeout=15) as s:
+                s.starttls()
+                s.login(sender, password)
+                s.sendmail(sender, [to], msg.as_string())
+        return jsonify({"ok": True})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)[:200]})
 
 
 # ── Database Backup ───────────────────────────────────────────────────────────
@@ -4645,52 +7259,390 @@ def backup_db():
     return redirect(url_for("system_settings"))
 
 
+@app.route("/export", methods=["GET", "POST"])
+@login_required
+def export_report():
+    """Parameterised export — choose filters then download."""
+    conn = get_db()
+    bid = user_board_id()
+    ph_progs = user_programme_names()
+
+    if bid is not None:
+        programmes = [r[0] for r in conn.execute(
+            "SELECT programme_name FROM programmes WHERE board_id=? ORDER BY programme_name", (bid,)
+        ).fetchall()]
+    else:
+        programmes = [r[0] for r in conn.execute(
+            "SELECT programme_name FROM programmes ORDER BY programme_name"
+        ).fetchall()]
+    if ph_progs is not None:
+        programmes = [p for p in programmes if p in ph_progs]
+
+    if request.method == "POST":
+        status_f   = request.form.get("status", "")
+        prog_f     = request.form.get("programme", "")
+        owner_f    = request.form.get("owner_type", "")
+        date_from  = request.form.get("date_from", "")
+        date_to    = request.form.get("date_to", "")
+
+        q = "SELECT * FROM case_tracking WHERE 1=1"
+        params = []
+        if bid is not None:
+            q += " AND board_id=?"
+            params.append(bid)
+        if ph_progs is not None and ph_progs:
+            placeholders = ",".join("?" * len(ph_progs))
+            q += f" AND programme_name IN ({placeholders})"
+            params.extend(ph_progs)
+        if status_f:
+            q += " AND status=?"
+            params.append(status_f)
+        if prog_f:
+            q += " AND programme_name=?"
+            params.append(prog_f)
+        if owner_f:
+            q += " AND owner_type=?"
+            params.append(owner_f)
+        if date_from:
+            q += " AND stage_start_date >= ?"
+            params.append(date_from)
+        if date_to:
+            q += " AND stage_start_date <= ?"
+            params.append(date_to)
+
+        cases = [dict(r) for r in conn.execute(q, params).fetchall()]
+        conn.close()
+        today = date.today()
+
+        headers_row = [
+            "Application ID", "Organisation", "Programme", "Stage", "Owner Type",
+            "Action Owner", "Email", "Stage Start", "TAT Days", "Days Elapsed",
+            "Case Status", "TAT Status", "Hold Days", "R1 Sent", "R2 Sent", "Overdue Sent", "Follow-ups"
+        ]
+        rows = []
+        for c in cases:
+            elapsed = working_days_elapsed(c["stage_start_date"], today, hold_days=c.get("hold_days", 0))
+            if c["is_milestone"]:
+                tat_status = "Milestone"
+            elif c.get("status") == "On Hold":
+                tat_status = "On Hold"
+            elif c["tat_days"] > 0 and elapsed >= c["tat_days"]:
+                tat_status = "Overdue"
+            elif c["tat_days"] > 0 and elapsed >= c.get("reminder2_day", 0):
+                tat_status = "At Risk"
+            else:
+                tat_status = "On Track"
+            rows.append([
+                c["application_id"], c["organisation_name"], c["programme_name"],
+                c["current_stage"], c["owner_type"] or "",
+                c["action_owner_name"] or "", c["action_owner_email"] or "",
+                c["stage_start_date"], c["tat_days"], elapsed,
+                c.get("status", "Active"), tat_status, c.get("hold_days", 0),
+                "Yes" if c["r1_sent"] else "No",
+                "Yes" if c["r2_sent"] else "No",
+                "Yes" if c["overdue_sent"] else "No", c["overdue_count"]
+            ])
+
+        fname_base = f"qci_export_{date.today()}"
+        output = io.StringIO()
+        w = csv.writer(output)
+        w.writerow(headers_row)
+        w.writerows(rows)
+        return Response(
+            output.getvalue(),
+            mimetype="text/csv",
+            headers={"Content-Disposition": f"attachment;filename={fname_base}.csv"}
+        )
+
+    conn.close()
+    prog_opts = '<option value="">All Programmes</option>' + "".join(
+        f'<option value="{p}">{p}</option>' for p in programmes
+    )
+    content = f"""
+<div class="row g-4 justify-content-center" style="max-width:700px;margin:0 auto">
+  <div class="col-12">
+    <div class="card">
+      <div class="card-header">
+        <i class="bi bi-file-earmark-spreadsheet" style="color:#059669"></i> Export Report
+        <span style="font-size:12px;color:#94a3b8;margin-left:8px">Configure filters then download</span>
+      </div>
+      <div class="card-body p-4">
+        <form method="post">
+          <div class="row g-3">
+            <div class="col-md-6">
+              <label class="form-label">Programme</label>
+              <select class="form-select" name="programme">{prog_opts}</select>
+            </div>
+            <div class="col-md-6">
+              <label class="form-label">Case Status</label>
+              <select class="form-select" name="status">
+                <option value="">All Statuses</option>
+                <option value="Active">Active</option>
+                <option value="On Hold">On Hold</option>
+                <option value="Closed">Closed</option>
+                <option value="Withdrawn">Withdrawn</option>
+                <option value="Suspended">Suspended</option>
+              </select>
+            </div>
+            <div class="col-md-6">
+              <label class="form-label">Owner Type</label>
+              <select class="form-select" name="owner_type">
+                <option value="">All Types</option>
+                <option value="Applicant">Applicant</option>
+                <option value="QCI">QCI</option>
+                <option value="Assessor">Assessor</option>
+                <option value="Hospital">Hospital</option>
+              </select>
+            </div>
+            <div class="col-md-3">
+              <label class="form-label">Stage Start From</label>
+              <input type="date" class="form-control" name="date_from">
+            </div>
+            <div class="col-md-3">
+              <label class="form-label">Stage Start To</label>
+              <input type="date" class="form-control" name="date_to">
+            </div>
+            <div class="col-12 pt-2">
+              <button type="submit" class="btn btn-success">
+                <i class="bi bi-download"></i> Download CSV
+              </button>
+            </div>
+          </div>
+        </form>
+      </div>
+    </div>
+  </div>
+</div>"""
+    return render_page(content, active_page="export", page_title="Export Report")
+
+
 @app.route("/export-dashboard")
 @login_required
 def export_dashboard():
-    """Export current dashboard data as CSV download."""
+    return redirect(url_for("export_report"))
+
+
+# ── Inbound REST API ──────────────────────────────────────────────────────────
+@app.route("/api/v1/cases/advance", methods=["POST"])
+def api_advance_case():
+    """Inbound API: advance a case to a new stage.
+    Auth: X-API-Key header.
+    Body JSON: {application_id, stage_name, stage_start_date, action_owner_name,
+                action_owner_email, organisation_name, programme_name, changed_by}
+    """
+    api_key = _verify_api_key(request)
+    if not api_key:
+        return jsonify({"ok": False, "error": "Invalid or missing API key"}), 401
+    data = request.get_json(silent=True) or {}
+    required = ["application_id", "stage_name", "programme_name"]
+    missing = [f for f in required if not data.get(f)]
+    if missing:
+        return jsonify({"ok": False, "error": f"Missing fields: {', '.join(missing)}"}), 400
+
+    # ── IDOR fix: verify programme belongs to the API key's board ──────────────
+    if api_key.get("board_id"):
+        _conn = get_db()
+        _prog_row = _conn.execute(
+            "SELECT id FROM programmes WHERE programme_name=? AND board_id=?",
+            (data["programme_name"].strip(), api_key["board_id"])
+        ).fetchone()
+        _conn.close()
+        if not _prog_row:
+            return jsonify({"ok": False,
+                            "error": "Programme not found or not authorised for this API key"}), 403
+
+    try:
+        upsert_data = {
+            "application_id":     data["application_id"].strip(),
+            "organisation_name":  data.get("organisation_name", "").strip(),
+            "programme_name":     data["programme_name"].strip(),
+            "stage_name":         data["stage_name"].strip(),
+            "stage_start_date":   data.get("stage_start_date", date.today().isoformat()),
+            "action_owner_name":  data.get("action_owner_name", "").strip(),
+            "action_owner_email": data.get("action_owner_email", "").strip(),
+            "program_officer_email": data.get("program_officer_email", "").strip(),
+            "_changed_by":        data.get("changed_by", "API"),
+            "_force_advance":     True,
+        }
+        action = upsert_case(upsert_data)
+        return jsonify({"ok": True, "action": action, "application_id": data["application_id"]})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
+
+
+@app.route("/api/v1/cases/<app_id>", methods=["GET"])
+def api_get_case(app_id):
+    """Inbound API: get case details."""
+    api_key = _verify_api_key(request)
+    if not api_key:
+        return jsonify({"ok": False, "error": "Invalid or missing API key"}), 401
     conn = get_db()
-    bid = user_board_id()
-    q = "SELECT * FROM case_tracking"
+    case = conn.execute(
+        "SELECT * FROM case_tracking WHERE application_id=?", (app_id,)
+    ).fetchone()
+    conn.close()
+    if not case:
+        return jsonify({"ok": False, "error": "Case not found"}), 404
+    c = dict(case)
+    c["days_elapsed"] = working_days_elapsed(c["stage_start_date"], hold_days=c.get("hold_days", 0))
+    return jsonify({"ok": True, "case": c})
+
+
+@app.route("/api/v1/cases", methods=["GET"])
+def api_list_cases():
+    """Inbound API: list cases, optionally filtered by programme."""
+    api_key = _verify_api_key(request)
+    if not api_key:
+        return jsonify({"ok": False, "error": "Invalid or missing API key"}), 401
+    conn = get_db()
+    q = "SELECT * FROM case_tracking WHERE 1=1"
     params = []
-    if bid is not None:
-        q += " WHERE board_id=?"
-        params.append(bid)
+    if api_key.get("board_id"):
+        q += " AND board_id=?"
+        params.append(api_key["board_id"])
+    if request.args.get("programme"):
+        q += " AND programme_name=?"
+        params.append(request.args["programme"])
+    if request.args.get("status"):
+        q += " AND status=?"
+        params.append(request.args["status"])
+    q += " LIMIT 200"
     cases = [dict(r) for r in conn.execute(q, params).fetchall()]
     conn.close()
     today = date.today()
-
-    output = io.StringIO()
-    w = csv.writer(output)
-    w.writerow([
-        "Application ID", "Organisation", "Programme", "Stage", "Owner Type",
-        "Action Owner", "Email", "Stage Start", "TAT Days", "Days Elapsed",
-        "Status", "R1 Sent", "R2 Sent", "Overdue Sent", "Follow-ups"
-    ])
     for c in cases:
-        elapsed = working_days_elapsed(c["stage_start_date"], today)
-        if c["is_milestone"]:
-            status = "Milestone"
-        elif c["tat_days"] > 0 and elapsed >= c["tat_days"]:
-            status = "Overdue"
-        elif c["tat_days"] > 0 and elapsed >= c["reminder2_day"]:
-            status = "At Risk"
-        else:
-            status = "On Track"
-        w.writerow([
-            c["application_id"], c["organisation_name"], c["programme_name"],
-            c["current_stage"], c["owner_type"] or "",
-            c["action_owner_name"] or "", c["action_owner_email"] or "",
-            c["stage_start_date"], c["tat_days"], elapsed,
-            status, "Yes" if c["r1_sent"] else "No",
-            "Yes" if c["r2_sent"] else "No",
-            "Yes" if c["overdue_sent"] else "No", c["overdue_count"]
-        ])
-    return Response(
-        output.getvalue(),
-        mimetype="text/csv",
-        headers={"Content-Disposition": f"attachment;filename=qci_dashboard_{today}.csv"}
-    )
+        c["days_elapsed"] = working_days_elapsed(c["stage_start_date"], today, hold_days=c.get("hold_days", 0))
+    return jsonify({"ok": True, "count": len(cases), "cases": cases})
+
+
+@app.route("/api-keys", methods=["GET", "POST"])
+@admin_required
+def manage_api_keys():
+    conn = get_db()
+    if request.method == "POST":
+        action = request.form.get("action")
+        if action == "create":
+            raw_key = secrets.token_urlsafe(32)
+            key_hash = hashlib.sha256(raw_key.encode()).hexdigest()
+            name = request.form.get("name", "Unnamed Key").strip()
+            board_id = request.form.get("board_id") or None
+            conn.execute(
+                "INSERT INTO api_keys (key_hash, name, board_id, created_at) VALUES (?,?,?,?)",
+                (key_hash, name, board_id, datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+            )
+            conn.commit()
+            flash(f"API key created. Copy it now — it won't be shown again: {raw_key}", "success")
+        elif action == "revoke":
+            conn.execute("UPDATE api_keys SET is_active=0 WHERE id=?", (request.form["key_id"],))
+            conn.commit()
+            flash("API key revoked.", "success")
+
+    keys = [dict(r) for r in conn.execute(
+        "SELECT id, name, board_id, created_at, last_used, is_active FROM api_keys ORDER BY id DESC"
+    ).fetchall()]
+    boards = [dict(r) for r in conn.execute("SELECT id, board_name FROM boards ORDER BY board_name").fetchall()]
+    conn.close()
+
+    board_opts = "".join(f'<option value="{b["id"]}">{b["board_name"]}</option>' for b in boards)
+    key_rows = ""
+    for k in keys:
+        status_badge = '<span class="badge bg-success">Active</span>' if k["is_active"] else '<span class="badge bg-secondary">Revoked</span>'
+        revoke_btn = f'''<form method="post" style="display:inline">
+          <input type="hidden" name="action" value="revoke">
+          <input type="hidden" name="key_id" value="{k["id"]}">
+          <button class="btn btn-sm btn-outline-danger" style="font-size:11px"
+                  {"disabled" if not k["is_active"] else ""}
+                  onclick="return confirm('Revoke this key?')">Revoke</button>
+        </form>''' if k["is_active"] else ""
+        key_rows += f"""<tr>
+          <td style="font-weight:600">{k["name"]}</td>
+          <td style="font-size:12px;color:#64748b">{k["created_at"]}</td>
+          <td style="font-size:12px;color:#64748b">{k["last_used"] or "Never"}</td>
+          <td>{status_badge}</td>
+          <td>{revoke_btn}</td>
+        </tr>"""
+
+    content = f"""
+<div class="row g-4">
+  <div class="col-lg-8">
+    <div class="card">
+      <div class="card-header d-flex justify-content-between align-items-center">
+        <span><i class="bi bi-key-fill" style="color:#2563eb"></i> API Keys</span>
+        <span style="font-size:12px;color:#94a3b8">Use X-API-Key header for all requests</span>
+      </div>
+      <div class="card-body p-0">
+        <table class="data-table">
+          <thead><tr><th>Name</th><th>Created</th><th>Last Used</th><th>Status</th><th>Action</th></tr></thead>
+          <tbody>{key_rows if key_rows else '<tr><td colspan="5" style="text-align:center;padding:30px;color:#94a3b8">No API keys yet.</td></tr>'}</tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+  <div class="col-lg-4">
+    <div class="card">
+      <div class="card-header"><i class="bi bi-plus-circle" style="color:#059669"></i> Generate New Key</div>
+      <div class="card-body p-4">
+        <form method="post">
+          <input type="hidden" name="action" value="create">
+          <div class="mb-3">
+            <label class="form-label">Key Name / Description</label>
+            <input type="text" class="form-control" name="name" placeholder="e.g. NABH Portal Integration" required>
+          </div>
+          <div class="mb-3">
+            <label class="form-label">Board Scope (optional)</label>
+            <select class="form-select" name="board_id">
+              <option value="">All Boards</option>
+              {board_opts}
+            </select>
+          </div>
+          <div style="background:#fef9c3;border:1px solid #fde68a;border-radius:8px;padding:10px 12px;font-size:11px;color:#92400e;margin-bottom:16px">
+            <i class="bi bi-exclamation-triangle-fill"></i> The key is shown ONCE after creation. Store it securely.
+          </div>
+          <button class="btn btn-primary w-100">Generate Key</button>
+        </form>
+      </div>
+    </div>
+    <div class="card mt-3">
+      <div class="card-header"><i class="bi bi-code-slash" style="color:#7c3aed"></i> API Reference</div>
+      <div class="card-body p-3" style="font-size:12px">
+        <strong>Advance a case:</strong>
+        <pre style="background:#f8fafc;padding:8px;border-radius:6px;font-size:10px;overflow-x:auto">POST /api/v1/cases/advance
+X-API-Key: your-key-here
+Content-Type: application/json
+
+{{
+  "application_id": "NABH-001",
+  "programme_name": "NABH Full...",
+  "stage_name": "Document Review",
+  "organisation_name": "ABC Hospital",
+  "changed_by": "NABH Portal"
+}}</pre>
+        <strong>Get case:</strong>
+        <pre style="background:#f8fafc;padding:8px;border-radius:6px;font-size:10px">GET /api/v1/cases/NABH-001
+X-API-Key: your-key-here</pre>
+      </div>
+    </div>
+  </div>
+</div>"""
+    return render_page(content, active_page="api_keys", page_title="API Keys")
+
+
+@app.route("/healthz")
+def healthz():
+    """Public health-check — shows DB path and user count for diagnosis."""
+    try:
+        conn = get_db()
+        user_count = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+        admin_exists = conn.execute("SELECT 1 FROM users WHERE username='admin'").fetchone() is not None
+        conn.close()
+        return jsonify({
+            "status": "ok",
+            "db_path": DATABASE_URL[:30] + "..." if DATABASE_URL else "not set",
+            "user_count": user_count,
+            "admin_exists": admin_exists,
+        })
+    except Exception as e:
+        return jsonify({"status": "error", "detail": str(e)}), 500
 
 
 @app.route("/run-check")
