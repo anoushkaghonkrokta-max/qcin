@@ -4234,27 +4234,35 @@ def settings():
                 if session.get("role") == "board_admin" and prog_board_id != session.get("board_id"):
                     flash("Cannot add stages to a programme in another board.", "error")
                 else:
-                    try:
-                        conn.execute(
-                            """INSERT INTO programme_config
-                               (programme_name,stage_name,stage_order,tat_days,reminder1_day,
-                                reminder2_day,owner_type,overdue_interval_days,is_milestone,is_optional,board_id)
-                               VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
-                            (pname, sname,
-                             int(request.form.get("stage_order", 1)),
-                             int(request.form.get("tat_days", 0)),
-                             int(request.form.get("reminder1_day", 0)),
-                             int(request.form.get("reminder2_day", 0)),
-                             request.form.get("owner_type") or None,
-                             int(request.form.get("overdue_interval_days", 3)),
-                             1 if request.form.get("is_milestone") else 0,
-                             1 if request.form.get("is_optional") else 0,
-                             prog_board_id),
-                        )
-                        conn.commit()
-                        flash(f"Stage '{sname}' added to {pname}.", "success")
-                    except Exception as e:
-                        flash(f"Error: {e}", "error")
+                    _new_order = int(request.form.get("stage_order", 1))
+                    _dup = conn.execute(
+                        "SELECT id FROM programme_config WHERE programme_name=? AND stage_order=?",
+                        (pname, _new_order)
+                    ).fetchone()
+                    if _dup:
+                        flash(f"Stage order #{_new_order} already exists in '{pname}'. Choose a different order number.", "error")
+                    else:
+                        try:
+                            conn.execute(
+                                """INSERT INTO programme_config
+                                   (programme_name,stage_name,stage_order,tat_days,reminder1_day,
+                                    reminder2_day,owner_type,overdue_interval_days,is_milestone,is_optional,board_id)
+                                   VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+                                (pname, sname,
+                                 _new_order,
+                                 int(request.form.get("tat_days", 0)),
+                                 int(request.form.get("reminder1_day", 0)),
+                                 int(request.form.get("reminder2_day", 0)),
+                                 request.form.get("owner_type") or None,
+                                 int(request.form.get("overdue_interval_days", 3)),
+                                 1 if request.form.get("is_milestone") else 0,
+                                 1 if request.form.get("is_optional") else 0,
+                                 prog_board_id),
+                            )
+                            conn.commit()
+                            flash(f"Stage '{sname}' added to {pname}.", "success")
+                        except Exception as e:
+                            flash(f"Error: {e}", "error")
 
         elif action == "delete_board":
             if session.get("role") != "super_admin":
@@ -4332,6 +4340,115 @@ def settings():
                         )
                         conn.commit()
                         flash(f"Stage '{sname_del}' deleted.", "success")
+
+        elif action == "update_stage":
+            sid = request.form.get("stage_id", "").strip()
+            if not sid:
+                flash("Stage ID missing.", "error")
+            else:
+                stage_row = conn.execute(
+                    "SELECT programme_name, board_id FROM programme_config WHERE id=?", (sid,)
+                ).fetchone()
+                if not stage_row:
+                    flash("Stage not found.", "error")
+                elif session.get("role") == "board_admin" and stage_row["board_id"] != session.get("board_id"):
+                    flash("Cannot edit stages from another board.", "error")
+                else:
+                    _us_name = request.form.get("stage_name", "").strip()
+                    _us_order = int(request.form.get("stage_order", 1))
+                    # Check duplicate order (excluding self)
+                    _dup2 = conn.execute(
+                        "SELECT id FROM programme_config WHERE programme_name=? AND stage_order=? AND id!=?",
+                        (stage_row["programme_name"], _us_order, sid)
+                    ).fetchone()
+                    if not _us_name:
+                        flash("Stage name is required.", "error")
+                    elif _dup2:
+                        flash(f"Stage order #{_us_order} is already used by another stage in this programme.", "error")
+                    else:
+                        try:
+                            conn.execute(
+                                """UPDATE programme_config SET
+                                   stage_name=?, stage_order=?, tat_days=?, reminder1_day=?,
+                                   reminder2_day=?, owner_type=?, overdue_interval_days=?,
+                                   is_milestone=?, is_optional=?
+                                   WHERE id=?""",
+                                (_us_name,
+                                 _us_order,
+                                 int(request.form.get("tat_days", 0)),
+                                 int(request.form.get("reminder1_day", 0)),
+                                 int(request.form.get("reminder2_day", 0)),
+                                 request.form.get("owner_type") or None,
+                                 int(request.form.get("overdue_interval_days", 3)),
+                                 1 if request.form.get("is_milestone") else 0,
+                                 1 if request.form.get("is_optional") else 0,
+                                 sid)
+                            )
+                            conn.commit()
+                            flash(f"Stage '{_us_name}' updated.", "success")
+                        except Exception as e:
+                            flash(f"Error updating stage: {e}", "error")
+
+        elif action == "copy_stages":
+            src_prog = request.form.get("source_programme", "").strip()
+            dst_prog = request.form.get("dest_programme", "").strip()
+            overwrite = request.form.get("overwrite_existing") == "1"
+            if not src_prog or not dst_prog:
+                flash("Source and destination programmes are required.", "error")
+            elif src_prog == dst_prog:
+                flash("Source and destination cannot be the same programme.", "error")
+            else:
+                dst_row = conn.execute(
+                    "SELECT id, board_id FROM programmes WHERE programme_name=?", (dst_prog,)
+                ).fetchone()
+                if not dst_row:
+                    flash("Destination programme not found.", "error")
+                elif session.get("role") == "board_admin" and dst_row["board_id"] != session.get("board_id"):
+                    flash("Cannot copy stages to a programme in another board.", "error")
+                else:
+                    src_stages = conn.execute(
+                        "SELECT * FROM programme_config WHERE programme_name=? ORDER BY stage_order",
+                        (src_prog,)
+                    ).fetchall()
+                    if not src_stages:
+                        flash(f"Source programme '{src_prog}' has no stages to copy.", "error")
+                    else:
+                        if overwrite:
+                            conn.execute(
+                                "DELETE FROM programme_config WHERE programme_name=?", (dst_prog,)
+                            )
+                            conn.commit()
+                        copied = 0
+                        skipped = 0
+                        for _ss in src_stages:
+                            _exist = conn.execute(
+                                "SELECT id FROM programme_config WHERE programme_name=? AND stage_order=?",
+                                (dst_prog, _ss["stage_order"])
+                            ).fetchone()
+                            if _exist and not overwrite:
+                                skipped += 1
+                                continue
+                            try:
+                                conn.execute(
+                                    """INSERT INTO programme_config
+                                       (programme_name, stage_name, stage_order, tat_days,
+                                        reminder1_day, reminder2_day, owner_type,
+                                        overdue_interval_days, is_milestone, is_optional, board_id)
+                                       VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+                                    (dst_prog, _ss["stage_name"], _ss["stage_order"],
+                                     _ss["tat_days"], _ss["reminder1_day"], _ss["reminder2_day"],
+                                     _ss["owner_type"], _ss["overdue_interval_days"],
+                                     _ss["is_milestone"], _ss["is_optional"],
+                                     dst_row["board_id"])
+                                )
+                                copied += 1
+                            except Exception:
+                                skipped += 1
+                        conn.commit()
+                        msg = f"Copied {copied} stage(s) from '{src_prog}' to '{dst_prog}'."
+                        if skipped:
+                            msg += f" {skipped} skipped (order conflict)."
+                        flash(msg, "success")
 
         elif action == "update_schedule":
             if session.get("role") != "super_admin":
@@ -4476,6 +4593,16 @@ def settings():
                     stage_flags += '<span style="background:#e0f2fe;color:#0369a1;font-size:10px;padding:1px 6px;border-radius:4px;margin-left:4px"><i class="bi bi-skip-forward-fill"></i> Optional</span>'
                 sname_js = s["stage_name"].replace("'", "\\'").replace('"', '&quot;')
                 if is_ba:
+                    _es_owner_js = (s["owner_type"] or "").replace("'", "\\'")
+                    edit_stage_btn = (
+                        f'<button class="btn btn-sm btn-outline-primary py-0 px-1 me-1" style="font-size:11px" '
+                        f'title="Edit stage" '
+                        f'onclick="editStage({s["id"]}, {json.dumps(s["stage_name"])}, {s["stage_order"]}, '
+                        f'{s["tat_days"]}, {s["reminder1_day"]}, {s["reminder2_day"]}, '
+                        f'{json.dumps(s["owner_type"] or "")}, {s["overdue_interval_days"]}, '
+                        f'{s["is_milestone"]}, {int(s.get("is_optional", 0))})">'
+                        f'<i class="bi bi-pencil"></i></button>'
+                    )
                     del_stage_btn = (
                         f'<form method="post" style="display:inline" '
                         f'onsubmit="return confirm(\'Delete stage &quot;{sname_js}&quot;?\')">'
@@ -4486,6 +4613,7 @@ def settings():
                         f'<i class="bi bi-trash"></i></button></form>'
                     )
                 else:
+                    edit_stage_btn = ""
                     del_stage_btn = ""
                 stages_rows += f"""<tr>
                   <td style="color:#94a3b8;font-size:12px">{s["stage_order"]}</td>
@@ -4495,10 +4623,10 @@ def settings():
                   <td style="text-align:center;color:#d97706">{s["reminder2_day"] or "—"}</td>
                   <td>{s["owner_type"] or "—"}</td>
                   <td style="text-align:center">{s["overdue_interval_days"]}</td>
-                  <td>{del_stage_btn}</td>
+                  <td style="white-space:nowrap">{edit_stage_btn}{del_stage_btn}</td>
                 </tr>"""
             th_center = 'style="text-align:center"'
-            del_col_header = '<th style="width:40px"></th>' if is_ba else ''
+            del_col_header = '<th style="width:72px"></th>' if is_ba else ''
             if stages:
                 stages_table_html = (
                     '<div style="overflow-x:auto"><table class="data-table"><thead><tr>'
@@ -4874,6 +5002,53 @@ def settings():
         </div>
       </div>
     </div>
+
+    <div class="card mt-3">
+      <div class="card-header d-flex justify-content-between align-items-center" style="cursor:pointer"
+           onclick="togglePanel('copyStageBody')">
+        <span><i class="bi bi-copy" style="color:#7c3aed"></i> Copy Stages from Programme</span>
+        <i class="bi bi-chevron-down" style="color:#94a3b8"></i>
+      </div>
+      <div id="copyStageBody" style="display:none">
+        <div class="card-body p-3">
+          <p style="font-size:12px;color:#64748b;margin-bottom:12px">
+            Clone all stages (TAT, reminders, owner) from one programme into another.
+            Useful when creating a new programme with a similar workflow.
+          </p>
+          <form method="post">
+            <input type="hidden" name="action" value="copy_stages">
+            <div class="mb-2">
+              <label class="form-label" style="font-size:12px">
+                <i class="bi bi-box-arrow-right" style="color:#059669"></i> Source Programme <span style="color:#94a3b8">(copy from)</span>
+              </label>
+              <select class="form-select form-select-sm" name="source_programme" required>
+                <option value="">— select —</option>
+                {prog_opts}
+              </select>
+            </div>
+            <div class="mb-2">
+              <label class="form-label" style="font-size:12px">
+                <i class="bi bi-box-arrow-in-right" style="color:#2563eb"></i> Destination Programme <span style="color:#94a3b8">(copy to)</span>
+              </label>
+              <select class="form-select form-select-sm" name="dest_programme" required>
+                <option value="">— select —</option>
+                {prog_opts}
+              </select>
+            </div>
+            <div class="form-check mb-3">
+              <input class="form-check-input" type="checkbox" name="overwrite_existing" value="1" id="overwriteChk">
+              <label class="form-check-label" style="font-size:12px" for="overwriteChk">
+                Replace existing stages in destination
+              </label>
+            </div>
+            <button class="btn btn-sm btn-primary w-100" type="submit"
+                    onclick="return confirm('Copy all stages from the source? If overwrite is checked, existing stages in the destination will be replaced.')">
+              <i class="bi bi-copy"></i> Copy Stages
+            </button>
+          </form>
+        </div>
+      </div>
+    </div>
   </div>
 
   <div class="col-lg-8">
@@ -4884,10 +5059,103 @@ def settings():
   </div>
 </div>
 """
-    scripts = """<script>
+    scripts = """
+<!-- Edit Stage Modal -->
+<div class="modal fade" id="editStageModal" tabindex="-1">
+  <div class="modal-dialog modal-dialog-centered">
+    <div class="modal-content">
+      <div class="modal-header" style="background:#f8fafc;border-bottom:1px solid #e2e8f0">
+        <h6 class="modal-title" style="font-weight:600">
+          <i class="bi bi-pencil-square" style="color:#2563eb"></i> Edit Stage
+        </h6>
+        <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+      </div>
+      <form method="post" id="editStageForm">
+        <input type="hidden" name="action" value="update_stage">
+        <input type="hidden" name="stage_id" id="es_id">
+        <div class="modal-body">
+          <div class="mb-3">
+            <label class="form-label" style="font-size:12px;font-weight:600">Stage Name</label>
+            <input type="text" class="form-control form-control-sm" name="stage_name" id="es_name" required>
+          </div>
+          <div class="row g-2 mb-3">
+            <div class="col-4">
+              <label class="form-label" style="font-size:12px;font-weight:600">Order #</label>
+              <input type="number" class="form-control form-control-sm" name="stage_order" id="es_order" min="1">
+            </div>
+            <div class="col-4">
+              <label class="form-label" style="font-size:12px;font-weight:600">TAT Days</label>
+              <input type="number" class="form-control form-control-sm" name="tat_days" id="es_tat" min="0">
+            </div>
+            <div class="col-4">
+              <label class="form-label" style="font-size:12px;font-weight:600">OD Interval</label>
+              <input type="number" class="form-control form-control-sm" name="overdue_interval_days" id="es_odi" min="1">
+            </div>
+          </div>
+          <div class="row g-2 mb-3">
+            <div class="col-6">
+              <label class="form-label" style="font-size:12px;font-weight:600">R1 Reminder Day</label>
+              <input type="number" class="form-control form-control-sm" name="reminder1_day" id="es_r1" min="0">
+            </div>
+            <div class="col-6">
+              <label class="form-label" style="font-size:12px;font-weight:600">R2 Reminder Day</label>
+              <input type="number" class="form-control form-control-sm" name="reminder2_day" id="es_r2" min="0">
+            </div>
+          </div>
+          <div class="mb-3">
+            <label class="form-label" style="font-size:12px;font-weight:600">Owner Type</label>
+            <select class="form-select form-select-sm" name="owner_type" id="es_owner">
+              <option value="">—</option>
+              <option>Applicant</option>
+              <option>Assessor</option>
+              <option>Program Officer</option>
+            </select>
+          </div>
+          <div class="d-flex gap-4">
+            <div class="form-check">
+              <input class="form-check-input" type="checkbox" name="is_milestone" id="es_ms">
+              <label class="form-check-label" style="font-size:12px" for="es_ms">
+                <i class="bi bi-flag-fill" style="color:#7c3aed;font-size:11px"></i> Milestone <span style="color:#94a3b8">(no emails)</span>
+              </label>
+            </div>
+            <div class="form-check">
+              <input class="form-check-input" type="checkbox" name="is_optional" id="es_opt">
+              <label class="form-check-label" style="font-size:12px" for="es_opt">
+                <i class="bi bi-skip-forward-fill" style="color:#0891b2;font-size:11px"></i> Optional <span style="color:#94a3b8">(can skip)</span>
+              </label>
+            </div>
+          </div>
+        </div>
+        <div class="modal-footer" style="background:#f8fafc;border-top:1px solid #e2e8f0">
+          <button type="button" class="btn btn-sm btn-outline-secondary" data-bs-dismiss="modal">Cancel</button>
+          <button type="submit" class="btn btn-sm btn-primary">
+            <i class="bi bi-check-lg"></i> Save Changes
+          </button>
+        </div>
+      </form>
+    </div>
+  </div>
+</div>
+<script>
 function togglePanel(id){
   var el = document.getElementById(id);
   el.style.display = el.style.display === 'none' ? '' : 'none';
+}
+function editStage(id, name, order, tat, r1, r2, owner, odi, ms, opt) {
+  document.getElementById('es_id').value = id;
+  document.getElementById('es_name').value = name;
+  document.getElementById('es_order').value = order;
+  document.getElementById('es_tat').value = tat;
+  document.getElementById('es_r1').value = r1;
+  document.getElementById('es_r2').value = r2;
+  document.getElementById('es_odi').value = odi;
+  var ownerSel = document.getElementById('es_owner');
+  for (var i = 0; i < ownerSel.options.length; i++) {
+    ownerSel.options[i].selected = (ownerSel.options[i].value === owner);
+  }
+  document.getElementById('es_ms').checked = (ms == 1);
+  document.getElementById('es_opt').checked = (opt == 1);
+  new bootstrap.Modal(document.getElementById('editStageModal')).show();
 }
 </script>"""
     return render_page(content, scripts, active_page="settings",
