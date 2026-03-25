@@ -424,6 +424,7 @@ def init_db():
             owner_type           TEXT,
             overdue_interval_days INTEGER NOT NULL DEFAULT 3,
             is_milestone         INTEGER NOT NULL DEFAULT 0,
+            is_optional          INTEGER NOT NULL DEFAULT 0,
             sender_email         TEXT,
             sender_password      TEXT,
             smtp_host            TEXT NOT NULL DEFAULT 'smtp.gmail.com',
@@ -569,6 +570,7 @@ def init_db():
         "ALTER TABLE case_tracking ADD COLUMN hold_days INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE case_tracking ADD COLUMN hold_start_date TEXT",
         "ALTER TABLE audit_log ADD COLUMN entry_hash TEXT",
+        "ALTER TABLE programme_config ADD COLUMN is_optional INTEGER NOT NULL DEFAULT 0",
     ]:
         try:
             conn.execute(sql)
@@ -617,58 +619,58 @@ def board_admin_required(f):
 
 # ── Seed data ────────────────────────────────────────────────────────────────
 _SEED_STAGES = [
-    ("NABH Full Accreditation Hospitals", "Application In Progress", 1, 30, 15, 25, "Applicant", 3, 0),
-    ("NABH Full Accreditation Hospitals", "Application Fee Pending", 2, 10, 5, 8, "Applicant", 3, 0),
-    ("NABH Full Accreditation Hospitals", "Application Fee Paid", 3, 0, 0, 0, None, 0, 1),
-    ("NABH Full Accreditation Hospitals", "DR Allocated", 4, 3, 1, 2, "Program Officer", 1, 0),
-    ("NABH Full Accreditation Hospitals", "DR In Progress", 5, 10, 5, 7, "Assessor", 3, 0),
-    ("NABH Full Accreditation Hospitals", "DR NC Response", 6, 20, 10, 15, "Applicant", 3, 0),
-    ("NABH Full Accreditation Hospitals", "DR NC Review", 7, 10, 5, 7, "Assessor", 3, 0),
-    ("NABH Full Accreditation Hospitals", "DR Approval by NABH", 8, 3, 1, 2, "Program Officer", 1, 0),
-    ("NABH Full Accreditation Hospitals", "Assessment selection (if applicable)", 9, 5, 2, 4, "Applicant", 3, 0),
-    ("NABH Full Accreditation Hospitals", "PA Allocation", 10, 20, 10, 15, "Program Officer", 1, 0),
-    ("NABH Full Accreditation Hospitals", "PA date Accepted by Assessor", 11, 7, 3, 5, "Assessor", 3, 0),
-    ("NABH Full Accreditation Hospitals", "PA Scheduled", 12, 5, 2, 4, "Applicant", 1, 0),
-    ("NABH Full Accreditation Hospitals", "PA completed", 13, 3, 1, 2, "Assessor", 1, 0),
-    ("NABH Full Accreditation Hospitals", "PA Feedback", 14, 2, 1, 999, "Applicant", 1, 0),
-    ("NABH Full Accreditation Hospitals", "PA NC Response 1", 15, 50, 30, 40, "Applicant", 3, 0),
-    ("NABH Full Accreditation Hospitals", "PA NC Review 1", 16, 10, 5, 7, "Assessor", 3, 0),
-    ("NABH Full Accreditation Hospitals", "PA NC Response 2", 17, 30, 10, 20, "Applicant", 3, 0),
-    ("NABH Full Accreditation Hospitals", "PA NC Review 2", 18, 10, 5, 7, "Assessor", 3, 0),
-    ("NABH Full Accreditation Hospitals", "1st Annual Fee Pending", 19, 10, 5, 8, "Applicant", 3, 0),
-    ("NABH Full Accreditation Hospitals", "1st Annual Fee Paid", 20, 0, 0, 0, None, 0, 1),
-    ("NABH Full Accreditation Hospitals", "OA Allocated", 21, 20, 10, 15, "Program Officer", 1, 0),
-    ("NABH Full Accreditation Hospitals", "OA date Accepted by Assessor", 22, 7, 3, 5, "Assessor", 3, 0),
-    ("NABH Full Accreditation Hospitals", "OA Scheduled", 23, 5, 3, 4, "Applicant", 3, 0),
-    ("NABH Full Accreditation Hospitals", "OA completed", 24, 3, 1, 2, "Assessor", 2, 0),
-    ("NABH Full Accreditation Hospitals", "OA Feedback", 25, 2, 1, 999, "Applicant", 1, 0),
-    ("NABH Full Accreditation Hospitals", "OA NC Response 1", 26, 50, 30, 40, "Applicant", 3, 0),
-    ("NABH Full Accreditation Hospitals", "OA NC Review 1", 27, 10, 5, 7, "Assessor", 3, 0),
-    ("NABH Full Accreditation Hospitals", "OA NC Response 2", 28, 30, 10, 20, "Applicant", 3, 0),
-    ("NABH Full Accreditation Hospitals", "OA NC Review 2", 29, 10, 5, 7, "Assessor", 3, 0),
-    ("NABH Full Accreditation Hospitals", "OA NC Accepted", 30, 0, 0, 0, None, 0, 1),
-    ("NABH Full Accreditation Hospitals", "AC Allocated", 31, 15, 7, 10, "Program Officer", 2, 0),
-    ("NABH Full Accreditation Hospitals", "AC Document Pending", 32, 90, 30, 60, "Applicant", 3, 0),
-    ("NABH Full Accreditation Hospitals", "Pending Document Submitted", 33, 0, 0, 0, None, 0, 1),
-    ("NABH Full Accreditation Hospitals", "Accredited/ Accredited Renewed", 34, 30, 15, 20, "Program Officer", 1, 0),
-    ("NABH Full Accreditation Hospitals", "2nd Annual Fee Payment", 35, 90, 1, 10, "Applicant", 3, 0),
-    ("NABH Full Accreditation Hospitals", "2nd Annual Fee Paid", 36, 0, 0, 0, None, 0, 1),
-    ("NABH Full Accreditation Hospitals", "SA due", 37, 30, 15, 20, "Program Officer", 3, 0),
-    ("NABH Full Accreditation Hospitals", "SA - OA Allocated", 38, 20, 10, 15, "Program Officer", 1, 0),
-    ("NABH Full Accreditation Hospitals", "SA - OA date Accepted by Assessor", 39, 7, 3, 5, "Assessor", 3, 0),
-    ("NABH Full Accreditation Hospitals", "SA - OA Scheduled", 40, 5, 3, 4, "Applicant", 3, 0),
-    ("NABH Full Accreditation Hospitals", "SA - OA completed", 41, 3, 1, 2, "Assessor", 2, 0),
-    ("NABH Full Accreditation Hospitals", "SA - OA Feedback", 42, 2, 1, 999, "Applicant", 1, 0),
-    ("NABH Full Accreditation Hospitals", "SA - OA NC Response 1", 43, 25, 15, 20, "Applicant", 3, 0),
-    ("NABH Full Accreditation Hospitals", "SA - OA NC Review 1", 44, 10, 5, 7, "Assessor", 3, 0),
-    ("NABH Full Accreditation Hospitals", "SA - OA NC Response 2", 45, 15, 7, 10, "Applicant", 3, 0),
-    ("NABH Full Accreditation Hospitals", "SA - OA NC Review 2", 46, 10, 5, 7, "Assessor", 3, 0),
-    ("NABH Full Accreditation Hospitals", "SA - OA NC Accepted", 47, 0, 0, 0, None, 0, 1),
-    ("NABH Full Accreditation Hospitals", "SA - AC Allocated", 48, 15, 7, 10, "Program Officer", 2, 0),
-    ("NABH Full Accreditation Hospitals", "Accredited Continued", 49, 30, 15, 20, "Program Officer", 1, 0),
-    ("NABH Full Accreditation Hospitals", "3rd Annual Fee Payment", 50, 90, 1, 10, "Applicant", 3, 0),
-    ("NABH Full Accreditation Hospitals", "4th Annual Fee Payment", 51, 90, 1, 10, "Applicant", 3, 0),
-    ("NABH Full Accreditation Hospitals", "Renewal", 52, 90, 30, 60, "Applicant", 3, 0),
+    ("NABH Full Accreditation Hospitals", "Application In Progress", 1, 30, 15, 25, "Applicant", 3, 0, 0),
+    ("NABH Full Accreditation Hospitals", "Application Fee Pending", 2, 10, 5, 8, "Applicant", 3, 0, 0),
+    ("NABH Full Accreditation Hospitals", "Application Fee Paid", 3, 0, 0, 0, None, 0, 1, 0),
+    ("NABH Full Accreditation Hospitals", "DR Allocated", 4, 3, 1, 2, "Program Officer", 1, 0, 0),
+    ("NABH Full Accreditation Hospitals", "DR In Progress", 5, 10, 5, 7, "Assessor", 3, 0, 0),
+    ("NABH Full Accreditation Hospitals", "DR NC Response", 6, 20, 10, 15, "Applicant", 3, 0, 0),
+    ("NABH Full Accreditation Hospitals", "DR NC Review", 7, 10, 5, 7, "Assessor", 3, 0, 0),
+    ("NABH Full Accreditation Hospitals", "DR Approval by NABH", 8, 3, 1, 2, "Program Officer", 1, 0, 0),
+    ("NABH Full Accreditation Hospitals", "Assessment selection (if applicable)", 9, 5, 2, 4, "Applicant", 3, 0, 0),
+    ("NABH Full Accreditation Hospitals", "PA Allocation", 10, 20, 10, 15, "Program Officer", 1, 0, 0),
+    ("NABH Full Accreditation Hospitals", "PA date Accepted by Assessor", 11, 7, 3, 5, "Assessor", 3, 0, 0),
+    ("NABH Full Accreditation Hospitals", "PA Scheduled", 12, 5, 2, 4, "Applicant", 1, 0, 0),
+    ("NABH Full Accreditation Hospitals", "PA completed", 13, 3, 1, 2, "Assessor", 1, 0, 0),
+    ("NABH Full Accreditation Hospitals", "PA Feedback", 14, 2, 1, 999, "Applicant", 1, 0, 0),
+    ("NABH Full Accreditation Hospitals", "PA NC Response 1", 15, 50, 30, 40, "Applicant", 3, 0, 0),
+    ("NABH Full Accreditation Hospitals", "PA NC Review 1", 16, 10, 5, 7, "Assessor", 3, 0, 0),
+    ("NABH Full Accreditation Hospitals", "PA NC Response 2", 17, 30, 10, 20, "Applicant", 3, 0, 0),
+    ("NABH Full Accreditation Hospitals", "PA NC Review 2", 18, 10, 5, 7, "Assessor", 3, 0, 0),
+    ("NABH Full Accreditation Hospitals", "1st Annual Fee Pending", 19, 10, 5, 8, "Applicant", 3, 0, 0),
+    ("NABH Full Accreditation Hospitals", "1st Annual Fee Paid", 20, 0, 0, 0, None, 0, 1, 0),
+    ("NABH Full Accreditation Hospitals", "OA Allocated", 21, 20, 10, 15, "Program Officer", 1, 0, 0),
+    ("NABH Full Accreditation Hospitals", "OA date Accepted by Assessor", 22, 7, 3, 5, "Assessor", 3, 0, 0),
+    ("NABH Full Accreditation Hospitals", "OA Scheduled", 23, 5, 3, 4, "Applicant", 3, 0, 0),
+    ("NABH Full Accreditation Hospitals", "OA completed", 24, 3, 1, 2, "Assessor", 2, 0, 0),
+    ("NABH Full Accreditation Hospitals", "OA Feedback", 25, 2, 1, 999, "Applicant", 1, 0, 0),
+    ("NABH Full Accreditation Hospitals", "OA NC Response 1", 26, 50, 30, 40, "Applicant", 3, 0, 0),
+    ("NABH Full Accreditation Hospitals", "OA NC Review 1", 27, 10, 5, 7, "Assessor", 3, 0, 0),
+    ("NABH Full Accreditation Hospitals", "OA NC Response 2", 28, 30, 10, 20, "Applicant", 3, 0, 0),
+    ("NABH Full Accreditation Hospitals", "OA NC Review 2", 29, 10, 5, 7, "Assessor", 3, 0, 0),
+    ("NABH Full Accreditation Hospitals", "OA NC Accepted", 30, 0, 0, 0, None, 0, 1, 0),
+    ("NABH Full Accreditation Hospitals", "AC Allocated", 31, 15, 7, 10, "Program Officer", 2, 0, 0),
+    ("NABH Full Accreditation Hospitals", "AC Document Pending", 32, 90, 30, 60, "Applicant", 3, 0, 0),
+    ("NABH Full Accreditation Hospitals", "Pending Document Submitted", 33, 0, 0, 0, None, 0, 1, 0),
+    ("NABH Full Accreditation Hospitals", "Accredited/ Accredited Renewed", 34, 30, 15, 20, "Program Officer", 1, 0, 0),
+    ("NABH Full Accreditation Hospitals", "2nd Annual Fee Payment", 35, 90, 1, 10, "Applicant", 3, 0, 0),
+    ("NABH Full Accreditation Hospitals", "2nd Annual Fee Paid", 36, 0, 0, 0, None, 0, 1, 0),
+    ("NABH Full Accreditation Hospitals", "SA due", 37, 30, 15, 20, "Program Officer", 3, 0, 0),
+    ("NABH Full Accreditation Hospitals", "SA - OA Allocated", 38, 20, 10, 15, "Program Officer", 1, 0, 0),
+    ("NABH Full Accreditation Hospitals", "SA - OA date Accepted by Assessor", 39, 7, 3, 5, "Assessor", 3, 0, 0),
+    ("NABH Full Accreditation Hospitals", "SA - OA Scheduled", 40, 5, 3, 4, "Applicant", 3, 0, 0),
+    ("NABH Full Accreditation Hospitals", "SA - OA completed", 41, 3, 1, 2, "Assessor", 2, 0, 0),
+    ("NABH Full Accreditation Hospitals", "SA - OA Feedback", 42, 2, 1, 999, "Applicant", 1, 0, 0),
+    ("NABH Full Accreditation Hospitals", "SA - OA NC Response 1", 43, 25, 15, 20, "Applicant", 3, 0, 0),
+    ("NABH Full Accreditation Hospitals", "SA - OA NC Review 1", 44, 10, 5, 7, "Assessor", 3, 0, 0),
+    ("NABH Full Accreditation Hospitals", "SA - OA NC Response 2", 45, 15, 7, 10, "Applicant", 3, 0, 0),
+    ("NABH Full Accreditation Hospitals", "SA - OA NC Review 2", 46, 10, 5, 7, "Assessor", 3, 0, 0),
+    ("NABH Full Accreditation Hospitals", "SA - OA NC Accepted", 47, 0, 0, 0, None, 0, 1, 0),
+    ("NABH Full Accreditation Hospitals", "SA - AC Allocated", 48, 15, 7, 10, "Program Officer", 2, 0, 0),
+    ("NABH Full Accreditation Hospitals", "Accredited Continued", 49, 30, 15, 20, "Program Officer", 1, 0, 0),
+    ("NABH Full Accreditation Hospitals", "3rd Annual Fee Payment", 50, 90, 1, 10, "Applicant", 3, 0, 0),
+    ("NABH Full Accreditation Hospitals", "4th Annual Fee Payment", 51, 90, 1, 10, "Applicant", 3, 0, 0),
+    ("NABH Full Accreditation Hospitals", "Renewal", 52, 90, 30, 60, "Applicant", 3, 0, 0),
 ]
 
 _SEED_TEMPLATES = [
@@ -823,7 +825,7 @@ def seed_data():
             conn.execute(
                 "INSERT INTO programme_config "
                 "(programme_name,stage_name,stage_order,tat_days,reminder1_day,reminder2_day,"
-                "owner_type,overdue_interval_days,is_milestone,board_id) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                "owner_type,overdue_interval_days,is_milestone,is_optional,board_id) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
                 (*row, nabh_id),
             )
     if conn.execute("SELECT COUNT(*) FROM email_templates").fetchone()[0] == 0:
@@ -1251,16 +1253,25 @@ def upsert_case(data: dict) -> str:
                 if new_order < old_order:
                     conn.close()
                     raise ValueError(
-                        f"Cannot move backwards: '{new_stage}' (order {new_order}) is before "
-                        f"'{old_stage}' (order {old_order}). Only Board Admin can move backwards."
+                        f"Stage '{new_stage}' (order {new_order}) comes before "
+                        f"'{old_stage}' (order {old_order}). Cannot move backwards."
                     )
                 if new_order > old_order + 1:
-                    conn.close()
-                    raise ValueError(
-                        f"Cannot skip stages: '{new_stage}' (order {new_order}) skips "
-                        f"{new_order - old_order - 1} stage(s) after '{old_stage}' (order {old_order}). "
-                        f"Use 'Force Advance' or contact a Board Admin to skip stages."
-                    )
+                    # Check all intermediate stages are optional
+                    intermediates = conn.execute(
+                        "SELECT stage_name, is_optional FROM programme_config "
+                        "WHERE programme_name=? AND stage_order > ? AND stage_order < ? ORDER BY stage_order",
+                        (data["programme_name"], old_order, new_order)
+                    ).fetchall()
+                    non_optional = [r["stage_name"] for r in intermediates if not r["is_optional"]]
+                    if non_optional:
+                        conn.close()
+                        raise ValueError(
+                            f"Cannot skip required stage(s): {', '.join(non_optional)}. "
+                            f"Only optional stages may be skipped."
+                        )
+                    # Log skipped optional stages for audit
+                    data["_skipped_stages"] = [r["stage_name"] for r in intermediates]
         conn.execute(
             """UPDATE case_tracking SET
                programme_name=?, organisation_name=?, current_stage=?, stage_start_date=?,
@@ -1284,6 +1295,9 @@ def upsert_case(data: dict) -> str:
                                  data.get("_changed_by", ""), board_id)
             log_audit("stage_change", data["application_id"],
                       f"{old_stage} → {new_stage}", data.get("_changed_by", ""), board_id)
+            for _skipped in data.get("_skipped_stages", []):
+                log_audit("stage_skipped", data["application_id"],
+                          f"Optional stage skipped: {_skipped}", data.get("_changed_by", ""), board_id)
         else:
             log_audit("case_updated", data["application_id"],
                       f"Updated (stage: {new_stage})", data.get("_changed_by", ""), board_id)
@@ -3402,6 +3416,8 @@ def log_stage():
                 <div><span style="font-size:11px;color:#64748b">Owner</span><br><strong id="si_owner">—</strong></div>
                 <div id="si_ms_div" style="display:none"><span style="font-size:11px;color:#64748b">Type</span><br>
                   <span class="pill pill-milestone" style="font-size:11px"><i class="bi bi-flag-fill"></i> Milestone</span></div>
+                <div id="si_opt_div" style="display:none"><span style="font-size:11px;color:#64748b">Stage Type</span><br>
+                  <span style="background:#e0f2fe;color:#0369a1;font-size:11px;padding:2px 8px;border-radius:4px"><i class="bi bi-skip-forward-fill"></i> Optional — can be skipped</span></div>
               </div>
             </div>
           </div>
@@ -3464,6 +3480,7 @@ def log_stage():
           <li>If it's new, a <strong>new case</strong> is created.</li>
           <li>TAT, reminders, and owner type are pulled from the selected programme configuration.</li>
           <li>Milestone stages receive <strong>no emails</strong>.</li>
+          <li><i class="bi bi-skip-forward-fill" style="color:#0891b2"></i> <strong>Optional stages</strong> (marked ○) can be skipped — you may advance directly past them to the next required stage.</li>
           <li>The daily scheduler runs at the configured time (IST); change it in <strong>Settings → Scheduler Settings</strong>. Use Run Check on the dashboard to trigger immediately.</li>
         </ul>
         <div style="margin-top:16px;padding:12px 14px;background:#fff;border-radius:8px;border:1px solid #e2e8f0">
@@ -3494,7 +3511,7 @@ document.getElementById('progSelect').addEventListener('change', function(){
       _stageData = {};
       data.forEach(function(s){ _stageData[s.stage_name] = s; });
       sel.innerHTML = '<option value="">Select a stage…</option>' +
-        data.map(s=>'<option value="'+s.stage_name+'">'+(s.is_milestone ? '⬥ ' : '')+s.stage_name+'</option>').join('');
+        data.map(s=>'<option value="'+s.stage_name+'">'+(s.is_milestone ? '⬥ ' : '')+(s.is_optional ? '○ ' : '')+s.stage_name+(s.is_optional ? ' (optional)' : '')+'</option>').join('');
     });
 });
 document.getElementById('stageSelect').addEventListener('change', function(){
@@ -3505,7 +3522,8 @@ document.getElementById('stageSelect').addEventListener('change', function(){
   document.getElementById('si_r1').textContent    = s.reminder1_day || '—';
   document.getElementById('si_r2').textContent    = s.reminder2_day || '—';
   document.getElementById('si_owner').textContent = s.owner_type || '—';
-  document.getElementById('si_ms_div').style.display = s.is_milestone ? '' : 'none';
+  document.getElementById('si_ms_div').style.display  = s.is_milestone ? '' : 'none';
+  document.getElementById('si_opt_div').style.display = s.is_optional  ? '' : 'none';
   box.classList.add('show');
 });
 </script>"""
@@ -3529,7 +3547,7 @@ def api_stages():
             conn.close()
             return jsonify([])
     rows = conn.execute(
-        "SELECT stage_name, stage_order, is_milestone, tat_days, reminder1_day, reminder2_day, owner_type "
+        "SELECT stage_name, stage_order, is_milestone, is_optional, tat_days, reminder1_day, reminder2_day, owner_type "
         "FROM programme_config WHERE programme_name=? ORDER BY stage_order",
         (programme,),
     ).fetchall()
@@ -4118,8 +4136,8 @@ def settings():
                         conn.execute(
                             """INSERT INTO programme_config
                                (programme_name,stage_name,stage_order,tat_days,reminder1_day,
-                                reminder2_day,owner_type,overdue_interval_days,is_milestone,board_id)
-                               VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                                reminder2_day,owner_type,overdue_interval_days,is_milestone,is_optional,board_id)
+                               VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
                             (pname, sname,
                              int(request.form.get("stage_order", 1)),
                              int(request.form.get("tat_days", 0)),
@@ -4128,6 +4146,7 @@ def settings():
                              request.form.get("owner_type") or None,
                              int(request.form.get("overdue_interval_days", 3)),
                              1 if request.form.get("is_milestone") else 0,
+                             1 if request.form.get("is_optional") else 0,
                              prog_board_id),
                         )
                         conn.commit()
@@ -4348,7 +4367,11 @@ def settings():
             is_ba = session.get("role") in ("super_admin", "board_admin")
             stages_rows = ""
             for s in stages:
-                milestone_icon = '<i class="bi bi-flag-fill" style="color:#7c3aed;font-size:11px"></i> ' if s["is_milestone"] else ""
+                stage_flags = ""
+                if s["is_milestone"]:
+                    stage_flags += '<span style="background:#ede9fe;color:#5b21b6;font-size:10px;padding:1px 6px;border-radius:4px;margin-left:4px"><i class="bi bi-flag-fill"></i> Milestone</span>'
+                if s.get("is_optional"):
+                    stage_flags += '<span style="background:#e0f2fe;color:#0369a1;font-size:10px;padding:1px 6px;border-radius:4px;margin-left:4px"><i class="bi bi-skip-forward-fill"></i> Optional</span>'
                 sname_js = s["stage_name"].replace("'", "\\'").replace('"', '&quot;')
                 if is_ba:
                     del_stage_btn = (
@@ -4364,7 +4387,7 @@ def settings():
                     del_stage_btn = ""
                 stages_rows += f"""<tr>
                   <td style="color:#94a3b8;font-size:12px">{s["stage_order"]}</td>
-                  <td style="font-weight:500">{milestone_icon}{s["stage_name"]}</td>
+                  <td style="font-weight:500">{s["stage_name"]}{stage_flags}</td>
                   <td style="text-align:center">{s["tat_days"] or "—"}</td>
                   <td style="text-align:center;color:#2563eb">{s["reminder1_day"] or "—"}</td>
                   <td style="text-align:center;color:#d97706">{s["reminder2_day"] or "—"}</td>
@@ -4730,9 +4753,19 @@ def settings():
                 <option>Program Officer</option>
               </select>
             </div>
-            <div class="form-check mb-3">
-              <input class="form-check-input" type="checkbox" name="is_milestone" id="msCheck">
-              <label class="form-check-label" style="font-size:12px" for="msCheck">Milestone stage (no emails)</label>
+            <div class="d-flex gap-3 mb-3">
+              <div class="form-check">
+                <input class="form-check-input" type="checkbox" name="is_milestone" id="msCheck">
+                <label class="form-check-label" style="font-size:12px" for="msCheck">
+                  <i class="bi bi-flag-fill" style="color:#7c3aed;font-size:11px"></i> Milestone <span style="color:#94a3b8">(no emails)</span>
+                </label>
+              </div>
+              <div class="form-check">
+                <input class="form-check-input" type="checkbox" name="is_optional" id="optCheck">
+                <label class="form-check-label" style="font-size:12px" for="optCheck">
+                  <i class="bi bi-skip-forward-fill" style="color:#0891b2;font-size:11px"></i> Optional <span style="color:#94a3b8">(can skip)</span>
+                </label>
+              </div>
             </div>
             <button class="btn btn-sm btn-success w-100" type="submit">Add Stage</button>
           </form>
@@ -5115,6 +5148,7 @@ def audit_log_page():
         "case_updated": ("bi-pencil-fill", "#0094ca"),
         "case_closed":  ("bi-x-circle-fill", "#dc2626"),
         "stage_change": ("bi-arrow-right-circle-fill", "#7c3aed"),
+        "stage_skipped":("bi-skip-forward-fill",       "#0891b2"),
         "email_sent":   ("bi-envelope-check-fill", "#00984C"),
         "email_error":  ("bi-envelope-x-fill", "#dc2626"),
         "bulk_upload":  ("bi-upload", "#0094ca"),
@@ -5177,11 +5211,25 @@ def case_history(app_id):
   </div>
 </div>"""
 
+    _AH_ICONS = {
+        "stage_change":  ("bi-arrow-right-circle-fill", "#7c3aed"),
+        "stage_skipped": ("bi-skip-forward-fill",       "#0891b2"),
+        "case_created":  ("bi-plus-circle-fill",        "#00984C"),
+        "case_updated":  ("bi-pencil-fill",             "#0094ca"),
+        "email_sent":    ("bi-envelope-check-fill",     "#00984C"),
+        "email_error":   ("bi-envelope-x-fill",         "#dc2626"),
+        "bulk_upload":   ("bi-upload",                  "#0094ca"),
+    }
     audit_rows = ""
     for a in audits:
-        audit_rows += f"""<tr>
+        _ah_icon, _ah_clr = _AH_ICONS.get(a["event_type"], ("bi-circle", "#94a3b8"))
+        _ah_label = a['event_type'].replace('_', ' ').title()
+        _ah_bg = "background:#f0f9ff" if a["event_type"] == "stage_skipped" else ""
+        audit_rows += f"""<tr style="{_ah_bg}">
   <td style="font-size:12px;color:#64748b">{a['timestamp']}</td>
-  <td style="font-size:12.5px;font-weight:500">{a['event_type'].replace('_',' ').title()}</td>
+  <td style="font-size:12.5px;font-weight:500">
+    <i class="bi {_ah_icon}" style="color:{_ah_clr};margin-right:4px"></i>{_ah_label}
+  </td>
   <td style="font-size:12.5px">{a['detail'] or ''}</td>
   <td style="font-size:12px;color:#94a3b8">{a['user_name'] or 'system'}</td>
 </tr>"""
