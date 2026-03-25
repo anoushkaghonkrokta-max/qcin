@@ -7707,6 +7707,14 @@ def _scheduled_job():
             rel.close()
 
 
+def _weekly_digest_job():
+    """Wrapper called by APScheduler for the weekly digest."""
+    try:
+        run_weekly_digest()
+    except Exception as e:
+        log.error("Weekly digest job error: %s", e)
+
+
 # ── Scheduler (disabled on Vercel — Cron Jobs call /run-check instead) ───────
 class _NoOpScheduler:
     """Stub used on Vercel so scheduler.reschedule_job() calls don't crash."""
