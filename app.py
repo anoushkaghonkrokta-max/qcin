@@ -3346,7 +3346,7 @@ def log_stage():
             data["_changed_by"] = session.get("full_name") or session.get("username", "")
             action = upsert_case(data)
             flash(f"Case {data['application_id']} {action} successfully.", "success")
-            return redirect(url_for("dashboard"))
+            return redirect(url_for("log_stage"))
         except ValueError as e:
             flash(str(e), "error")
 
@@ -4371,28 +4371,29 @@ def settings():
             del_prog_btn = ""
             if is_ba:
                 del_prog_btn = f"""
-  <form method="post" style="position:absolute;right:48px;top:50%;transform:translateY(-50%);z-index:10"
-        onsubmit="return confirm('Delete programme &quot;{pname}&quot; and ALL its stages? This cannot be undone.')">
-    <input type="hidden" name="action" value="delete_programme">
-    <input type="hidden" name="programme_name" value="{pname}">
-    <button class="btn btn-sm btn-danger py-1 px-2" style="font-size:11px">
-      <i class="bi bi-trash"></i> Delete
-    </button>
-  </form>"""
+    <form method="post" class="ms-2 flex-shrink-0"
+          onsubmit="return confirm('Delete programme &quot;{pname}&quot; and ALL its stages? This cannot be undone.')">
+      <input type="hidden" name="action" value="delete_programme">
+      <input type="hidden" name="programme_name" value="{pname}">
+      <button class="btn btn-sm btn-danger" style="font-size:11px;padding:4px 10px;white-space:nowrap">
+        <i class="bi bi-trash"></i> Delete
+      </button>
+    </form>"""
             prog_inner += f"""
-<div class="accordion-item" style="border:1px solid #e2e8f0;border-radius:8px;margin-bottom:8px;overflow:hidden;position:relative">
-  {del_prog_btn}
-  <h2 class="accordion-header">
-    <button class="accordion-button collapsed py-2" type="button" data-bs-toggle="collapse"
-            data-bs-target="#prog_{pid_safe}" style="background:#f8fafc;font-size:14px">
-      <div class="d-flex align-items-center gap-3 w-100 me-3">
+<div class="accordion-item" style="border:1px solid #e2e8f0;border-radius:8px;margin-bottom:8px;overflow:hidden">
+  <div class="d-flex align-items-center" style="background:#f8fafc;padding-right:8px;border-bottom:1px solid #e2e8f0">
+    <button class="accordion-button collapsed flex-grow-1 py-2" type="button" data-bs-toggle="collapse"
+            data-bs-target="#prog_{pid_safe}"
+            style="background:transparent;font-size:14px;border:none;box-shadow:none">
+      <div class="d-flex align-items-center gap-3 w-100">
         <i class="bi bi-list-task" style="color:#7c3aed"></i>
         <span style="font-weight:600">{pname}</span>
         <span>{credential_badge}</span>
         <span class="ms-auto" style="font-size:12px;color:#94a3b8">{len(stages)} stages</span>
       </div>
     </button>
-  </h2>
+    {del_prog_btn}
+  </div>
   <div id="prog_{pid_safe}" class="accordion-collapse collapse">
     <div class="accordion-body p-0">
       {stages_table_html}
@@ -4438,27 +4439,28 @@ def settings():
         del_board_btn = ""
         if session.get("role") == "super_admin":
             del_board_btn = f"""
-  <form method="post" style="position:absolute;right:52px;top:50%;transform:translateY(-50%);z-index:10"
-        onsubmit="return confirm('Delete board &quot;{b['board_name']}&quot;? All programmes must be deleted first.')">
-    <input type="hidden" name="action" value="delete_board">
-    <input type="hidden" name="board_id" value="{b['id']}">
-    <button class="btn btn-sm btn-danger py-1 px-2" style="font-size:12px">
-      <i class="bi bi-trash"></i> Delete Board
-    </button>
-  </form>"""
+    <form method="post" class="ms-2 flex-shrink-0"
+          onsubmit="return confirm('Delete board &quot;{b['board_name']}&quot;? All programmes must be deleted first.')">
+      <input type="hidden" name="action" value="delete_board">
+      <input type="hidden" name="board_id" value="{b['id']}">
+      <button class="btn btn-sm btn-danger" style="font-size:11px;padding:4px 10px;white-space:nowrap">
+        <i class="bi bi-trash"></i> Delete Board
+      </button>
+    </form>"""
         board_sections += f"""
-<div class="accordion-item" style="border:2px solid #e2e8f0;border-radius:12px;margin-bottom:16px;overflow:hidden;position:relative">
-  {del_board_btn}
-  <h2 class="accordion-header">
-    <button class="accordion-button" type="button" data-bs-toggle="collapse"
-            data-bs-target="#board_{bid_safe}" style="background:linear-gradient(135deg,#003356,#0094ca);color:#fff;font-weight:700;font-size:15px">
-      <div class="d-flex align-items-center gap-3 w-100 me-3">
+<div class="accordion-item" style="border:2px solid #e2e8f0;border-radius:12px;margin-bottom:16px;overflow:hidden">
+  <div class="d-flex align-items-center" style="background:linear-gradient(135deg,#003356,#0094ca);padding-right:12px">
+    <button class="accordion-button flex-grow-1" type="button" data-bs-toggle="collapse"
+            data-bs-target="#board_{bid_safe}"
+            style="background:transparent;color:#fff;font-weight:700;font-size:15px;border:none;box-shadow:none">
+      <div class="d-flex align-items-center gap-3 w-100">
         <i class="bi bi-building" style="font-size:18px"></i>
         <span>{b['board_name']}</span>
         <span class="ms-auto" style="font-size:12px;opacity:.8">{prog_count} programme{"s" if prog_count != 1 else ""}</span>
       </div>
     </button>
-  </h2>
+    {del_board_btn}
+  </div>
   <div id="board_{bid_safe}" class="accordion-collapse collapse show">
     <div class="accordion-body" style="background:#fafbfc;padding:16px">
       <div class="accordion" id="progAccordion_{bid_safe}">
