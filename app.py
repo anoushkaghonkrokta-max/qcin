@@ -10,7 +10,8 @@ import logging
 import os
 import secrets
 import smtplib
-import sqlite3
+import psycopg2
+import psycopg2.extras
 import struct
 import time
 import urllib.request
@@ -64,10 +65,7 @@ else:
         _f.write(_SK)
 app.secret_key = os.environ.get("SECRET_KEY", _SK)
 
-DB_PATH = os.environ.get(
-    "DB_PATH",
-    os.path.join(os.path.dirname(__file__), "qci_notifications.db"),
-)
+DATABASE_URL = os.environ.get("DATABASE_URL", "")
 KEY_FILE = os.path.join(os.path.dirname(__file__), "fernet.key")
 
 # ── Fernet encryption ────────────────────────────────────────────────────────
@@ -426,11 +424,59 @@ def working_days_elapsed(start: str, end_d=None, hold_days: int = 0) -> int:
 
 
 # ── Database helpers ─────────────────────────────────────────────────────────
+class DBConn:
+    """Thin psycopg2 wrapper that mimics the sqlite3 connection API used throughout this app.
+
+    Handles:
+    - ``?`` → ``%s`` placeholder translation
+    - ``INTEGER PRIMARY KEY AUTOINCREMENT`` → ``SERIAL PRIMARY KEY`` in DDL
+    - ``executescript()`` by splitting on ``;`` and executing each statement
+    - sqlite3-style ``conn.execute()`` that returns the cursor
+    """
+
+    def __init__(self, pg_conn):
+        self._conn = pg_conn
+        self._cur = pg_conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
+
+    def execute(self, sql, params=()):
+        pg_sql = sql.replace("?", "%s")
+        if params:
+            self._cur.execute(pg_sql, params)
+        else:
+            self._cur.execute(pg_sql)
+        return self._cur
+
+    def executescript(self, sql):
+        for stmt in sql.split(";"):
+            stmt = stmt.strip()
+            if not stmt:
+                continue
+            pg_stmt = (
+                stmt
+                .replace("?", "%s")
+                .replace("INTEGER PRIMARY KEY AUTOINCREMENT", "SERIAL PRIMARY KEY")
+            )
+            self._cur.execute(pg_stmt)
+
+    def commit(self):
+        self._conn.commit()
+
+    def rollback(self):
+        self._conn.rollback()
+
+    def close(self):
+        self._conn.close()
+
+
 def get_db():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    return conn
+    if not DATABASE_URL:
+        raise RuntimeError(
+            "DATABASE_URL environment variable is not set. "
+            "Add a PostgreSQL plugin in your Railway project and set DATABASE_URL."
+        )
+    pg_conn = psycopg2.connect(DATABASE_URL)
+    pg_conn.autocommit = False
+    return DBConn(pg_conn)
 
 
 def init_db():
@@ -584,30 +630,23 @@ def init_db():
             is_active  INTEGER NOT NULL DEFAULT 1
         );
     """)
-    # Migrate existing DBs: add columns if absent
+    # Migrate existing DBs: add columns if absent (IF NOT EXISTS is safe to re-run)
     for sql in [
-        "ALTER TABLE programme_config ADD COLUMN smtp_host TEXT NOT NULL DEFAULT 'smtp.gmail.com'",
-        "ALTER TABLE programme_config ADD COLUMN smtp_port INTEGER NOT NULL DEFAULT 587",
-        "ALTER TABLE programme_config ADD COLUMN board_id INTEGER",
-        "ALTER TABLE users ADD COLUMN board_id INTEGER",
-        "ALTER TABLE users ADD COLUMN force_password_reset INTEGER NOT NULL DEFAULT 0",
-        "ALTER TABLE users ADD COLUMN totp_secret TEXT",
-        "ALTER TABLE users ADD COLUMN last_login TEXT",
-        "ALTER TABLE case_tracking ADD COLUMN board_id INTEGER",
-        "ALTER TABLE case_tracking ADD COLUMN cc_emails TEXT",
-        "ALTER TABLE case_tracking ADD COLUMN suppress_until TEXT",
-        "ALTER TABLE case_tracking ADD COLUMN status TEXT NOT NULL DEFAULT 'Active'",
-        "ALTER TABLE email_templates ADD COLUMN board_id INTEGER",
-        "ALTER TABLE holidays ADD COLUMN board_id INTEGER",
-        "ALTER TABLE case_tracking ADD COLUMN hold_days INTEGER NOT NULL DEFAULT 0",
-        "ALTER TABLE case_tracking ADD COLUMN hold_start_date TEXT",
-        "ALTER TABLE audit_log ADD COLUMN entry_hash TEXT",
-        "ALTER TABLE programme_config ADD COLUMN is_optional INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE programme_config ADD COLUMN IF NOT EXISTS smtp_host TEXT NOT NULL DEFAULT 'smtp.gmail.com'",
+        "ALTER TABLE programme_config ADD COLUMN IF NOT EXISTS smtp_port INTEGER NOT NULL DEFAULT 587",
+        "ALTER TABLE programme_config ADD COLUMN IF NOT EXISTS board_id INTEGER",
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS board_id INTEGER",
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS force_password_reset INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS totp_secret TEXT",
+        "ALTER TABLE case_tracking ADD COLUMN IF NOT EXISTS board_id INTEGER",
+        "ALTER TABLE case_tracking ADD COLUMN IF NOT EXISTS cc_emails TEXT",
+        "ALTER TABLE case_tracking ADD COLUMN IF NOT EXISTS suppress_until TEXT",
+        "ALTER TABLE email_templates ADD COLUMN IF NOT EXISTS board_id INTEGER",
     ]:
         try:
             conn.execute(sql)
         except Exception:
-            pass
+            conn.rollback()
     conn.commit()
     conn.close()
 
@@ -7038,15 +7077,12 @@ def test_smtp():
 @app.route("/backup")
 @admin_required
 def backup_db():
-    try:
-        with open(DB_PATH, "rb") as f:
-            data = f.read()
-        fname = f"qci_backup_{date.today().strftime('%Y%m%d_%H%M')}.db"
-        return Response(data, mimetype="application/octet-stream",
-                        headers={"Content-Disposition": f"attachment;filename={fname}"})
-    except Exception as e:
-        flash(f"Backup failed: {e}", "error")
-        return redirect(url_for("system_settings"))
+    flash(
+        "Database backup is not available in PostgreSQL mode. "
+        "Use pg_dump via your Railway database dashboard or CLI to export data.",
+        "info",
+    )
+    return redirect(url_for("system_settings"))
 
 
 @app.route("/export", methods=["GET", "POST"])
