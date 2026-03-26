@@ -475,7 +475,8 @@ class DBConn:
     def close(self):
         self._cur.close()
         if self._pool:
-            self._pool.putconn(self._conn)   # return to pool, not closed
+            self._conn.rollback()  # Clears any broken/aborted transactions before returning to pool
+            self._pool.putconn(self._conn)
         else:
             self._conn.close()
 
