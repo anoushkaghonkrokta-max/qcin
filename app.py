@@ -16,6 +16,7 @@ import psycopg2.pool
 import struct
 import time
 import urllib.request
+import pytz
 from datetime import date, datetime, timedelta
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -65,6 +66,13 @@ app.secret_key = _secret_key_env
 
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
 
+# ── Timezone ─────────────────────────────────────────────────────────────────
+_IST = pytz.timezone("Asia/Kolkata")
+
+def now_ist() -> datetime:
+    """Return the current datetime in IST (Asia/Kolkata)."""
+    return datetime.now(_IST)
+
 # ── Fernet encryption (must be set via environment variable on Render) ────────
 _fk_env = os.environ.get("FERNET_KEY")
 if not _fk_env:
@@ -113,7 +121,7 @@ def log_audit(event_type: str, application_id: str = None, detail: str = "",
     Never raises — audit failures must not crash the calling request."""
     try:
         conn = get_db()
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        timestamp = now_ist().strftime("%Y-%m-%d %H:%M:%S")
         # Hash-chaining: try to read previous hash (column may not exist on older DBs)
         entry_hash = None
         try:
@@ -163,7 +171,7 @@ def _verify_api_key(request) -> dict:
     ).fetchone()
     if row:
         conn.execute("UPDATE api_keys SET last_used=? WHERE id=?",
-                     (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), row["id"]))
+                     (now_ist().strftime("%Y-%m-%d %H:%M:%S"), row["id"]))
         conn.commit()
     conn.close()
     return dict(row) if row else None
@@ -176,7 +184,7 @@ def log_stage_transition(application_id: str, from_stage: str, to_stage: str,
     conn.execute(
         "INSERT INTO stage_history (timestamp, application_id, from_stage, to_stage, changed_by, board_id) "
         "VALUES (?,?,?,?,?,?)",
-        (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), application_id, from_stage, to_stage,
+        (now_ist().strftime("%Y-%m-%d %H:%M:%S"), application_id, from_stage, to_stage,
          changed_by, board_id)
     )
     conn.commit()
@@ -262,7 +270,7 @@ def queue_email(programme_name: str, notification_type: str, to_email: str,
             to_email, cc_email, sender_email, sender_password, smtp_host, smtp_port,
             subject, body, status, board_id)
            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,'pending',?)""",
-        (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), application_id, programme_name,
+        (now_ist().strftime("%Y-%m-%d %H:%M:%S"), application_id, programme_name,
          notification_type, to_email, cc_email or "", sender_email, sender_password_enc,
          smtp_host, smtp_port, subj, body, board_id)
     )
@@ -319,7 +327,7 @@ def process_email_queue(max_retries: int = 3) -> dict:
                     smtp_conn.sendmail(sender_email, recipients, msg.as_string())
                     conn.execute(
                         "UPDATE email_queue SET status='sent', last_attempt=? WHERE id=?",
-                        (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), item["id"])
+                        (now_ist().strftime("%Y-%m-%d %H:%M:%S"), item["id"])
                     )
                     sent += 1
                 except Exception as e:
@@ -327,7 +335,7 @@ def process_email_queue(max_retries: int = 3) -> dict:
                     new_status = "failed" if attempts >= max_retries else "pending"
                     conn.execute(
                         "UPDATE email_queue SET status=?, attempts=?, last_attempt=?, error_msg=? WHERE id=?",
-                        (new_status, attempts, datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        (new_status, attempts, now_ist().strftime("%Y-%m-%d %H:%M:%S"),
                          str(e)[:300], item["id"])
                     )
                     failed += 1
@@ -339,7 +347,7 @@ def process_email_queue(max_retries: int = 3) -> dict:
                 new_status = "failed" if attempts >= max_retries else "pending"
                 conn.execute(
                     "UPDATE email_queue SET status=?, attempts=?, last_attempt=?, error_msg=? WHERE id=?",
-                    (new_status, attempts, datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    (new_status, attempts, now_ist().strftime("%Y-%m-%d %H:%M:%S"),
                      str(conn_err)[:300], item["id"])
                 )
                 failed += 1
@@ -383,15 +391,18 @@ _HOLIDAYS = {
 }
 
 
-def working_days_elapsed(start: str, end_d=None, hold_days: int = 0) -> int:
+def working_days_elapsed(start: str, end_d=None, hold_days: int = 0, extra_holidays: set = None) -> int:
     """Working days from start (inclusive) to end (inclusive, default today).
 
     hold_days: subtract paused/on-hold days from the elapsed count.
+    extra_holidays: optional set of date objects with custom DB holidays to merge
+                    with _HOLIDAYS. Pass this from callers that loop over many cases
+                    (fetch once, pass in) to avoid per-call DB queries.
     start strings longer than 10 chars (e.g. Excel datetime exports) are
     truncated to the date portion before parsing.
     """
     if end_d is None:
-        end_d = date.today()
+        end_d = now_ist().date()
     if not start:
         return 0
     try:
@@ -400,10 +411,11 @@ def working_days_elapsed(start: str, end_d=None, hold_days: int = 0) -> int:
         s = datetime.strptime(start, "%Y-%m-%d").date() if isinstance(start, str) else start
     except (ValueError, TypeError):
         return 0
+    all_hols = _HOLIDAYS if extra_holidays is None else _HOLIDAYS | extra_holidays
     count = 0
     cur = s
     while cur <= end_d:
-        if cur.weekday() < 5 and cur not in _HOLIDAYS:
+        if cur.weekday() < 5 and cur not in all_hols:
             count += 1
         cur += timedelta(days=1)
     return max(0, count - 1 - hold_days)  # days elapsed after start date, minus hold days
@@ -447,7 +459,6 @@ class DBConn:
 
     def execute(self, sql, params=()):
         pg_sql = sql.replace("?", "%s")
-        pg_sql = pg_sql.replace("INSERT OR IGNORE INTO", "INSERT INTO").replace("INSERT OR REPLACE INTO", "INSERT INTO")
         if params:
             self._cur.execute(pg_sql, params)
         else:
@@ -679,6 +690,7 @@ def init_db():
         "ALTER TABLE programmes ADD COLUMN IF NOT EXISTS reminder2_days INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE programmes ADD COLUMN IF NOT EXISTS overdue_days INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE programmes ADD COLUMN IF NOT EXISTS notification_emails TEXT",
+        "ALTER TABLE case_tracking ADD COLUMN IF NOT EXISTS escalation_sent INTEGER NOT NULL DEFAULT 0",
     ]:
         try:
             conn.execute(sql)
@@ -723,6 +735,28 @@ def board_admin_required(f):
             return redirect(url_for("dashboard"))
         return f(*args, **kwargs)
     return decorated
+
+
+# ── CSRF protection ───────────────────────────────────────────────────────────
+_CSRF_EXEMPT_ENDPOINTS = {"login", "logout", "run_check", "run_weekly"}
+_CSRF_EXEMPT_PREFIXES  = ("/api/",)
+
+@app.before_request
+def _csrf_protect():
+    """Validate CSRF token on every POST that is not an API or login endpoint."""
+    if request.method != "POST":
+        return
+    endpoint = request.endpoint or ""
+    if endpoint in _CSRF_EXEMPT_ENDPOINTS:
+        return
+    for prefix in _CSRF_EXEMPT_PREFIXES:
+        if request.path.startswith(prefix):
+            return
+    token = request.form.get("csrf_token")
+    if token != session.get("csrf_token"):
+        flash("Invalid request. Please try again.", "error")
+        referrer = request.referrer or url_for("dashboard")
+        return redirect(referrer)
 
 
 # ── Seed data ────────────────────────────────────────────────────────────────
@@ -1048,7 +1082,7 @@ def send_notification(programme: str, ntype: str, to_email: str, cc_email: str,
 
 # ── Core daily check ─────────────────────────────────────────────────────────
 def run_daily_check(board_id=None) -> dict:
-    today = date.today()
+    today = now_ist().date()
     conn  = get_db()
     if board_id is not None:
         cases = [dict(r) for r in conn.execute(
@@ -1067,6 +1101,15 @@ def run_daily_check(board_id=None) -> dict:
     ).fetchall()
     _pc_lookup = {(r["programme_name"], r["stage_name"]): dict(r) for r in _pc_rows}
 
+    # Pre-fetch programme notification_emails for CC injection
+    try:
+        _prog_notif_rows = conn.execute(
+            "SELECT programme_name, notification_emails FROM programmes WHERE notification_emails IS NOT NULL"
+        ).fetchall()
+        _prog_notif_map = {r["programme_name"]: r["notification_emails"] for r in _prog_notif_rows}
+    except Exception:
+        _prog_notif_map = {}
+
     # Pre-fetch programme → programme_head email mapping for escalations
     _ph_rows = conn.execute(
         """SELECT p.programme_name, u.email, u.full_name
@@ -1081,6 +1124,13 @@ def run_daily_check(board_id=None) -> dict:
             {"email": _r["email"], "full_name": _r["full_name"]}
         )
 
+    # Pre-fetch custom DB holidays once for the whole loop
+    try:
+        _db_hols = {datetime.strptime(r[0][:10], "%Y-%m-%d").date()
+                    for r in conn.execute("SELECT holiday_date FROM holidays").fetchall()}
+    except Exception:
+        _db_hols = set()
+
     for case in cases:
         # Skip closed/withdrawn/suspended/on-hold cases
         case_status = case.get("status", "Active")
@@ -1090,7 +1140,7 @@ def run_daily_check(board_id=None) -> dict:
             summary["skipped_milestone"] += 1
             continue
 
-        elapsed = working_days_elapsed(case["stage_start_date"], today, hold_days=case.get("hold_days", 0))
+        elapsed = working_days_elapsed(case["stage_start_date"], today, hold_days=case.get("hold_days", 0), extra_holidays=_db_hols)
         tat     = case["tat_days"]
         r1_day  = case["reminder1_day"]
         r2_day  = case["reminder2_day"]
@@ -1126,7 +1176,12 @@ def run_daily_check(board_id=None) -> dict:
                 pass
 
         sender_pw_enc = cfg["sender_password"] if cfg and cfg["sender_password"] else ""
-        cc = case.get("cc_emails") or case.get("program_officer_email") or ""
+        # Merge case CC emails with programme-level notification_emails
+        _prog_extra_cc = _prog_notif_map.get(case["programme_name"], "")
+        cc = ";".join(filter(None, [
+            case.get("cc_emails") or case.get("program_officer_email") or "",
+            _prog_extra_cc
+        ]))
         webhook_ph = {
             "application_id": case["application_id"],
             "organisation": case["organisation_name"],
@@ -1150,40 +1205,37 @@ def run_daily_check(board_id=None) -> dict:
             return True
 
         def _escalate_to_ph():
-            """Email all Programme Heads mapped to this programme if TAT severely breached."""
+            """Queue escalation emails to Programme Heads mapped to this programme.
+            Guards against spam by checking escalation_sent flag."""
+            if case.get("escalation_sent"):
+                return  # Already escalated for this stage period
             escalation_threshold = int(get_app_setting("ph_escalation_days", "5"))
             days_overdue = elapsed - tat
             if days_overdue < escalation_threshold:
                 return
             ph_users = _ph_map.get(case["programme_name"], [])
+            queued = False
             for ph_user in ph_users:
                 if not ph_user["email"]:
                     continue
                 esc_ph = {**ph,
                           "Action_Owner_Name": ph_user["full_name"] or ph_user["email"],
                           "Days_Overdue": days_overdue}
-                subj = f"[ESCALATION] {case['organisation_name']} overdue {days_overdue}d — {case['current_stage']}"
-                body = (f"Dear {ph_user['full_name'] or 'Programme Head'},\n\n"
-                        f"This is an escalation notice.\n\n"
-                        f"Case: {case['organisation_name']} ({case['application_id']})\n"
-                        f"Programme: {case['programme_name']}\n"
-                        f"Stage: {case['current_stage']}\n"
-                        f"Days overdue: {days_overdue}\n\n"
-                        f"Immediate intervention may be required.\n\nQCI Notification Engine")
                 if sender_email:
-                    try:
-                        msg = MIMEMultipart()
-                        msg["From"] = sender_email
-                        msg["To"] = ph_user["email"]
-                        msg["Subject"] = subj
-                        msg.attach(MIMEText(body, "plain"))
-                        pw = decrypt_str(sender_pw_enc) if sender_pw_enc else ""
-                        with smtplib.SMTP(smtp_host, smtp_port, timeout=15) as s:
-                            s.starttls()
-                            s.login(sender_email, pw)
-                            s.sendmail(sender_email, [ph_user["email"]], msg.as_string())
-                    except Exception as e:
-                        log.warning("PH escalation failed: %s", e)
+                    queue_email(
+                        case["programme_name"], "Escalation",
+                        ph_user["email"], cc,
+                        sender_email, sender_pw_enc, esc_ph,
+                        smtp_host, smtp_port,
+                        case["application_id"], case.get("board_id"),
+                        stage_name=case["current_stage"]
+                    )
+                    queued = True
+            if queued:
+                conn.execute(
+                    "UPDATE case_tracking SET escalation_sent=1 WHERE id=?", (case["id"],)
+                )
+                conn.commit()
 
         # R1
         if r1_day > 0 and elapsed >= r1_day and not case["r1_sent"]:
@@ -1241,7 +1293,13 @@ def run_weekly_digest():
         log.info("Weekly digest is disabled — skipping.")
         return
     conn = get_db()
-    today = date.today()
+    today = now_ist().date()
+    # Pre-fetch custom DB holidays once for the whole digest
+    try:
+        _digest_db_hols = {datetime.strptime(r[0][:10], "%Y-%m-%d").date()
+                           for r in conn.execute("SELECT holiday_date FROM holidays").fetchall()}
+    except Exception:
+        _digest_db_hols = set()
     recipients = [dict(r) for r in conn.execute(
         "SELECT u.*, b.board_name FROM users u LEFT JOIN boards b ON b.id=u.board_id "
         "WHERE u.role IN ('board_ceo','board_admin','super_admin') AND u.email IS NOT NULL"
@@ -1263,10 +1321,10 @@ def run_weekly_digest():
 
         total = len(cases)
         overdue = sum(1 for c in cases if not c["is_milestone"] and c["tat_days"] > 0
-                      and working_days_elapsed(c["stage_start_date"], today) >= c["tat_days"])
+                      and working_days_elapsed(c["stage_start_date"], today, extra_holidays=_digest_db_hols) >= c["tat_days"])
         at_risk = sum(1 for c in cases if not c["is_milestone"] and c["tat_days"] > 0
-                      and working_days_elapsed(c["stage_start_date"], today) >= c["reminder2_day"]
-                      and working_days_elapsed(c["stage_start_date"], today) < c["tat_days"])
+                      and working_days_elapsed(c["stage_start_date"], today, extra_holidays=_digest_db_hols) >= c["reminder2_day"]
+                      and working_days_elapsed(c["stage_start_date"], today, extra_holidays=_digest_db_hols) < c["tat_days"])
         compliant = total - overdue - at_risk
 
         body = (f"Weekly QCI Notification Engine Digest — {today.strftime('%d %b %Y')}\n\n"
@@ -1279,12 +1337,12 @@ def run_weekly_digest():
 
         # Top 5 most overdue
         overdue_cases = [c for c in cases if not c["is_milestone"] and c["tat_days"] > 0
-                         and working_days_elapsed(c["stage_start_date"], today) >= c["tat_days"]]
-        overdue_cases.sort(key=lambda x: working_days_elapsed(x["stage_start_date"], today), reverse=True)
+                         and working_days_elapsed(c["stage_start_date"], today, extra_holidays=_digest_db_hols) >= c["tat_days"]]
+        overdue_cases.sort(key=lambda x: working_days_elapsed(x["stage_start_date"], today, extra_holidays=_digest_db_hols), reverse=True)
         if overdue_cases:
             body += "Top Overdue Cases:\n"
             for c in overdue_cases[:5]:
-                days_late = working_days_elapsed(c["stage_start_date"], today) - c["tat_days"]
+                days_late = working_days_elapsed(c["stage_start_date"], today, extra_holidays=_digest_db_hols) - c["tat_days"]
                 body += f"  • {c['organisation_name']} ({c['application_id']}) — {c['current_stage']} — {days_late}d late\n"
             body += "\n"
 
@@ -1322,6 +1380,16 @@ def run_weekly_digest():
         except Exception as e:
             log.warning("Weekly digest failed for %s: %s", user["email"], e)
 
+    # Clean up old audit and email queue records
+    try:
+        cutoff = (now_ist() - timedelta(days=90)).strftime("%Y-%m-%d")
+        conn.execute("DELETE FROM audit_log WHERE timestamp < ?", (cutoff,))
+        conn.execute("DELETE FROM email_queue WHERE queued_at < ? AND status != 'pending'", (cutoff,))
+        conn.commit()
+        log.info("Weekly digest cleanup: removed audit/queue records older than %s", cutoff)
+    except Exception as e:
+        log.warning("Weekly digest cleanup failed: %s", e)
+
     conn.close()
 
 
@@ -1353,7 +1421,7 @@ def upsert_case(data: dict) -> str:
                    action_owner_name=?, action_owner_email=?, program_officer_email=?,
                    r1_sent=0, r2_sent=0, overdue_sent=0, overdue_count=0,
                    last_overdue_date=NULL, is_milestone=?, board_id=?,
-                   cc_emails=?, suppress_until=?
+                   cc_emails=?, suppress_until=?, escalation_sent=0
                    WHERE application_id=?""",
                 (data["programme_name"], data["organisation_name"], data["stage_name"],
                  data["stage_start_date"], cfg["tat_days"], cfg["reminder1_day"], cfg["reminder2_day"],
@@ -1646,6 +1714,19 @@ th{white-space:nowrap}
   .main-content { max-width: 1600px; }
 }
 </style>
+<meta name="csrf-token" content="{{ session.get('csrf_token', '') }}">
+<script>
+document.addEventListener('DOMContentLoaded', function() {
+  var t = document.querySelector('meta[name="csrf-token"]').content;
+  document.querySelectorAll('form[method="post"],form[method="POST"]').forEach(function(f) {
+    if (!f.querySelector('input[name="csrf_token"]')) {
+      var i = document.createElement('input');
+      i.type = 'hidden'; i.name = 'csrf_token'; i.value = t;
+      f.appendChild(i);
+    }
+  });
+});
+</script>
 </head>
 <body>
 
@@ -1977,14 +2058,15 @@ def login():
             # Record last login
             conn3 = get_db()
             conn3.execute("UPDATE users SET last_login=? WHERE id=?",
-                         (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), user["id"]))
+                         (now_ist().strftime("%Y-%m-%d %H:%M:%S"), user["id"]))
             conn3.commit()
             conn3.close()
-            session["user_id"]   = user["id"]
-            session["username"]  = user["username"]
-            session["role"]      = user["role"]
-            session["full_name"] = user["full_name"] or user["username"]
-            session["board_id"]  = user["board_id"]
+            session["user_id"]    = user["id"]
+            session["username"]   = user["username"]
+            session["role"]       = user["role"]
+            session["full_name"]  = user["full_name"] or user["username"]
+            session["board_id"]   = user["board_id"]
+            session["csrf_token"] = secrets.token_hex(32)
             if user["board_id"]:
                 conn2 = get_db()
                 brow = conn2.execute("SELECT board_name FROM boards WHERE id=?", (user["board_id"],)).fetchone()
@@ -2059,17 +2141,27 @@ def force_pw_reset():
 
 
 @app.route("/users", methods=["GET", "POST"])
-@admin_required
+@board_admin_required
 def manage_users():
+    _is_super = session.get("role") == "super_admin"
+    _caller_board_id = user_board_id()
     conn = get_db()
     if request.method == "POST":
         action = request.form.get("action")
         if action == "add":
             try:
                 role = request.form["role"]
+                # board_admin cannot create super_admin accounts
+                if not _is_super and role == "super_admin":
+                    flash("Permission denied: cannot create super_admin accounts.", "error")
+                    conn.close()
+                    return redirect(url_for("manage_users"))
                 board_id = request.form.get("board_id") or None
                 if board_id:
                     board_id = int(board_id)
+                # board_admin can only create users in their own board
+                if not _is_super and _caller_board_id is not None:
+                    board_id = _caller_board_id
                 conn.execute(
                     "INSERT INTO users (username, password_hash, role, full_name, email, board_id) VALUES (?,?,?,?,?,?)",
                     (request.form["username"].strip(),
@@ -2129,15 +2221,30 @@ def manage_users():
                 conn.commit()
                 flash("Programme mapping updated.", "success")
 
-    users = [dict(r) for r in conn.execute(
-        """SELECT u.*, b.board_name FROM users u
-           LEFT JOIN boards b ON b.id = u.board_id
-           ORDER BY u.role, u.username"""
-    ).fetchall()]
+    if _is_super:
+        users = [dict(r) for r in conn.execute(
+            """SELECT u.*, b.board_name FROM users u
+               LEFT JOIN boards b ON b.id = u.board_id
+               ORDER BY u.role, u.username"""
+        ).fetchall()]
+    else:
+        users = [dict(r) for r in conn.execute(
+            """SELECT u.*, b.board_name FROM users u
+               LEFT JOIN boards b ON b.id = u.board_id
+               WHERE u.board_id=?
+               ORDER BY u.role, u.username""",
+            (_caller_board_id,)
+        ).fetchall()]
     boards = [dict(r) for r in conn.execute("SELECT * FROM boards ORDER BY board_name").fetchall()]
-    all_programmes = [dict(r) for r in conn.execute(
-        "SELECT p.*, b.board_name FROM programmes p JOIN boards b ON b.id=p.board_id ORDER BY b.board_name, p.programme_name"
-    ).fetchall()]
+    if _is_super:
+        all_programmes = [dict(r) for r in conn.execute(
+            "SELECT p.*, b.board_name FROM programmes p JOIN boards b ON b.id=p.board_id ORDER BY b.board_name, p.programme_name"
+        ).fetchall()]
+    else:
+        all_programmes = [dict(r) for r in conn.execute(
+            "SELECT p.*, b.board_name FROM programmes p JOIN boards b ON b.id=p.board_id WHERE p.board_id=? ORDER BY p.programme_name",
+            (_caller_board_id,)
+        ).fetchall()]
 
     # Build programme map per user (for program_head display)
     ph_prog_map = {}
@@ -2446,14 +2553,19 @@ def bulk_users():
                     continue
                 board_name = (row.get("board_name") or "").strip().lower()
                 board_id = boards.get(board_name) if board_name else None
-                pw = (row.get("password") or "").strip() or secrets.token_hex(8)
+                raw_pw = (row.get("password") or "").strip()
+                if not raw_pw:
+                    raw_pw = "Welcome@123"
+                    force_reset = 1
+                else:
+                    force_reset = 0
                 try:
                     conn.execute(
-                        "INSERT INTO users (username, password_hash, role, full_name, email, board_id) VALUES (?,?,?,?,?,?)",
-                        (uname, generate_password_hash(pw), role,
+                        "INSERT INTO users (username, password_hash, role, full_name, email, board_id, force_password_reset) VALUES (?,?,?,?,?,?,?)",
+                        (uname, generate_password_hash(raw_pw), role,
                          (row.get("full_name") or "").strip(),
                          (row.get("email") or "").strip() or None,
-                         board_id)
+                         board_id, force_reset)
                     )
                     created += 1
                 except Exception as e:
@@ -2524,7 +2636,7 @@ def ceo_dashboard():
         return redirect(url_for("dashboard"))
     conn = get_db()
     bid = user_board_id()
-    today = date.today()
+    today = now_ist().date()
 
     if bid is not None:
         cases = [dict(r) for r in conn.execute(
@@ -2540,10 +2652,15 @@ def ceo_dashboard():
         programmes = [dict(r) for r in conn.execute(
             "SELECT p.*, b.board_name FROM programmes p JOIN boards b ON b.id=p.board_id ORDER BY b.board_name, p.programme_name"
         ).fetchall()]
+    try:
+        _ceo_db_hols = {datetime.strptime(r[0][:10], "%Y-%m-%d").date()
+                        for r in conn.execute("SELECT holiday_date FROM holidays").fetchall()}
+    except Exception:
+        _ceo_db_hols = set()
     conn.close()
 
     for c in cases:
-        c["days_elapsed"] = working_days_elapsed(c["stage_start_date"], today)
+        c["days_elapsed"] = working_days_elapsed(c["stage_start_date"], today, extra_holidays=_ceo_db_hols)
 
     total_cases = len(cases)
     overdue = [c for c in cases if not c["is_milestone"] and c["tat_days"] > 0 and c["days_elapsed"] >= c["tat_days"]]
@@ -2800,11 +2917,16 @@ def dashboard():
             flash("Your account has no email address set. Add one in your profile so 'My Cases' can filter correctly.", "info")
 
     cases = [dict(r) for r in conn.execute(base_q, base_params).fetchall()]
+    try:
+        _dash_db_hols = {datetime.strptime(r[0][:10], "%Y-%m-%d").date()
+                         for r in conn.execute("SELECT holiday_date FROM holidays").fetchall()}
+    except Exception:
+        _dash_db_hols = set()
     conn.close()
 
-    today = date.today()
+    today = now_ist().date()
     for c in cases:
-        c["days_elapsed"] = working_days_elapsed(c["stage_start_date"], today, hold_days=c.get("hold_days", 0))
+        c["days_elapsed"] = working_days_elapsed(c["stage_start_date"], today, hold_days=c.get("hold_days", 0), extra_holidays=_dash_db_hols)
 
     reverse = sort.endswith("_desc")
     key = sort.replace("_desc", "").replace("_asc", "")
@@ -3952,6 +4074,7 @@ def edit_case(case_id):
     conn.close()
 
     if request.method == "POST":
+        new_status = request.form.get("status", "Active")
         data = {
             "application_id":     case["application_id"],
             "organisation_name":  request.form["organisation_name"].strip(),
@@ -3967,6 +4090,12 @@ def edit_case(case_id):
         try:
             data["_changed_by"] = session.get("full_name") or session.get("username", "")
             upsert_case(data)
+            # Update status separately (upsert_case doesn't manage status field)
+            _sc = get_db()
+            _sc.execute("UPDATE case_tracking SET status=? WHERE application_id=?",
+                        (new_status, case["application_id"]))
+            _sc.commit()
+            _sc.close()
             flash(f"Case {case['application_id']} updated.", "success")
             return redirect(url_for("dashboard"))
         except ValueError as e:
@@ -4052,6 +4181,15 @@ def edit_case(case_id):
           <input type="date" class="form-control" name="suppress_until"
                  value="{case.get('suppress_until') or ''}">
         </div>
+        <div class="mb-3">
+          <label class="form-label">Status</label>
+          <select class="form-select" name="status">
+            <option value="Active" {"selected" if (case.get("status") or "Active") == "Active" else ""}>Active</option>
+            <option value="On Hold" {"selected" if case.get("status") == "On Hold" else ""}>On Hold</option>
+            <option value="Closed" {"selected" if case.get("status") == "Closed" else ""}>Closed</option>
+            <option value="Withdrawn" {"selected" if case.get("status") == "Withdrawn" else ""}>Withdrawn</option>
+          </select>
+        </div>
 
         <div class="alert" style="background:#fffbeb;border:1px solid #fde68a;border-radius:8px;font-size:13px;color:#92400e;padding:10px 14px">
           <i class="bi bi-arrow-clockwise"></i> Saving will <strong>reset</strong> all sent-flags (R1, R2, Overdue) and the overdue counter for this case.
@@ -4091,6 +4229,9 @@ loadStages("{case['programme_name']}", _currentStage);
 @app.route("/delete-case/<int:case_id>")
 @login_required
 def delete_case(case_id):
+    if session.get("role") not in ("super_admin", "board_admin"):
+        flash("Permission denied.", "error")
+        return redirect(url_for("dashboard"))
     conn = get_db()
     row = conn.execute("SELECT application_id, board_id FROM case_tracking WHERE id=?", (case_id,)).fetchone()
     if not row:
@@ -4148,7 +4289,7 @@ def update_case_status():
         hold_start = case.get("hold_start_date")
         extra_hold = 0
         if hold_start:
-            extra_hold = working_days_elapsed(hold_start, date.today())
+            extra_hold = working_days_elapsed(hold_start, now_ist().date())
         new_hold_days = (case.get("hold_days") or 0) + extra_hold
         conn.execute(
             "UPDATE case_tracking SET status=?, hold_start_date=NULL, hold_days=? WHERE application_id=?",
@@ -4181,7 +4322,7 @@ def save_filter():
             "INSERT INTO saved_filters (user_id, filter_name, filter_json, created_at) VALUES (?,?,?,?) ON CONFLICT (user_id, filter_name) DO UPDATE SET filter_json=EXCLUDED.filter_json, created_at=EXCLUDED.created_at",
             (session["user_id"], data["name"][:60],
              json.dumps({"qs": data.get("qs", "")}),
-             datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+             now_ist().strftime("%Y-%m-%d %H:%M:%S"))
         )
         conn.commit()
         conn.close()
@@ -6050,38 +6191,37 @@ def bulk_advance():
             flash("Select cases and a target stage.", "error")
         else:
             advanced = 0
-            errors = 0
+            errors = []
             user_name = session.get("full_name") or session.get("username", "")
             for cid in selected_ids:
                 case = conn.execute("SELECT * FROM case_tracking WHERE id=?", (cid,)).fetchone()
                 if not case:
                     continue
                 case = dict(case)
-                # Find stage config
-                cfg = conn.execute(
-                    "SELECT * FROM programme_config WHERE programme_name=? AND stage_name=?",
-                    (case["programme_name"], target_stage)
-                ).fetchone()
-                if not cfg:
-                    errors += 1
-                    continue
-                old_stage = case["current_stage"]
-                conn.execute(
-                    """UPDATE case_tracking SET current_stage=?, stage_start_date=?,
-                       tat_days=?, reminder1_day=?, reminder2_day=?, owner_type=?,
-                       is_milestone=?, r1_sent=0, r2_sent=0, overdue_sent=0, overdue_count=0,
-                       last_overdue_date=NULL WHERE id=?""",
-                    (target_stage, new_start_date, cfg["tat_days"], cfg["reminder1_day"],
-                     cfg["reminder2_day"], cfg["owner_type"], cfg["is_milestone"], cid)
-                )
-                advanced += 1
-                log_stage_transition(case["application_id"], old_stage, target_stage,
-                                     user_name, case.get("board_id"))
-            conn.commit()
+                upsert_data = {
+                    "application_id":      case["application_id"],
+                    "organisation_name":   case["organisation_name"],
+                    "programme_name":      case["programme_name"],
+                    "stage_name":          target_stage,
+                    "stage_start_date":    new_start_date,
+                    "action_owner_name":   case.get("action_owner_name") or "",
+                    "action_owner_email":  case.get("action_owner_email") or "",
+                    "program_officer_email": case.get("program_officer_email") or "",
+                    "cc_emails":           case.get("cc_emails") or None,
+                    "suppress_until":      case.get("suppress_until") or None,
+                    "_changed_by":         user_name,
+                    "_force_advance":      True,
+                }
+                try:
+                    upsert_case(upsert_data)
+                    advanced += 1
+                except Exception as e:
+                    errors.append(f"{case['application_id']}: {e}")
+            conn.close()
             log_audit("bulk_advance", None,
                       f"Advanced {advanced} cases to '{target_stage}'", user_name, bid)
-            flash(f"{advanced} case(s) advanced to '{target_stage}'. {errors} error(s).", "success")
-            conn.close()
+            err_count = len(errors)
+            flash(f"{advanced} case(s) advanced to '{target_stage}'. {err_count} error(s).", "success")
             return redirect(url_for("bulk_advance"))
 
     conn.close()
@@ -6136,15 +6276,22 @@ def bulk_advance():
       <div class="card-header">Advance To</div>
       <div class="card-body p-3">
         <div class="mb-3">
+          <label class="form-label" style="font-size:12px">Programme (for stage lookup)</label>
+          <select class="form-select form-select-sm" id="baProgSelect">
+            <option value="">— select programme —</option>
+            {''.join('<option value="' + h(pn) + '">' + h(pn) + '</option>' for pn in sorted(prog_groups.keys()))}
+          </select>
+        </div>
+        <div class="mb-3">
           <label class="form-label" style="font-size:12px">Target Stage</label>
-          <input type="text" class="form-control" name="target_stage" required
-                 placeholder="e.g. Application Fee Paid">
-          <div style="font-size:11px;color:#94a3b8;margin-top:4px">Must be a valid stage in the same programme</div>
+          <select class="form-select" name="target_stage" id="baStageSelect" required>
+            <option value="">— select programme first —</option>
+          </select>
         </div>
         <div class="mb-3">
           <label class="form-label" style="font-size:12px">New Start Date</label>
           <input type="date" class="form-control" name="new_start_date"
-                 value="{date.today().strftime('%Y-%m-%d')}">
+                 value="{now_ist().strftime('%Y-%m-%d')}">
         </div>
         <button type="submit" class="btn btn-warning w-100">
           <i class="bi bi-fast-forward-fill"></i> Advance Selected Cases
@@ -6167,6 +6314,23 @@ function updateCount(){
   var n = document.querySelectorAll('.case-cb:checked').length;
   document.getElementById('selCount').textContent = n + ' selected';
 }
+document.getElementById('baProgSelect').addEventListener('change', function(){
+  var prog = this.value;
+  var sel = document.getElementById('baStageSelect');
+  sel.innerHTML = '<option value="">Loading…</option>';
+  if(!prog){ sel.innerHTML='<option value="">— select programme first —</option>'; return; }
+  fetch('/api/stages?programme='+encodeURIComponent(prog))
+    .then(function(r){return r.json();})
+    .then(function(data){
+      sel.innerHTML = '<option value="">— select stage —</option>';
+      (data.stages||[]).forEach(function(s){
+        var o = document.createElement('option');
+        o.value = s; o.textContent = s;
+        sel.appendChild(o);
+      });
+    })
+    .catch(function(){ sel.innerHTML='<option value="">Error loading stages</option>'; });
+});
 </script>"""
     return render_page(content, scripts, active_page="bulk_advance",
                        page_title="Bulk Stage Advance")
@@ -6242,11 +6406,18 @@ def search():
                 base += " AND 1=0"
         base += " LIMIT 50"
         results = [dict(r) for r in conn.execute(base, params).fetchall()]
+        try:
+            _search_db_hols = {datetime.strptime(r[0][:10], "%Y-%m-%d").date()
+                               for r in conn.execute("SELECT holiday_date FROM holidays").fetchall()}
+        except Exception:
+            _search_db_hols = set()
         conn.close()
+    else:
+        _search_db_hols = set()
 
-    today = date.today()
+    today = now_ist().date()
     for c in results:
-        c["days_elapsed"] = working_days_elapsed(c["stage_start_date"], today)
+        c["days_elapsed"] = working_days_elapsed(c["stage_start_date"], today, extra_holidays=_search_db_hols)
 
     rows = ""
     for c in results:
@@ -6272,7 +6443,7 @@ def search():
 <div class="card">
   <div class="card-header">
     <form method="get" class="d-flex gap-2 align-items-center">
-      <input type="text" class="form-control" name="q" value="{q}" placeholder="Search by Application ID or Organisation…" style="max-width:400px">
+      <input type="text" class="form-control" name="q" value="{h(q)}" placeholder="Search by Application ID or Organisation…" style="max-width:400px">
       <button class="btn btn-primary" type="submit"><i class="bi bi-search"></i> Search</button>
     </form>
   </div>
@@ -6281,13 +6452,13 @@ def search():
       <thead><tr><th>App ID</th><th>Organisation</th><th>Programme</th><th>Stage</th><th>Status</th><th>Actions</th></tr></thead>
       <tbody>
         {rows if rows else ('<tr><td colspan="6" style="text-align:center;color:#94a3b8;padding:40px">' +
-          ('No results for "' + q + '"' if q else 'Enter a search term above.') + '</td></tr>')}
+          ('No results for &quot;' + str(h(q)) + '&quot;' if q else 'Enter a search term above.') + '</td></tr>')}
       </tbody>
     </table>
   </div>
 </div>"""
     return render_page(content, active_page="search", page_title="Search Cases",
-                       page_crumb=f"Search: {q}" if q else "Search")
+                       page_crumb=f"Search: {h(q)}" if q else "Search")
 
 
 # ── Analytics / Reports Hub ───────────────────────────────────────────────────
@@ -6297,7 +6468,7 @@ def reports():
     conn = get_db()
     bid = user_board_id()
     ph_progs = user_programme_names()
-    today = date.today()
+    today = now_ist().date()
 
     if bid is not None:
         if ph_progs is not None:
@@ -6325,10 +6496,15 @@ def reports():
         history = [dict(r) for r in conn.execute(
             "SELECT * FROM stage_history ORDER BY timestamp DESC"
         ).fetchall()]
+    try:
+        _rep_db_hols = {datetime.strptime(r[0][:10], "%Y-%m-%d").date()
+                        for r in conn.execute("SELECT holiday_date FROM holidays").fetchall()}
+    except Exception:
+        _rep_db_hols = set()
     conn.close()
 
     for c in cases:
-        c["days_elapsed"] = working_days_elapsed(c["stage_start_date"], today)
+        c["days_elapsed"] = working_days_elapsed(c["stage_start_date"], today, extra_holidays=_rep_db_hols)
 
     # ── TAT Breach Report ──
     breached = [c for c in cases if not c["is_milestone"] and c["tat_days"] > 0
@@ -6496,7 +6672,7 @@ def _export_csv_filtered():
     conn = get_db()
     bid = user_board_id()
     ph_progs = user_programme_names()
-    today = date.today()
+    today = now_ist().date()
     prog_filter = request.form.getlist("prog_filter")
     case_status_f = request.form.get("case_status", "")
     date_from = request.form.get("date_from", "")
@@ -6698,7 +6874,7 @@ def export_excel():
     conn = get_db()
     bid = user_board_id()
     ph_progs = user_programme_names()
-    today = date.today()
+    today = now_ist().date()
 
     # Build filter conditions from POST params
     prog_filter = request.form.getlist("prog_filter")
@@ -6744,10 +6920,15 @@ def export_excel():
         audit = [dict(r) for r in conn.execute(
             "SELECT * FROM audit_log ORDER BY id DESC LIMIT 2000"
         ).fetchall()]
+    try:
+        _excl_db_hols = {datetime.strptime(r[0][:10], "%Y-%m-%d").date()
+                         for r in conn.execute("SELECT holiday_date FROM holidays").fetchall()}
+    except Exception:
+        _excl_db_hols = set()
     conn.close()
 
     for c in cases:
-        c["days_elapsed"] = working_days_elapsed(c["stage_start_date"], today)
+        c["days_elapsed"] = working_days_elapsed(c["stage_start_date"], today, extra_holidays=_excl_db_hols)
         tat = c["tat_days"]
         elapsed = c["days_elapsed"]
         if c["is_milestone"]:
@@ -7333,8 +7514,13 @@ def export_report():
             params.append(date_to)
 
         cases = [dict(r) for r in conn.execute(q, params).fetchall()]
+        try:
+            _export_db_hols = {datetime.strptime(r[0][:10], "%Y-%m-%d").date()
+                               for r in conn.execute("SELECT holiday_date FROM holidays").fetchall()}
+        except Exception:
+            _export_db_hols = set()
         conn.close()
-        today = date.today()
+        today = now_ist().date()
 
         headers_row = [
             "Application ID", "Organisation", "Programme", "Stage", "Owner Type",
@@ -7343,7 +7529,7 @@ def export_report():
         ]
         rows = []
         for c in cases:
-            elapsed = working_days_elapsed(c["stage_start_date"], today, hold_days=c.get("hold_days", 0))
+            elapsed = working_days_elapsed(c["stage_start_date"], today, hold_days=c.get("hold_days", 0), extra_holidays=_export_db_hols)
             if c["is_milestone"]:
                 tat_status = "Milestone"
             elif c.get("status") == "On Hold":
@@ -7530,10 +7716,15 @@ def api_list_cases():
         params.append(request.args["status"])
     q += " LIMIT 200"
     cases = [dict(r) for r in conn.execute(q, params).fetchall()]
+    try:
+        _api_db_hols = {datetime.strptime(r[0][:10], "%Y-%m-%d").date()
+                        for r in conn.execute("SELECT holiday_date FROM holidays").fetchall()}
+    except Exception:
+        _api_db_hols = set()
     conn.close()
-    today = date.today()
+    today = now_ist().date()
     for c in cases:
-        c["days_elapsed"] = working_days_elapsed(c["stage_start_date"], today, hold_days=c.get("hold_days", 0))
+        c["days_elapsed"] = working_days_elapsed(c["stage_start_date"], today, hold_days=c.get("hold_days", 0), extra_holidays=_api_db_hols)
     return jsonify({"ok": True, "count": len(cases), "cases": cases})
 
 
@@ -7550,7 +7741,7 @@ def manage_api_keys():
             board_id = request.form.get("board_id") or None
             conn.execute(
                 "INSERT INTO api_keys (key_hash, name, board_id, created_at) VALUES (?,?,?,?)",
-                (key_hash, name, board_id, datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+                (key_hash, name, board_id, now_ist().strftime("%Y-%m-%d %H:%M:%S"))
             )
             conn.commit()
             flash(f"API key created. Copy it now — it won't be shown again: {raw_key}", "success")
@@ -7680,9 +7871,9 @@ def run_check():
 def _scheduled_job():
     """Run the daily check with an atomic DB-level lock so only one worker fires it."""
     worker_id = secrets.token_hex(8)
-    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    now_str = now_ist().strftime("%Y-%m-%d %H:%M:%S")
     # Stale lock threshold: if another worker crashed, release locks older than 10 min
-    stale_cutoff = (datetime.now() - timedelta(minutes=10)).strftime("%Y-%m-%d %H:%M:%S")
+    stale_cutoff = (now_ist() - timedelta(minutes=10)).strftime("%Y-%m-%d %H:%M:%S")
     conn = get_db()
     try:
         # Delete any stale locks first
