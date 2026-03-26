@@ -403,7 +403,7 @@ def working_days_elapsed(start: str, end_d=None, hold_days: int = 0) -> int:
     count = 0
     cur = s
     while cur <= end_d:
-        if cur.weekday() < 5 and cur not in all_holidays:
+        if cur.weekday() < 5 and cur not in _HOLIDAYS:
             count += 1
         cur += timedelta(days=1)
     return max(0, count - 1 - hold_days)  # days elapsed after start date, minus hold days
