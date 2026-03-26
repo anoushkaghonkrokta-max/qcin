@@ -738,7 +738,12 @@ def board_admin_required(f):
 
 
 # ── CSRF protection ───────────────────────────────────────────────────────────
-_CSRF_EXEMPT_ENDPOINTS = {"login", "logout", "run_check", "run_weekly"}
+_CSRF_EXEMPT_ENDPOINTS = {
+    "login", "logout", "run_check", "run_weekly",
+    # AJAX fetch() POSTs — no form body so csrf_token can't be injected by the DOM snippet;
+    # these routes all require @login_required so session auth still protects them.
+    "save_filter", "delete_filter", "test_smtp",
+}
 _CSRF_EXEMPT_PREFIXES  = ("/api/",)
 
 @app.before_request
@@ -6211,6 +6216,7 @@ def bulk_advance():
                     "suppress_until":      case.get("suppress_until") or None,
                     "_changed_by":         user_name,
                     "_force_advance":      True,
+                    "_suppress_notifications": True,  # Bulk advance: suppress SC emails to avoid flooding
                 }
                 try:
                     upsert_case(upsert_data)
