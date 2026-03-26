@@ -473,12 +473,26 @@ class DBConn:
         self._conn.rollback()
 
     def close(self):
-        self._cur.close()
+        try:
+            self._cur.close()
+        except Exception:
+            pass  # Cursor may be in error state — safe to ignore
         if self._pool:
-            self._conn.rollback()  # Clears any broken/aborted transactions before returning to pool
-            self._pool.putconn(self._conn)
+            try:
+                self._conn.rollback()
+                self._pool.putconn(self._conn)  # Return healthy connection to pool
+            except Exception:
+                # Connection is dead (e.g. Render idle timeout killed it).
+                # Discard it so the pool can create a fresh one on next getconn().
+                try:
+                    self._pool.putconn(self._conn, close=True)
+                except Exception:
+                    pass  # Last resort — give up cleanly
         else:
-            self._conn.close()
+            try:
+                self._conn.close()
+            except Exception:
+                pass
 
 
 def get_db() -> DBConn:
