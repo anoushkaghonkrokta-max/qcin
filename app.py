@@ -363,19 +363,56 @@ def process_email_queue(max_retries: int = 3) -> dict:
     return {"sent": sent, "failed": failed}
 
 
-def fire_webhook(event_type: str, payload: dict):
-    """Fire outbound webhook (WhatsApp/SMS stub). Non-blocking, swallows errors."""
+def queue_webhook(event_type: str, payload: dict, board_id: int = None):
+    """Insert a webhook call into webhook_queue for async batch processing.
+    Never blocks the caller — the scheduler drains the queue periodically."""
     url = get_app_setting("webhook_url", "").strip()
     if not url:
         return
     try:
-        data = json.dumps({"event": event_type, "data": payload}).encode()
-        req = urllib.request.Request(url, data=data,
-                                     headers={"Content-Type": "application/json"},
-                                     method="POST")
-        urllib.request.urlopen(req, timeout=5)
+        conn = get_db()
+        conn.execute(
+            "INSERT INTO webhook_queue (queued_at, event_type, payload, url, status, board_id) "
+            "VALUES (?,?,?,?,?,?)",
+            (now_ist().strftime("%Y-%m-%d %H:%M:%S"), event_type,
+             json.dumps(payload), url, "pending", board_id)
+        )
+        conn.commit()
+        conn.close()
     except Exception as e:
-        log.warning("Webhook fire failed: %s", e)
+        log.warning("queue_webhook failed: %s", e)
+
+
+def _drain_webhook_queue(batch_size: int = 50):
+    """Process pending webhooks in batches. Called by the scheduler, never by a web request."""
+    conn = get_db()
+    pending = conn.execute(
+        "SELECT id, url, event_type, payload FROM webhook_queue WHERE status='pending' "
+        "ORDER BY queued_at ASC LIMIT ?", (batch_size,)
+    ).fetchall()
+    sent = failed = 0
+    for row in pending:
+        try:
+            data = json.dumps({"event": row["event_type"], "data": json.loads(row["payload"])}).encode()
+            req = urllib.request.Request(row["url"], data=data,
+                                         headers={"Content-Type": "application/json"},
+                                         method="POST")
+            urllib.request.urlopen(req, timeout=10)
+            conn.execute("UPDATE webhook_queue SET status='sent', sent_at=? WHERE id=?",
+                         (now_ist().strftime("%Y-%m-%d %H:%M:%S"), row["id"]))
+            sent += 1
+        except Exception as e:
+            conn.execute("UPDATE webhook_queue SET status='failed', sent_at=?, error=? WHERE id=?",
+                         (now_ist().strftime("%Y-%m-%d %H:%M:%S"), str(e)[:500], row["id"]))
+            failed += 1
+    conn.commit()
+    conn.close()
+    if sent or failed:
+        log.info("Webhook drain: %d sent, %d failed", sent, failed)
+
+
+# Legacy alias — kept so grep/search finds it; routes now use queue_webhook
+fire_webhook = queue_webhook
 
 
 # ── Indian public holidays (2025–2027) ──────────────────────────────────────
@@ -391,15 +428,29 @@ _HOLIDAYS = {
 }
 
 
-def working_days_elapsed(start: str, end_d=None, hold_days: int = 0, extra_holidays: set = None) -> int:
-    """Working days from start (inclusive) to end (inclusive, default today).
+def _count_weekdays(d1: date, d2: date) -> int:
+    """O(1) count of weekdays (Mon-Fri) in [d1, d2] inclusive."""
+    if d1 > d2:
+        return 0
+    n = (d2 - d1).days + 1
+    full_weeks, extra = divmod(n, 7)
+    count = full_weeks * 5
+    dow = d1.weekday()
+    for i in range(extra):
+        if (dow + i) % 7 < 5:
+            count += 1
+    return count
 
-    hold_days: subtract paused/on-hold days from the elapsed count.
-    extra_holidays: optional set of date objects with custom DB holidays to merge
-                    with _HOLIDAYS. Pass this from callers that loop over many cases
-                    (fetch once, pass in) to avoid per-call DB queries.
-    start strings longer than 10 chars (e.g. Excel datetime exports) are
-    truncated to the date portion before parsing.
+
+def working_days_elapsed(start: str, end_d=None, hold_days: int = 0, extra_holidays: set = None) -> int:
+    """Business days elapsed between start and end (O(1) + O(H) algorithm).
+
+    Returns the count of working days strictly after start up to and including
+    end_d, minus hold_days. Weekends (Sat/Sun) and holidays are excluded.
+
+    Complexity: O(1) for weekday math + O(H) for holiday scan, where H is the
+    number of holidays (~30 for 3 years). For 10,000 cases this is ~300K simple
+    comparisons instead of the millions of date increments the old while-loop did.
     """
     if end_d is None:
         end_d = now_ist().date()
@@ -407,18 +458,16 @@ def working_days_elapsed(start: str, end_d=None, hold_days: int = 0, extra_holid
         return 0
     try:
         if isinstance(start, str):
-            start = start[:10]  # trim Excel datetime suffix e.g. "2024-01-15 00:00:00"
+            start = start[:10]
         s = datetime.strptime(start, "%Y-%m-%d").date() if isinstance(start, str) else start
     except (ValueError, TypeError):
         return 0
+    if s >= end_d:
+        return 0
     all_hols = _HOLIDAYS if extra_holidays is None else _HOLIDAYS | extra_holidays
-    count = 0
-    cur = s
-    while cur <= end_d:
-        if cur.weekday() < 5 and cur not in all_hols:
-            count += 1
-        cur += timedelta(days=1)
-    return max(0, count - 1 - hold_days)  # days elapsed after start date, minus hold days
+    weekdays = _count_weekdays(s, end_d)
+    hol_on_weekday = sum(1 for hol in all_hols if s <= hol <= end_d and hol.weekday() < 5)
+    return max(0, weekdays - 1 - hol_on_weekday - hold_days)
 
 
 # ── Database helpers ─────────────────────────────────────────────────────────
@@ -700,6 +749,17 @@ def init_db():
             days_overdue_max INTEGER,
             notify_role      TEXT NOT NULL DEFAULT 'program_head',
             UNIQUE(board_id, days_overdue_min)
+        );
+        CREATE TABLE IF NOT EXISTS webhook_queue (
+            id         SERIAL PRIMARY KEY,
+            queued_at  TEXT NOT NULL,
+            event_type TEXT NOT NULL,
+            payload    TEXT NOT NULL DEFAULT '{}',
+            url        TEXT NOT NULL,
+            status     TEXT NOT NULL DEFAULT 'pending',
+            sent_at    TEXT,
+            error      TEXT,
+            board_id   INTEGER REFERENCES boards(id)
         );
     """)
     # Migrate existing DBs: add columns if absent (IF NOT EXISTS is safe to re-run)
@@ -1469,8 +1529,12 @@ def run_weekly_digest():
             "DELETE FROM email_queue WHERE queued_at < ? AND status IN ('sent','failed')",
             (cutoff,)
         )
+        conn.execute(
+            "DELETE FROM webhook_queue WHERE queued_at < ? AND status IN ('sent','failed')",
+            (cutoff,)
+        )
         conn.commit()
-        log.info("Weekly digest cleanup: removed audit/queue records older than %s", cutoff)
+        log.info("Weekly digest cleanup: removed audit/email/webhook records older than %s", cutoff)
     except Exception as e:
         log.warning("Weekly digest cleanup failed: %s", e)
 
@@ -8184,6 +8248,7 @@ else:
                           hour=_sched_hour, minute=_sched_minute, id="daily_check")
         scheduler.add_job(_weekly_digest_job, "cron",
                           day_of_week="mon", hour=8, minute=0, id="weekly_digest")
+        scheduler.add_job(_drain_webhook_queue, "interval", minutes=5, id="webhook_drain")
         scheduler.start()
     except Exception as _sched_err:
         log.warning("APScheduler not available: %s — using no-op stub.", _sched_err)
