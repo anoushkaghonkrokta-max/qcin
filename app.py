@@ -2458,14 +2458,14 @@ def manage_users():
         _uname = u["username"]
         _urole = u["role"]
         remap_btn = (
-            '<button class="btn btn-sm btn-outline-primary" style="font-size:12px;padding:3px 8px" title="Map Programmes" '
-            f'onclick="showRemapPh({json.dumps(str(_uid))}, {json.dumps(str(_uname))}, {json.dumps(str(_urole))})">'
+            f'<button class="btn btn-sm btn-outline-primary btn-remap" style="font-size:12px;padding:3px 8px" title="Map Programmes" '
+            f'data-uid="{h(_uid)}" data-uname="{h(_uname)}" data-urole="{h(_urole)}">'
             '<i class="bi bi-diagram-3"></i></button>'
             if _urole in _REMAP_ROLES else ""
         )
         del_btn = (
-            '<button class="btn btn-sm btn-outline-danger" style="font-size:12px;padding:3px 8px" title="Delete User" '
-            f'onclick="confirmDeleteUser({_uid}, {json.dumps(_uname)})">'
+            f'<button class="btn btn-sm btn-outline-danger btn-del-user" style="font-size:12px;padding:3px 8px" title="Delete User" '
+            f'data-uid="{h(_uid)}" data-uname="{h(_uname)}">'
             '<i class="bi bi-trash"></i></button>'
             if not is_self else ""
         )
@@ -2479,8 +2479,8 @@ def manage_users():
           <td style="font-size:11px;color:#64748b">{last_login_cell}</td>
           <td>
             <div class="d-flex gap-1 align-items-center" style="white-space:nowrap">
-              <button class="btn btn-sm btn-outline-secondary" style="font-size:12px;padding:3px 8px" title="Reset Password"
-                onclick="showResetPw({u['id']}, {json.dumps(u['username'])})">
+              <button class="btn btn-sm btn-outline-secondary btn-reset-pw" style="font-size:12px;padding:3px 8px" title="Reset Password"
+                data-uid="{h(u['id'])}" data-uname="{h(u['username'])}">
                 <i class="bi bi-key"></i></button>
               {remap_btn}
               {del_btn}
@@ -2642,16 +2642,25 @@ def manage_users():
     scripts = """<script>
 var _PROG_ROLES = ['program_officer', 'program_head', 'board_ceo'];
 
-function showResetPw(id, name){
-  document.getElementById('rpUserId').value = id;
-  document.getElementById('rpUser').textContent = name;
-  new bootstrap.Modal(document.getElementById('resetPwModal')).show();
-}
-function confirmDeleteUser(id, name){
-  document.getElementById('delUserId').value = id;
-  document.getElementById('delUserName').textContent = name;
-  new bootstrap.Modal(document.getElementById('delUserModal')).show();
-}
+// ── Event delegation: avoids inline onclick + json.dumps quoting bugs ─────────
+document.addEventListener('click', function(e){
+  var btn = e.target.closest('button');
+  if(!btn) return;
+  if(btn.classList.contains('btn-reset-pw')){
+    document.getElementById('rpUserId').value = btn.dataset.uid;
+    document.getElementById('rpUser').textContent = btn.dataset.uname;
+    new bootstrap.Modal(document.getElementById('resetPwModal')).show();
+  } else if(btn.classList.contains('btn-remap')){
+    document.getElementById('remapPhUserId').value = btn.dataset.uid;
+    document.getElementById('remapPhUser').textContent = btn.dataset.uname + ' (' + btn.dataset.urole + ')';
+    new bootstrap.Modal(document.getElementById('remapPhModal')).show();
+  } else if(btn.classList.contains('btn-del-user')){
+    document.getElementById('delUserId').value = btn.dataset.uid;
+    document.getElementById('delUserName').textContent = btn.dataset.uname;
+    new bootstrap.Modal(document.getElementById('delUserModal')).show();
+  }
+});
+
 function submitDeleteUser(){
   document.getElementById('deleteUserForm').submit();
 }
@@ -2672,11 +2681,6 @@ function toggleRoleFields(){
   if(showProg) filterProgsByBoard();
 }
 toggleRoleFields();
-function showRemapPh(id, name, role){
-  document.getElementById('remapPhUserId').value = id;
-  document.getElementById('remapPhUser').textContent = name + ' (' + role + ')';
-  new bootstrap.Modal(document.getElementById('remapPhModal')).show();
-}
 function filterUsers(q){
   q = q.toLowerCase();
   document.querySelectorAll('#userTable tbody tr').forEach(function(row){
@@ -3218,15 +3222,15 @@ def dashboard():
           <td style="white-space:nowrap">
             <a href="/case-history/{_app_id_h}" class="btn btn-sm btn-action btn-outline-secondary me-1"
                title="History"><i class="bi bi-clock-history"></i></a>
-            <button class="btn btn-sm btn-action btn-outline-success me-1" title="Quick Advance"
-               onclick="openQuickAdvance({c['id']}, {json.dumps(c['application_id'])}, {json.dumps(c['programme_name'])})">
+            <button class="btn btn-sm btn-action btn-outline-success me-1 btn-quick-advance" title="Quick Advance"
+               data-cid="{c['id']}" data-appid="{_app_id_h}" data-prog="{_prog_h}">
                <i class="bi bi-arrow-right-circle"></i></button>
             <a href="/edit-case/{c['id']}" class="btn btn-sm btn-action btn-outline-primary me-1">Edit</a>
-            <button class="btn btn-sm btn-action btn-outline-warning me-1" title="Change Status"
-               onclick="openStatusModal({c['id']}, {json.dumps(c['application_id'])}, {json.dumps(case_st)})">
+            <button class="btn btn-sm btn-action btn-outline-warning me-1 btn-status-modal" title="Change Status"
+               data-cid="{c['id']}" data-appid="{_app_id_h}" data-status="{_case_st_h}">
                <i class="bi bi-toggles"></i></button>
-            <button class="btn btn-sm btn-action btn-outline-danger"
-              onclick="confirmDelete('/delete-case/{c['id']}', {json.dumps(c['application_id'])})">Delete</button>
+            <button class="btn btn-sm btn-action btn-outline-danger btn-del-case"
+               data-url="/delete-case/{c['id']}" data-appid="{_app_id_h}">Delete</button>
           </td>
         </tr>"""
 
@@ -3708,6 +3712,18 @@ def dashboard():
 </button>"""
 
     scripts = """<script>
+// Event delegation — replaces inline onclick+json.dumps which broke on usernames/app IDs with special chars
+document.addEventListener('click', function(e){
+  var btn = e.target.closest('button,a');
+  if(!btn) return;
+  if(btn.classList.contains('btn-quick-advance')){
+    openQuickAdvance(btn.dataset.cid, btn.dataset.appid, btn.dataset.prog);
+  } else if(btn.classList.contains('btn-status-modal')){
+    openStatusModal(btn.dataset.cid, btn.dataset.appid, btn.dataset.status);
+  } else if(btn.classList.contains('btn-del-case')){
+    confirmDelete(btn.dataset.url, btn.dataset.appid);
+  }
+});
 function confirmDelete(url, appId){
   document.getElementById('deleteModalMsg').textContent = 'Delete case ' + appId + '? This cannot be undone.';
   document.getElementById('deleteConfirmBtn').href = url;
@@ -5169,11 +5185,12 @@ def settings():
                 _p_r1 = p.get("reminder1_days") or 0
                 _p_r2 = p.get("reminder2_days") or 0
                 _p_od = p.get("overdue_days") or 0
-                _p_emails = h(p.get("notification_emails") or "")
+                _p_emails_raw = h(p.get("notification_emails") or "")
                 edit_prog_btn = (
-                    f'<button class="btn btn-sm btn-outline-secondary ms-2 flex-shrink-0" '
+                    f'<button class="btn btn-sm btn-outline-secondary ms-2 flex-shrink-0 btn-edit-prog" '
                     f'style="font-size:11px;padding:4px 10px;white-space:nowrap" '
-                    f'onclick="editProgramme({json.dumps(pname)}, {_p_tat}, {_p_r1}, {_p_r2}, {_p_od}, {json.dumps(_p_emails)})">'
+                    f'data-pname="{h(pname)}" data-tat="{_p_tat}" data-r1="{_p_r1}" '
+                    f'data-r2="{_p_r2}" data-od="{_p_od}" data-emails="{_p_emails_raw}">'
                     f'<i class="bi bi-gear"></i> Edit</button>'
                 )
                 del_prog_btn = f"""
@@ -5733,6 +5750,13 @@ function editProgramme(name, tat, r1, r2, od, emails) {
   document.getElementById('ep_emails').value = emails;
   new bootstrap.Modal(document.getElementById('editProgModal')).show();
 }
+// Event delegation for Edit Programme — replaces inline onclick+json.dumps quoting bug
+document.addEventListener('click', function(e){
+  var btn = e.target.closest('.btn-edit-prog');
+  if(!btn) return;
+  editProgramme(btn.dataset.pname, btn.dataset.tat, btn.dataset.r1,
+                btn.dataset.r2, btn.dataset.od, btn.dataset.emails);
+});
 </script>
 <!-- Edit Programme Modal -->
 <div class="modal fade" id="editProgModal" tabindex="-1">
