@@ -8257,10 +8257,12 @@ else:
 
 # ── App startup ───────────────────────────────────────────────────────────────
 # Vercel runs this at cold-start (module import). Tables are created if absent.
-with app.app_context():
-    init_db()
-    migrate_data()
-    seed_data()
+# Skipped when TESTING=1 so pytest can import without a live database.
+if not os.environ.get("TESTING"):
+    with app.app_context():
+        init_db()
+        migrate_data()
+        seed_data()
 
 if __name__ == "__main__":
     app.run(debug=True, use_reloader=False, port=5050)
