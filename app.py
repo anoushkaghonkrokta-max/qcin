@@ -846,6 +846,14 @@ _CSRF_EXEMPT_ENDPOINTS = {
 _CSRF_EXEMPT_PREFIXES  = ("/api/",)
 
 @app.before_request
+def _ensure_csrf_token():
+    """Auto-heal sessions that predate the CSRF feature: generate a token on the
+    fly so users don't have to log out and back in after a deploy."""
+    if "user_id" in session and "csrf_token" not in session:
+        session["csrf_token"] = secrets.token_hex(32)
+
+
+@app.before_request
 def _csrf_protect():
     """Validate CSRF token on every POST that is not an API or login endpoint."""
     if request.method != "POST":
@@ -3077,16 +3085,24 @@ def dashboard():
         base_q += " AND owner_type=?"
         base_params.append(owner_filter)
     if my_cases:
-        po_email = conn.execute(
-            "SELECT email FROM users WHERE id=?", (session["user_id"],)
-        ).fetchone()
-        if po_email and po_email["email"]:
-            base_q += " AND program_officer_email=?"
-            base_params.append(po_email["email"])
+        _role = session.get("role", "")
+        if _role == "program_head":
+            # Programme Heads see cases in their mapped programmes (already filtered by ph_progs above)
+            # If ph_progs is None or empty, the filter is already applied — no extra WHERE needed
+            if not ph_progs:
+                base_q += " AND 1=0"
+                flash("No programmes mapped to your account. Ask an admin to assign programmes.", "info")
         else:
-            # No email on this account — return zero results with a flash hint
-            base_q += " AND 1=0"
-            flash("Your account has no email address set. Add one in your profile so 'My Cases' can filter correctly.", "info")
+            # Program Officers + others: filter by their email as PO
+            po_email = conn.execute(
+                "SELECT email FROM users WHERE id=?", (session["user_id"],)
+            ).fetchone()
+            if po_email and po_email["email"]:
+                base_q += " AND program_officer_email=?"
+                base_params.append(po_email["email"])
+            else:
+                base_q += " AND 1=0"
+                flash("Your account has no email address set. Add one in your profile so 'My Cases' can filter correctly.", "info")
 
     # ── Stat card counts — lightweight query on full filtered set ──
     stat_q = f"SELECT stage_start_date, tat_days, reminder2_day, is_milestone FROM ({base_q}) _sub"
@@ -4439,6 +4455,15 @@ document.getElementById('progSelect').addEventListener('change', function(){{
   loadStages(this.value, '');
 }});
 loadStages("{case['programme_name']}", _currentStage);
+// Auto-reset date to today when stage is changed (prevents instant SLA breach)
+document.getElementById('stageSelect').addEventListener('change', function(){{
+  if(this.value !== _currentStage){{
+    var dateInput = document.querySelector('input[name="stage_start_date"]');
+    dateInput.value = new Date().toISOString().slice(0,10);
+    dateInput.style.outline = '2px solid #d97706';
+    setTimeout(function(){{ dateInput.style.outline=''; }}, 2000);
+  }}
+}});
 </script>"""
     return render_page(content, scripts, active_page="",
                        page_title="Edit Case",
@@ -6917,48 +6942,106 @@ def reports():
 def assessor_scorecard():
     conn = get_db()
     bid = user_board_id()
-    q = """SELECT action_owner_email, action_owner_name,
+
+    # ── Tab 1: Active bottlenecks (current owner = Assessor) ──
+    q_active = """SELECT action_owner_email, action_owner_name,
                COUNT(*) AS total_cases,
-               SUM(r1_sent) AS r1_count,
-               SUM(r2_sent) AS r2_count,
+               SUM(r1_sent) AS r1_count, SUM(r2_sent) AS r2_count,
                SUM(overdue_sent) AS overdue_count,
                ROUND(100.0 * SUM(overdue_sent) / NULLIF(COUNT(*),0), 1) AS overdue_rate
                FROM case_tracking WHERE owner_type='Assessor'"""
     if bid is not None:
-        rows = conn.execute(q + " AND board_id=? GROUP BY action_owner_email, action_owner_name ORDER BY overdue_rate DESC NULLS LAST", (bid,)).fetchall()
+        active_rows = [dict(r) for r in conn.execute(q_active + " AND board_id=? GROUP BY action_owner_email, action_owner_name ORDER BY overdue_rate DESC", (bid,)).fetchall()]
     else:
-        rows = conn.execute(q + " GROUP BY action_owner_email, action_owner_name ORDER BY overdue_rate DESC NULLS LAST").fetchall()
-    conn.close()
-    rows = [dict(r) for r in rows]
+        active_rows = [dict(r) for r in conn.execute(q_active + " GROUP BY action_owner_email, action_owner_name ORDER BY overdue_rate DESC").fetchall()]
 
-    trs = ""
-    for r in rows:
+    # ── Tab 2: Historical performance (from stage_history) ──
+    # Get assessor-owned stages from programme_config
+    if bid is not None:
+        hist_rows = [dict(r) for r in conn.execute(
+            """SELECT sh.changed_by AS assessor,
+                      COUNT(*) AS total_transitions,
+                      COUNT(CASE WHEN pc.tat_days > 0 THEN 1 END) AS tracked_stages
+               FROM stage_history sh
+               LEFT JOIN programme_config pc ON pc.stage_name = sh.to_stage
+                 AND pc.programme_name = (SELECT programme_name FROM case_tracking WHERE application_id = sh.application_id LIMIT 1)
+               WHERE sh.board_id=? AND pc.owner_type = 'Assessor'
+               GROUP BY sh.changed_by ORDER BY total_transitions DESC""", (bid,)
+        ).fetchall()]
+    else:
+        hist_rows = [dict(r) for r in conn.execute(
+            """SELECT sh.changed_by AS assessor,
+                      COUNT(*) AS total_transitions,
+                      COUNT(CASE WHEN pc.tat_days > 0 THEN 1 END) AS tracked_stages
+               FROM stage_history sh
+               LEFT JOIN programme_config pc ON pc.stage_name = sh.to_stage
+                 AND pc.programme_name = (SELECT programme_name FROM case_tracking WHERE application_id = sh.application_id LIMIT 1)
+               WHERE pc.owner_type = 'Assessor'
+               GROUP BY sh.changed_by ORDER BY total_transitions DESC"""
+        ).fetchall()]
+    conn.close()
+
+    # ── Build active bottlenecks table ──
+    active_trs = ""
+    for r in active_rows:
         rate = float(r["overdue_rate"] or 0)
         badge_color = "#dc2626" if rate >= 50 else "#d97706" if rate >= 25 else "#00984C"
-        trs += (f'<tr><td style="font-weight:500">{h(r["action_owner_name"] or "—")}</td>'
+        active_trs += (f'<tr><td style="font-weight:500">{h(r["action_owner_name"] or "—")}</td>'
                 f'<td style="font-size:12px;color:#64748b">{h(r["action_owner_email"])}</td>'
                 f'<td style="text-align:center">{r["total_cases"]}</td>'
                 f'<td style="text-align:center;color:#d97706">{r["r1_count"]}</td>'
                 f'<td style="text-align:center;color:#dc2626">{r["r2_count"]}</td>'
                 f'<td style="text-align:center;color:#7c3aed">{r["overdue_count"]}</td>'
                 f'<td style="text-align:center;font-weight:700;color:{badge_color}">{rate}%</td></tr>')
-    if not trs:
-        trs = '<tr><td colspan="7" style="text-align:center;color:#94a3b8;padding:32px">No assessor data yet. Cases appear here once owner_type=Assessor cases are tracked.</td></tr>'
+    if not active_trs:
+        active_trs = '<tr><td colspan="7" style="text-align:center;color:#94a3b8;padding:32px">No active assessor cases</td></tr>'
+
+    # ── Build history table ──
+    hist_trs = ""
+    for r in hist_rows:
+        hist_trs += (f'<tr><td style="font-weight:500">{h(r["assessor"] or "—")}</td>'
+                     f'<td style="text-align:center">{r["total_transitions"]}</td>'
+                     f'<td style="text-align:center">{r["tracked_stages"]}</td></tr>')
+    if not hist_trs:
+        hist_trs = '<tr><td colspan="3" style="text-align:center;color:#94a3b8;padding:32px">No stage history data yet</td></tr>'
 
     content = f"""
 <div style="max-width:1100px;margin:0 auto">
-  <div class="card">
-    <div class="card-header"><i class="bi bi-person-badge" style="color:var(--accent)"></i> Assessor Performance Scorecard</div>
-    <div class="card-body p-0">
-      <table class="table table-hover mb-0" style="font-size:13px">
-        <thead><tr style="background:#f8fafc">
-          <th style="padding:10px 16px">Name</th><th>Email</th>
-          <th style="text-align:center">Cases</th><th style="text-align:center">R1 Sent</th>
-          <th style="text-align:center">R2 Sent</th><th style="text-align:center">Overdue</th>
-          <th style="text-align:center">Overdue %</th>
-        </tr></thead>
-        <tbody>{trs}</tbody>
-      </table>
+  <ul class="nav nav-tabs mb-3" role="tablist">
+    <li class="nav-item"><a class="nav-link active" data-bs-toggle="tab" href="#activeTab">Active Bottlenecks</a></li>
+    <li class="nav-item"><a class="nav-link" data-bs-toggle="tab" href="#historyTab">Historical Performance</a></li>
+  </ul>
+  <div class="tab-content">
+    <div class="tab-pane fade show active" id="activeTab">
+      <div class="card">
+        <div class="card-header"><i class="bi bi-exclamation-triangle" style="color:#d97706"></i> Current Assessor Bottlenecks</div>
+        <div class="card-body p-0">
+          <table class="table table-hover mb-0" style="font-size:13px">
+            <thead><tr style="background:#f8fafc">
+              <th style="padding:10px 16px">Name</th><th>Email</th>
+              <th style="text-align:center">Cases</th><th style="text-align:center">R1</th>
+              <th style="text-align:center">R2</th><th style="text-align:center">Overdue</th>
+              <th style="text-align:center">Overdue %</th>
+            </tr></thead>
+            <tbody>{active_trs}</tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+    <div class="tab-pane fade" id="historyTab">
+      <div class="card">
+        <div class="card-header"><i class="bi bi-clock-history" style="color:var(--accent)"></i> Historical Assessor Activity (from stage_history)</div>
+        <div class="card-body p-0">
+          <table class="table table-hover mb-0" style="font-size:13px">
+            <thead><tr style="background:#f8fafc">
+              <th style="padding:10px 16px">Assessor</th>
+              <th style="text-align:center">Total Transitions</th>
+              <th style="text-align:center">TAT-Tracked Stages</th>
+            </tr></thead>
+            <tbody>{hist_trs}</tbody>
+          </table>
+        </div>
+      </div>
     </div>
   </div>
 </div>"""
@@ -7482,6 +7565,33 @@ def system_settings():
             conn.close()
             flash("Holiday removed.", "success")
 
+        elif action == "save_escalation_rule":
+            _bid = request.form.get("esc_board_id") or None
+            _min = int(request.form.get("esc_min", 1))
+            _max = request.form.get("esc_max", "").strip()
+            _max = int(_max) if _max else None
+            _role = request.form.get("esc_role", "program_head")
+            conn = get_db()
+            try:
+                conn.execute(
+                    "INSERT INTO escalation_matrix (board_id, days_overdue_min, days_overdue_max, notify_role) "
+                    "VALUES (?,?,?,?) ON CONFLICT (board_id, days_overdue_min) DO UPDATE SET "
+                    "days_overdue_max=EXCLUDED.days_overdue_max, notify_role=EXCLUDED.notify_role",
+                    (_bid, _min, _max, _role))
+                conn.commit()
+                flash(f"Escalation rule saved: {_min}-{_max or '∞'} days → {_role}", "success")
+            except Exception as e:
+                flash(f"Error: {e}", "error")
+            conn.close()
+
+        elif action == "delete_escalation_rule":
+            _eid = request.form.get("esc_id")
+            conn = get_db()
+            conn.execute("DELETE FROM escalation_matrix WHERE id=?", (_eid,))
+            conn.commit()
+            conn.close()
+            flash("Escalation rule removed.", "success")
+
         elif action == "save_digest":
             set_app_setting("digest_enabled", "1" if request.form.get("digest_enabled") else "0")
             set_app_setting("ph_escalation_days", request.form.get("ph_escalation_days", "5"))
@@ -7501,6 +7611,11 @@ def system_settings():
     conn = get_db()
     users = [dict(r) for r in conn.execute("SELECT id, username, totp_secret, force_password_reset FROM users ORDER BY username").fetchall()]
     holidays_list = [dict(r) for r in conn.execute("SELECT * FROM holidays ORDER BY holiday_date").fetchall()]
+    boards_list = [dict(r) for r in conn.execute("SELECT id, board_name FROM boards ORDER BY board_name").fetchall()]
+    esc_rules = [dict(r) for r in conn.execute(
+        "SELECT em.*, b.board_name FROM escalation_matrix em "
+        "LEFT JOIN boards b ON em.board_id = b.id ORDER BY em.board_id, em.days_overdue_min"
+    ).fetchall()]
     conn.close()
 
     user_rows = ""
@@ -7545,6 +7660,25 @@ def system_settings():
         f'</form></td></tr>'
         for h in holidays_list
     ) or '<tr><td colspan="3" style="text-align:center;color:#94a3b8;padding:16px;font-size:13px">No custom holidays added (built-in Indian holidays are always applied)</td></tr>'
+
+    # ── Build escalation matrix HTML ──
+    esc_rows_html = ""
+    for er in esc_rules:
+        _max_disp = str(er["days_overdue_max"]) if er["days_overdue_max"] else "∞"
+        _role_badge = {"program_head": "PH", "board_ceo": "CEO", "board_admin": "Admin"}.get(er["notify_role"], er["notify_role"])
+        _role_color = {"program_head": "#0094ca", "board_ceo": "#d97706", "board_admin": "#dc2626"}.get(er["notify_role"], "#64748b")
+        esc_rows_html += (
+            f'<tr><td>{h(er.get("board_name") or "All Boards")}</td>'
+            f'<td style="text-align:center">{er["days_overdue_min"]} – {_max_disp}</td>'
+            f'<td><span style="background:{_role_color}22;color:{_role_color};padding:2px 8px;border-radius:4px;font-size:11px;font-weight:600">{_role_badge}</span></td>'
+            f'<td><form method="post" class="d-inline"><input type="hidden" name="action" value="delete_escalation_rule">'
+            f'<input type="hidden" name="esc_id" value="{er["id"]}">'
+            f'<button class="btn btn-xs btn-outline-danger" style="font-size:11px;padding:1px 8px">✕</button></form></td></tr>')
+    if not esc_rows_html:
+        esc_rows_html = '<tr><td colspan="4" style="text-align:center;color:#94a3b8;padding:16px;font-size:13px">No rules configured</td></tr>'
+
+    board_opts_esc = '<option value="">All Boards</option>' + "".join(
+        f'<option value="{b["id"]}">{b["board_name"]}</option>' for b in boards_list)
 
     content = f"""
 <div class="row g-4">
@@ -7677,6 +7811,48 @@ def system_settings():
           <thead><tr><th>Username</th><th>2FA</th><th>PW Reset</th><th>Actions</th></tr></thead>
           <tbody>{user_rows}</tbody>
         </table>
+      </div>
+    </div>
+
+    <div class="card mt-4">
+      <div class="card-header"><i class="bi bi-diagram-3" style="color:#dc2626"></i> Escalation Rules</div>
+      <div class="card-body p-3">
+        <p style="font-size:12px;color:#64748b;margin-bottom:12px">
+          Define when overdue cases escalate to higher roles. The scheduler checks these rules daily.
+        </p>
+        <div style="overflow-x:auto">
+          <table class="data-table">
+            <thead><tr><th>Board</th><th style="text-align:center">Days Overdue</th><th>Notify Role</th><th></th></tr></thead>
+            <tbody>{esc_rows_html}</tbody>
+          </table>
+        </div>
+        <hr style="margin:16px 0;border-color:#f1f5f9">
+        <form method="post" class="row g-2 align-items-end">
+          <input type="hidden" name="action" value="save_escalation_rule">
+          <div class="col-auto">
+            <label class="form-label" style="font-size:11px">Board</label>
+            <select class="form-select form-select-sm" name="esc_board_id" style="min-width:120px">{board_opts_esc}</select>
+          </div>
+          <div class="col-auto">
+            <label class="form-label" style="font-size:11px">From Day</label>
+            <input type="number" class="form-control form-control-sm" name="esc_min" value="1" min="1" style="width:80px" required>
+          </div>
+          <div class="col-auto">
+            <label class="form-label" style="font-size:11px">To Day <span style="color:#94a3b8">(blank=∞)</span></label>
+            <input type="number" class="form-control form-control-sm" name="esc_max" placeholder="∞" style="width:80px">
+          </div>
+          <div class="col-auto">
+            <label class="form-label" style="font-size:11px">Notify</label>
+            <select class="form-select form-select-sm" name="esc_role" style="min-width:140px">
+              <option value="program_head">Programme Head</option>
+              <option value="board_ceo">Board CEO</option>
+              <option value="board_admin">Board Admin</option>
+            </select>
+          </div>
+          <div class="col-auto">
+            <button class="btn btn-sm btn-primary"><i class="bi bi-plus-lg"></i> Add Rule</button>
+          </div>
+        </form>
       </div>
     </div>
   </div>
