@@ -428,6 +428,31 @@ def working_days_elapsed(start: str, end_d=None, hold_days: int = 0, extra_holid
 _db_pool: "psycopg2.pool.ThreadedConnectionPool | None" = None
 
 
+def _pg_sql(sql: str) -> str:
+    """Convert SQLite-style ? placeholders to PostgreSQL %s.
+    Skips ? characters inside SQL string literals so that literal question
+    marks in VALUES/LIKE clauses are never mis-converted."""
+    result = []
+    in_single = False
+    esc = False
+    for ch in sql:
+        if esc:
+            esc = False
+            result.append(ch)
+            continue
+        if ch == '\\':
+            esc = True
+            result.append(ch)
+            continue
+        if ch == "'":
+            in_single = not in_single
+        elif ch == '?' and not in_single:
+            result.append('%s')
+            continue
+        result.append(ch)
+    return ''.join(result)
+
+
 def _get_pool() -> "psycopg2.pool.ThreadedConnectionPool":
     global _db_pool
     if _db_pool is None or _db_pool.closed:
@@ -458,7 +483,7 @@ class DBConn:
         self._cur = pg_conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
 
     def execute(self, sql, params=()):
-        pg_sql = sql.replace("?", "%s")
+        pg_sql = _pg_sql(sql)
         if params:
             self._cur.execute(pg_sql, params)
         else:
@@ -569,7 +594,9 @@ def init_db():
             overdue_sent         INTEGER NOT NULL DEFAULT 0,
             overdue_count        INTEGER NOT NULL DEFAULT 0,
             last_overdue_date    TEXT,
-            is_milestone         INTEGER NOT NULL DEFAULT 0
+            is_milestone         INTEGER NOT NULL DEFAULT 0,
+            iteration_count      INTEGER NOT NULL DEFAULT 1,
+            escalation_tier      INTEGER NOT NULL DEFAULT 0
         );
         CREATE TABLE IF NOT EXISTS email_templates (
             id                INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -659,11 +686,20 @@ def init_db():
         CREATE TABLE IF NOT EXISTS api_keys (
             id         SERIAL PRIMARY KEY,
             key_hash   TEXT NOT NULL UNIQUE,
+            key_prefix TEXT,
             name       TEXT NOT NULL,
             board_id   INTEGER REFERENCES boards(id),
             created_at TEXT NOT NULL,
             last_used  TEXT,
             is_active  INTEGER NOT NULL DEFAULT 1
+        );
+        CREATE TABLE IF NOT EXISTS escalation_matrix (
+            id               SERIAL PRIMARY KEY,
+            board_id         INTEGER REFERENCES boards(id),
+            days_overdue_min INTEGER NOT NULL DEFAULT 1,
+            days_overdue_max INTEGER,
+            notify_role      TEXT NOT NULL DEFAULT 'program_head',
+            UNIQUE(board_id, days_overdue_min)
         );
     """)
     # Migrate existing DBs: add columns if absent (IF NOT EXISTS is safe to re-run)
@@ -691,6 +727,9 @@ def init_db():
         "ALTER TABLE programmes ADD COLUMN IF NOT EXISTS overdue_days INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE programmes ADD COLUMN IF NOT EXISTS notification_emails TEXT",
         "ALTER TABLE case_tracking ADD COLUMN IF NOT EXISTS escalation_sent INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS key_prefix TEXT",
+        "ALTER TABLE case_tracking ADD COLUMN IF NOT EXISTS iteration_count INTEGER NOT NULL DEFAULT 1",
+        "ALTER TABLE case_tracking ADD COLUMN IF NOT EXISTS escalation_tier INTEGER NOT NULL DEFAULT 0",
     ]:
         try:
             conn.execute(sql)
@@ -984,6 +1023,24 @@ def seed_data():
                 (*row, nabh_id),
             )
     conn.commit()
+    try:
+        _all_boards = conn.execute("SELECT id FROM boards").fetchall()
+        for _br in _all_boards:
+            _bid = _br[0]
+            for _min, _max, _role in [
+                (1, 7, "program_head"),
+                (8, 30, "board_ceo"),
+                (31, None, "board_admin"),
+            ]:
+                conn.execute(
+                    "INSERT INTO escalation_matrix (board_id, days_overdue_min, days_overdue_max, notify_role) "
+                    "VALUES (?,?,?,?) ON CONFLICT (board_id, days_overdue_min) DO NOTHING",
+                    (_bid, _min, _max, _role)
+                )
+        conn.commit()
+    except Exception as _e:
+        conn.rollback()
+        log.warning("Escalation matrix seed failed: %s", _e)
     conn.close()
 
 
@@ -1210,26 +1267,39 @@ def run_daily_check(board_id=None) -> dict:
             return True
 
         def _escalate_to_ph():
-            """Queue escalation emails to Programme Heads mapped to this programme.
-            Guards against spam by checking escalation_sent flag."""
-            if case.get("escalation_sent"):
-                return  # Already escalated for this stage period
-            escalation_threshold = int(get_app_setting("ph_escalation_days", "5"))
+            """Multi-tier escalation using escalation_matrix table."""
             days_overdue = elapsed - tat
-            if days_overdue < escalation_threshold:
+            if days_overdue <= 0:
                 return
-            ph_users = _ph_map.get(case["programme_name"], [])
+            # Find applicable tier from matrix
+            matrix_rows = conn.execute(
+                "SELECT * FROM escalation_matrix WHERE board_id=? AND days_overdue_min <= ? "
+                "AND (days_overdue_max IS NULL OR days_overdue_max >= ?) ORDER BY days_overdue_min DESC LIMIT 1",
+                (case.get("board_id"), days_overdue, days_overdue)
+            ).fetchone()
+            if not matrix_rows:
+                return
+            tier_index = {"program_head": 1, "board_ceo": 2, "board_admin": 3}.get(matrix_rows["notify_role"], 1)
+            if case.get("escalation_tier", 0) >= tier_index:
+                return  # Already escalated at this or higher tier
+            # Find users with the required role scoped to board
+            notify_role = matrix_rows["notify_role"]
+            target_users = conn.execute(
+                "SELECT email, full_name FROM users WHERE role=? AND board_id=? AND email IS NOT NULL",
+                (notify_role, case.get("board_id"))
+            ).fetchall()
             queued = False
-            for ph_user in ph_users:
-                if not ph_user["email"]:
+            for t_user in target_users:
+                if not t_user["email"]:
                     continue
                 esc_ph = {**ph,
-                          "Action_Owner_Name": ph_user["full_name"] or ph_user["email"],
-                          "Days_Overdue": days_overdue}
+                          "Action_Owner_Name": t_user["full_name"] or t_user["email"],
+                          "Days_Overdue": days_overdue,
+                          "Escalation_Role": notify_role}
                 if sender_email:
                     queue_email(
                         case["programme_name"], "Escalation",
-                        ph_user["email"], cc,
+                        t_user["email"], cc,
                         sender_email, sender_pw_enc, esc_ph,
                         smtp_host, smtp_port,
                         case["application_id"], case.get("board_id"),
@@ -1238,7 +1308,8 @@ def run_daily_check(board_id=None) -> dict:
                     queued = True
             if queued:
                 conn.execute(
-                    "UPDATE case_tracking SET escalation_sent=1 WHERE id=?", (case["id"],)
+                    "UPDATE case_tracking SET escalation_sent=1, escalation_tier=? WHERE id=?",
+                    (tier_index, case["id"])
                 )
                 conn.commit()
 
@@ -1388,8 +1459,16 @@ def run_weekly_digest():
     # Clean up old audit and email queue records
     try:
         cutoff = (now_ist() - timedelta(days=90)).strftime("%Y-%m-%d")
-        conn.execute("DELETE FROM audit_log WHERE timestamp < ?", (cutoff,))
-        conn.execute("DELETE FROM email_queue WHERE queued_at < ? AND status != 'pending'", (cutoff,))
+        # Only purge high-volume low-value logs; retain structural events forever
+        conn.execute(
+            "DELETE FROM audit_log WHERE timestamp < ? AND event_type IN "
+            "('email_sent','scheduled_check','run_check','bulk_advance')",
+            (cutoff,)
+        )
+        conn.execute(
+            "DELETE FROM email_queue WHERE queued_at < ? AND status IN ('sent','failed')",
+            (cutoff,)
+        )
         conn.commit()
         log.info("Weekly digest cleanup: removed audit/queue records older than %s", cutoff)
     except Exception as e:
@@ -1404,7 +1483,7 @@ def upsert_case(data: dict) -> str:
     conn = get_db()
     try:
         cfg = conn.execute(
-            "SELECT tat_days,reminder1_day,reminder2_day,owner_type,is_milestone,overdue_interval_days,board_id "
+            "SELECT tat_days,reminder1_day,reminder2_day,owner_type,is_milestone,overdue_interval_days,board_id,stage_order "
             "FROM programme_config WHERE programme_name=? AND stage_name=?",
             (data["programme_name"], data["stage_name"]),
         ).fetchone()
@@ -1419,6 +1498,15 @@ def upsert_case(data: dict) -> str:
         if existing:
             old_stage = existing["current_stage"]
             new_stage = data["stage_name"]
+            _cur_order_row = conn.execute(
+                "SELECT stage_order FROM programme_config WHERE programme_name=? AND stage_name=?",
+                (data["programme_name"], existing["current_stage"])
+            ).fetchone()
+            _is_regression = bool(
+                _cur_order_row and cfg.get("stage_order") is not None and
+                _cur_order_row["stage_order"] is not None and
+                cfg["stage_order"] < _cur_order_row["stage_order"]
+            )
             conn.execute(
                 """UPDATE case_tracking SET
                    programme_name=?, organisation_name=?, current_stage=?, stage_start_date=?,
@@ -1426,7 +1514,7 @@ def upsert_case(data: dict) -> str:
                    action_owner_name=?, action_owner_email=?, program_officer_email=?,
                    r1_sent=0, r2_sent=0, overdue_sent=0, overdue_count=0,
                    last_overdue_date=NULL, is_milestone=?, board_id=?,
-                   cc_emails=?, suppress_until=?, escalation_sent=0
+                   cc_emails=?, suppress_until=?, escalation_sent=0, escalation_tier=0
                    WHERE application_id=?""",
                 (data["programme_name"], data["organisation_name"], data["stage_name"],
                  data["stage_start_date"], cfg["tat_days"], cfg["reminder1_day"], cfg["reminder2_day"],
@@ -1436,6 +1524,12 @@ def upsert_case(data: dict) -> str:
                  data["application_id"]),
             )
             conn.commit()
+            if _is_regression:
+                conn.execute(
+                    "UPDATE case_tracking SET iteration_count = iteration_count + 1 WHERE application_id=?",
+                    (data["application_id"],)
+                )
+                conn.commit()
             action = "updated"
         else:
             conn.execute(
@@ -1466,6 +1560,10 @@ def upsert_case(data: dict) -> str:
                                  data.get("_changed_by", ""), board_id)
             log_audit("stage_change", data["application_id"],
                       f"{old_stage} → {new_stage}", data.get("_changed_by", ""), board_id)
+            if _is_regression:
+                log_audit("stage_regression", data["application_id"],
+                          f"Stage regressed: {existing['current_stage']} → {data['stage_name']}",
+                          data.get("_changed_by", ""), board_id)
             for _skipped in data.get("_skipped_stages", []):
                 log_audit("stage_skipped", data["application_id"],
                           f"Optional stage skipped: {_skipped}", data.get("_changed_by", ""), board_id)
@@ -1773,6 +1871,11 @@ document.addEventListener('DOMContentLoaded', function() {
     <a class="nav-link {{ 'active' if active_page=='reports' else '' }}" href="/reports">
       <i class="bi bi-graph-up"></i> Analytics
     </a>
+    {% if user_role in ('super_admin', 'board_admin') %}
+    <a class="nav-link {{ 'active' if active_page=='assessor_scorecard' else '' }}" href="/assessor-scorecard">
+      <i class="bi bi-person-badge"></i> Assessor Scorecard
+    </a>
+    {% endif %}
     <a class="nav-link {{ 'active' if active_page=='export_excel' else '' }}" href="/export-excel">
       <i class="bi bi-file-earmark-excel"></i> Export Report
     </a>
@@ -2921,42 +3024,55 @@ def dashboard():
             base_q += " AND 1=0"
             flash("Your account has no email address set. Add one in your profile so 'My Cases' can filter correctly.", "info")
 
-    cases = [dict(r) for r in conn.execute(base_q, base_params).fetchall()]
-    try:
-        _dash_db_hols = {datetime.strptime(r[0][:10], "%Y-%m-%d").date()
-                         for r in conn.execute("SELECT holiday_date FROM holidays").fetchall()}
-    except Exception:
-        _dash_db_hols = set()
-    conn.close()
+    # ── Stat card counts — lightweight query on full filtered set ──
+    stat_q = f"SELECT stage_start_date, tat_days, reminder2_day, is_milestone FROM ({base_q}) _sub"
+    stat_rows = [dict(r) for r in conn.execute(stat_q, base_params).fetchall()]
 
     today = now_ist().date()
-    for c in cases:
-        c["days_elapsed"] = working_days_elapsed(c["stage_start_date"], today, hold_days=c.get("hold_days", 0), extra_holidays=_dash_db_hols)
+    n_total    = len(stat_rows)
+    n_overdue  = 0
+    n_at_risk  = 0
+    n_milestone= 0
+    for _s in stat_rows:
+        if _s["is_milestone"]:
+            n_milestone += 1
+        elif _s["tat_days"] > 0:
+            _el = working_days_elapsed(_s["stage_start_date"], today)
+            if _el >= _s["tat_days"]:
+                n_overdue += 1
+            elif _el >= _s["reminder2_day"]:
+                n_at_risk += 1
+    n_ok = n_total - n_overdue - n_at_risk - n_milestone
 
-    reverse = sort.endswith("_desc")
-    key = sort.replace("_desc", "").replace("_asc", "")
-    key_map = {"elapsed": "days_elapsed", "app": "application_id", "org": "organisation_name"}
-    sort_key = key_map.get(key, "days_elapsed")
-    cases.sort(key=lambda x: (x.get(sort_key) or 0), reverse=reverse)
-
-    # Compute stat card counts (on full set)
-    n_total    = len(cases)
-    n_overdue  = sum(1 for c in cases if not c["is_milestone"] and c["tat_days"] > 0 and c["days_elapsed"] >= c["tat_days"])
-    n_at_risk  = sum(1 for c in cases if not c["is_milestone"] and c["tat_days"] > 0
-                     and c["days_elapsed"] >= c["reminder2_day"] and c["days_elapsed"] < c["tat_days"])
-    n_ok       = n_total - n_overdue - n_at_risk - sum(1 for c in cases if c["is_milestone"])
-    n_milestone= sum(1 for c in cases if c["is_milestone"])
-
-    # Paginate
-    PAGE_SIZE = 50
-    page = max(1, int(request.args.get("page", 1)))
+    # ── Pagination — fetch only current page from the DB ──
+    PAGE_SIZE   = 50
+    page        = max(1, int(request.args.get("page", 1)))
     total_count = n_total
-    start_idx = (page - 1) * PAGE_SIZE
-    page_cases = cases[start_idx : start_idx + PAGE_SIZE]
     total_pages = max(1, (total_count + PAGE_SIZE - 1) // PAGE_SIZE)
-    page = min(page, total_pages)
-    start_idx = (page - 1) * PAGE_SIZE
-    page_cases = cases[start_idx : start_idx + PAGE_SIZE]
+    page        = min(page, total_pages)
+
+    # SQL sort (calendar-day approximation; exact business days computed for page rows only)
+    if sort == "elapsed_desc":
+        order_clause = "ORDER BY stage_start_date ASC"
+    elif sort == "elapsed_asc":
+        order_clause = "ORDER BY stage_start_date DESC"
+    elif sort in ("app_desc", "app_asc"):
+        order_clause = f"ORDER BY application_id {'DESC' if sort.endswith('desc') else 'ASC'}"
+    elif sort in ("org_desc", "org_asc"):
+        order_clause = f"ORDER BY organisation_name {'DESC' if sort.endswith('desc') else 'ASC'}"
+    else:
+        order_clause = "ORDER BY stage_start_date ASC"
+
+    page_q      = f"{base_q} {order_clause} LIMIT ? OFFSET ?"
+    page_params = base_params + [PAGE_SIZE, (page - 1) * PAGE_SIZE]
+    page_cases  = [dict(r) for r in conn.execute(page_q, page_params).fetchall()]
+    conn.close()
+
+    # Exact business-day elapsed only for the 50 rows on this page
+    for c in page_cases:
+        c["days_elapsed"] = working_days_elapsed(c["stage_start_date"], today, hold_days=c.get("hold_days", 0))
+
+    cases = page_cases  # used by rows_html loop below
 
     rows_html = ""
     for c in page_cases:
@@ -3311,7 +3427,8 @@ def dashboard():
             args = request.args.to_dict()
             args["page"] = p
             return url_for("dashboard", **args)
-        _pagination_html = f'<div class="d-flex justify-content-between align-items-center mt-3 px-1"><div style="font-size:12px;color:#94a3b8">Showing {start_idx+1}–{min(start_idx+PAGE_SIZE, total_count)} of {total_count} cases</div><nav><ul class="pagination pagination-sm mb-0"><li class="page-item {"disabled" if page==1 else ""}"><a class="page-link" href="{page_url(prev_page)}">&#8249; Prev</a></li>'
+        _start_idx = (page - 1) * PAGE_SIZE
+        _pagination_html = f'<div class="d-flex justify-content-between align-items-center mt-3 px-1"><div style="font-size:12px;color:#94a3b8">Showing {_start_idx+1}–{min(_start_idx+PAGE_SIZE, total_count)} of {total_count} cases</div><nav><ul class="pagination pagination-sm mb-0"><li class="page-item {"disabled" if page==1 else ""}"><a class="page-link" href="{page_url(prev_page)}">&#8249; Prev</a></li>'
         for _p in range(max(1, page-2), min(total_pages+1, page+3)):
             _pagination_html += f'<li class="page-item {"active" if _p==page else ""}"><a class="page-link" href="{page_url(_p)}">{_p}</a></li>'
         _pagination_html += f'<li class="page-item {"disabled" if page==total_pages else ""}"><a class="page-link" href="{page_url(next_page)}">Next &#8250;</a></li></ul></nav></div>'
@@ -3769,6 +3886,39 @@ def api_stages():
     ).fetchall()
     conn.close()
     return jsonify([dict(r) for r in rows])
+
+
+@app.route("/api/preview-tat-impact")
+@board_admin_required
+def preview_tat_impact():
+    programme = request.args.get("programme", "")
+    stage     = request.args.get("stage", "")
+    try:
+        new_tat = int(request.args.get("tat", "0"))
+    except ValueError:
+        return jsonify({"error": "Invalid TAT value"})
+    if not programme or not stage:
+        return jsonify({"error": "programme and stage required"})
+    conn = get_db()
+    bid = user_board_id()
+    params = [programme, stage]
+    q = "SELECT stage_start_date, tat_days FROM case_tracking WHERE programme_name=? AND current_stage=?"
+    if bid is not None:
+        q += " AND board_id=?"
+        params.append(bid)
+    cases = conn.execute(q, params).fetchall()
+    conn.close()
+    today = now_ist().date()
+    total = len(cases)
+    currently_overdue = sum(1 for c in cases if c["tat_days"] > 0 and working_days_elapsed(c["stage_start_date"], today) >= c["tat_days"])
+    will_be_overdue   = sum(1 for c in cases if new_tat > 0 and working_days_elapsed(c["stage_start_date"], today) >= new_tat)
+    return jsonify({
+        "total_at_stage":     total,
+        "currently_overdue":  currently_overdue,
+        "will_be_overdue":    will_be_overdue,
+        "newly_flagged":      max(0, will_be_overdue - currently_overdue),
+        "newly_resolved":     max(0, currently_overdue - will_be_overdue),
+    })
 
 
 @app.route("/bulk-upload", methods=["GET", "POST"])
@@ -5546,6 +5696,31 @@ function editProgramme(name, tat, r1, r2, od, emails) {
     </div>
   </div>
 </div>"""
+    scripts += """
+<script>
+(function() {
+  document.addEventListener('DOMContentLoaded', function() {
+    document.querySelectorAll('input[name="tat_days"]').forEach(function(inp) {
+      inp.addEventListener('change', function() {
+        var tr = this.closest('tr');
+        var stage = tr ? (tr.querySelector('[name="stage_name"]') || {}).value : '';
+        var prog  = (document.querySelector('[name="programme_name"]') || {}).value || '';
+        if (!stage || !prog || !this.value) return;
+        fetch('/api/preview-tat-impact?programme='+encodeURIComponent(prog)+'&stage='+encodeURIComponent(stage)+'&tat='+encodeURIComponent(this.value))
+          .then(function(r){return r.json();}).then(function(d) {
+            var wrap = inp.parentElement;
+            var prev = wrap.querySelector('.tat-impact-preview');
+            if (!prev) { prev = document.createElement('div'); prev.className='tat-impact-preview'; prev.style.cssText='font-size:11px;margin-top:2px'; wrap.appendChild(prev); }
+            if (d.error) { prev.innerHTML=''; return; }
+            if (d.newly_flagged > 0) prev.innerHTML='<span style="color:#dc2626">&#9888; '+d.newly_flagged+' case(s) become overdue</span>';
+            else if (d.newly_resolved > 0) prev.innerHTML='<span style="color:#00984C">&#10003; '+d.newly_resolved+' case(s) no longer overdue</span>';
+            else prev.innerHTML='<span style="color:#64748b">No impact on '+d.total_at_stage+' current case(s)</span>';
+          }).catch(function(){});
+      });
+    });
+  });
+})();
+</script>"""
     return render_page(content, scripts, active_page="settings",
                        page_title="Programme Settings")
 
@@ -6673,6 +6848,59 @@ def reports():
     return render_page(content, active_page="reports", page_title="Analytics & Reports")
 
 
+@app.route("/assessor-scorecard")
+@board_admin_required
+def assessor_scorecard():
+    conn = get_db()
+    bid = user_board_id()
+    q = """SELECT action_owner_email, action_owner_name,
+               COUNT(*) AS total_cases,
+               SUM(CASE WHEN r1_sent THEN 1 ELSE 0 END) AS r1_count,
+               SUM(CASE WHEN r2_sent THEN 1 ELSE 0 END) AS r2_count,
+               SUM(CASE WHEN overdue_sent THEN 1 ELSE 0 END) AS overdue_count,
+               ROUND(100.0 * SUM(CASE WHEN overdue_sent THEN 1 ELSE 0 END) / NULLIF(COUNT(*),0), 1) AS overdue_rate
+               FROM case_tracking WHERE owner_type='Assessor'"""
+    if bid is not None:
+        rows = conn.execute(q + " AND board_id=? GROUP BY action_owner_email, action_owner_name ORDER BY overdue_rate DESC NULLS LAST", (bid,)).fetchall()
+    else:
+        rows = conn.execute(q + " GROUP BY action_owner_email, action_owner_name ORDER BY overdue_rate DESC NULLS LAST").fetchall()
+    conn.close()
+    rows = [dict(r) for r in rows]
+
+    trs = ""
+    for r in rows:
+        rate = float(r["overdue_rate"] or 0)
+        badge_color = "#dc2626" if rate >= 50 else "#d97706" if rate >= 25 else "#00984C"
+        trs += (f'<tr><td style="font-weight:500">{h(r["action_owner_name"] or "—")}</td>'
+                f'<td style="font-size:12px;color:#64748b">{h(r["action_owner_email"])}</td>'
+                f'<td style="text-align:center">{r["total_cases"]}</td>'
+                f'<td style="text-align:center;color:#d97706">{r["r1_count"]}</td>'
+                f'<td style="text-align:center;color:#dc2626">{r["r2_count"]}</td>'
+                f'<td style="text-align:center;color:#7c3aed">{r["overdue_count"]}</td>'
+                f'<td style="text-align:center;font-weight:700;color:{badge_color}">{rate}%</td></tr>')
+    if not trs:
+        trs = '<tr><td colspan="7" style="text-align:center;color:#94a3b8;padding:32px">No assessor data yet. Cases appear here once owner_type=Assessor cases are tracked.</td></tr>'
+
+    content = f"""
+<div style="max-width:1100px;margin:0 auto">
+  <div class="card">
+    <div class="card-header"><i class="bi bi-person-badge" style="color:var(--accent)"></i> Assessor Performance Scorecard</div>
+    <div class="card-body p-0">
+      <table class="table table-hover mb-0" style="font-size:13px">
+        <thead><tr style="background:#f8fafc">
+          <th style="padding:10px 16px">Name</th><th>Email</th>
+          <th style="text-align:center">Cases</th><th style="text-align:center">R1 Sent</th>
+          <th style="text-align:center">R2 Sent</th><th style="text-align:center">Overdue</th>
+          <th style="text-align:center">Overdue %</th>
+        </tr></thead>
+        <tbody>{trs}</tbody>
+      </table>
+    </div>
+  </div>
+</div>"""
+    return render_page(content, active_page="assessor_scorecard", page_title="Assessor Scorecard")
+
+
 def _export_csv_filtered():
     """CSV export helper called from export_excel when fmt=csv."""
     conn = get_db()
@@ -7743,11 +7971,12 @@ def manage_api_keys():
         if action == "create":
             raw_key = secrets.token_urlsafe(32)
             key_hash = hashlib.sha256(raw_key.encode()).hexdigest()
+            key_prefix = "qci_" + raw_key[:8]
             name = request.form.get("name", "Unnamed Key").strip()
             board_id = request.form.get("board_id") or None
             conn.execute(
-                "INSERT INTO api_keys (key_hash, name, board_id, created_at) VALUES (?,?,?,?)",
-                (key_hash, name, board_id, now_ist().strftime("%Y-%m-%d %H:%M:%S"))
+                "INSERT INTO api_keys (key_hash, key_prefix, name, board_id, created_at) VALUES (?,?,?,?,?)",
+                (key_hash, key_prefix, name, board_id, now_ist().strftime("%Y-%m-%d %H:%M:%S"))
             )
             conn.commit()
             flash(f"API key created. Copy it now — it won't be shown again: {raw_key}", "success")
@@ -7757,7 +7986,7 @@ def manage_api_keys():
             flash("API key revoked.", "success")
 
     keys = [dict(r) for r in conn.execute(
-        "SELECT id, name, board_id, created_at, last_used, is_active FROM api_keys ORDER BY id DESC"
+        "SELECT id, name, key_prefix, board_id, created_at, last_used, is_active FROM api_keys ORDER BY id DESC"
     ).fetchall()]
     boards = [dict(r) for r in conn.execute("SELECT id, board_name FROM boards ORDER BY board_name").fetchall()]
     conn.close()
@@ -7773,8 +8002,10 @@ def manage_api_keys():
                   {"disabled" if not k["is_active"] else ""}
                   onclick="return confirm('Revoke this key?')">Revoke</button>
         </form>''' if k["is_active"] else ""
+        prefix_cell = f'<code style="font-size:11px;background:#f1f5f9;padding:1px 5px;border-radius:3px">{k["key_prefix"] or "—"}…</code>' if k.get("key_prefix") else '<span style="color:#94a3b8;font-size:11px">—</span>'
         key_rows += f"""<tr>
           <td style="font-weight:600">{k["name"]}</td>
+          <td>{prefix_cell}</td>
           <td style="font-size:12px;color:#64748b">{k["created_at"]}</td>
           <td style="font-size:12px;color:#64748b">{k["last_used"] or "Never"}</td>
           <td>{status_badge}</td>
@@ -7791,8 +8022,8 @@ def manage_api_keys():
       </div>
       <div class="card-body p-0">
         <table class="data-table">
-          <thead><tr><th>Name</th><th>Created</th><th>Last Used</th><th>Status</th><th>Action</th></tr></thead>
-          <tbody>{key_rows if key_rows else '<tr><td colspan="5" style="text-align:center;padding:30px;color:#94a3b8">No API keys yet.</td></tr>'}</tbody>
+          <thead><tr><th>Name</th><th>Prefix</th><th>Created</th><th>Last Used</th><th>Status</th><th>Action</th></tr></thead>
+          <tbody>{key_rows if key_rows else '<tr><td colspan="6" style="text-align:center;padding:30px;color:#94a3b8">No API keys yet.</td></tr>'}</tbody>
         </table>
       </div>
     </div>
