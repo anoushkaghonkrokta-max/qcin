@@ -3619,7 +3619,7 @@ def dashboard():
           <div class="mb-3">
             <label class="form-label">Start Date <span style="color:#94a3b8;font-size:11px">(new stage)</span></label>
             <input type="date" class="form-control" name="new_start_date"
-                   value="{date.today().strftime('%Y-%m-%d')}">
+                   value="{now_ist().strftime('%Y-%m-%d')}">
           </div>
           <div class="mb-1">
             <label class="form-label">Suppress Notifications Until <span style="color:#94a3b8;font-size:11px">(optional)</span></label>
@@ -3846,7 +3846,7 @@ def log_stage():
             <div class="col-md-6">
               <label class="form-label">Date of Stage Change</label>
               <input type="date" class="form-control" name="stage_start_date"
-                     value="{date.today().isoformat()}" required>
+                     value="{now_ist().date().isoformat()}" required>
             </div>
           </div>
           <div class="mb-3">
@@ -4071,7 +4071,7 @@ def bulk_upload():
                 # Validate date format (YYYY-MM-DD required)
                 _raw_date = data["stage_start_date"]
                 if not _raw_date:
-                    data["stage_start_date"] = date.today().isoformat()
+                    data["stage_start_date"] = now_ist().date().isoformat()
                 else:
                     try:
                         datetime.strptime(_raw_date, "%Y-%m-%d")
@@ -4526,7 +4526,7 @@ def update_case_status():
         # Start hold — record hold_start_date
         conn.execute(
             "UPDATE case_tracking SET status=?, hold_start_date=? WHERE application_id=?",
-            ("On Hold", date.today().isoformat(), app_id)
+            ("On Hold", now_ist().date().isoformat(), app_id)
         )
     elif case.get("status") == "On Hold" and new_status != "On Hold":
         # Ending hold — calculate working days held and accumulate
@@ -6454,7 +6454,7 @@ def bulk_advance():
     if request.method == "POST":
         selected_ids = request.form.getlist("case_ids")
         target_stage = request.form.get("target_stage", "").strip()
-        new_start_date = request.form.get("new_start_date", date.today().strftime("%Y-%m-%d"))
+        new_start_date = request.form.get("new_start_date", now_ist().strftime("%Y-%m-%d"))
 
         if not selected_ids or not target_stage:
             flash("Select cases and a target stage.", "error")
@@ -6698,7 +6698,7 @@ window.addEventListener('load', function(){
 def quick_advance_post():
     case_id = request.form.get("case_id")
     target_stage = request.form.get("target_stage", "").strip()
-    new_start_date = request.form.get("new_start_date", date.today().strftime("%Y-%m-%d"))
+    new_start_date = request.form.get("new_start_date", now_ist().strftime("%Y-%m-%d"))
     suppress_until = request.form.get("suppress_until", "").strip() or None
 
     conn = get_db()
@@ -8225,7 +8225,7 @@ def api_advance_case():
             "organisation_name":  data.get("organisation_name", "").strip(),
             "programme_name":     data["programme_name"].strip(),
             "stage_name":         data["stage_name"].strip(),
-            "stage_start_date":   data.get("stage_start_date", date.today().isoformat()),
+            "stage_start_date":   data.get("stage_start_date", now_ist().date().isoformat()),
             "action_owner_name":  data.get("action_owner_name", "").strip(),
             "action_owner_email": data.get("action_owner_email", "").strip(),
             "program_officer_email": data.get("program_officer_email", "").strip(),
