@@ -6855,10 +6855,10 @@ def assessor_scorecard():
     bid = user_board_id()
     q = """SELECT action_owner_email, action_owner_name,
                COUNT(*) AS total_cases,
-               SUM(CASE WHEN r1_sent THEN 1 ELSE 0 END) AS r1_count,
-               SUM(CASE WHEN r2_sent THEN 1 ELSE 0 END) AS r2_count,
-               SUM(CASE WHEN overdue_sent THEN 1 ELSE 0 END) AS overdue_count,
-               ROUND(100.0 * SUM(CASE WHEN overdue_sent THEN 1 ELSE 0 END) / NULLIF(COUNT(*),0), 1) AS overdue_rate
+               SUM(r1_sent) AS r1_count,
+               SUM(r2_sent) AS r2_count,
+               SUM(overdue_sent) AS overdue_count,
+               ROUND(100.0 * SUM(overdue_sent) / NULLIF(COUNT(*),0), 1) AS overdue_rate
                FROM case_tracking WHERE owner_type='Assessor'"""
     if bid is not None:
         rows = conn.execute(q + " AND board_id=? GROUP BY action_owner_email, action_owner_name ORDER BY overdue_rate DESC NULLS LAST", (bid,)).fetchall()
