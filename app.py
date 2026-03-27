@@ -2094,7 +2094,7 @@ function openQuickAdvance(caseId, appId, progName){
   fetch('/api/stages?programme=' + encodeURIComponent(progName))
     .then(r=>r.json()).then(function(stages){
       var sel = document.getElementById('qa_stage_select');
-      sel.innerHTML = stages.map(s=>'<option value="'+s.name+'">'+s.name+'</option>').join('');
+      sel.innerHTML = stages.map(s=>'<option value="'+s.stage_name+'">'+s.stage_name+'</option>').join('');
     });
   new bootstrap.Modal(document.getElementById('quickAdvanceModal')).show();
 }
@@ -6650,10 +6650,11 @@ function loadStages(prog){
   fetch('/api/stages?programme='+encodeURIComponent(prog))
     .then(function(r){return r.json();})
     .then(function(data){
+      var stages = Array.isArray(data) ? data : (data.stages||[]);
       sel.innerHTML = '<option value="">— select stage —</option>';
-      (data.stages||[]).forEach(function(s){
+      stages.forEach(function(s){
         var o = document.createElement('option');
-        o.value = s; o.textContent = s;
+        o.value = s.stage_name; o.textContent = s.stage_name;
         sel.appendChild(o);
       });
       updateSubmitBtn();
