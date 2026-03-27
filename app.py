@@ -6516,7 +6516,7 @@ def bulk_advance():
   <td style="font-size:12px;color:#94a3b8">{h(c['stage_start_date'])}</td>
 </tr>"""
         case_list_html += f"""
-<div class="mb-3">
+<div class="mb-3" data-prog="{h(pn)}">
   <div style="font-weight:600;font-size:13px;color:var(--navy);margin-bottom:6px">
     <i class="bi bi-folder2" style="color:var(--accent)"></i> {pn}
     <span style="font-size:11px;color:#94a3b8;font-weight:400;margin-left:6px">{len(pcases)} cases</span>
@@ -6563,7 +6563,12 @@ def bulk_advance():
           <input type="date" class="form-control" name="new_start_date"
                  value="{now_ist().strftime('%Y-%m-%d')}">
         </div>
-        <button type="submit" class="btn btn-warning w-100">
+        <div id="baProgWarn" class="alert alert-warning py-2 px-3 mb-2" style="font-size:12px;display:none">
+          <i class="bi bi-exclamation-triangle-fill"></i>
+          Cases from multiple programmes selected — stages apply to the programme chosen above only.
+        </div>
+        <button type="submit" class="btn btn-secondary w-100" id="baSubmitBtn" disabled
+                title="Select at least one case and a target stage first">
           <i class="bi bi-fast-forward-fill"></i> Advance Selected Cases
         </button>
       </div>
@@ -6578,17 +6583,70 @@ function toggleGroup(el){
   updateCount();
 }
 document.addEventListener('change', function(e){
-  if(e.target.classList.contains('case-cb')) updateCount();
+  if(e.target.classList.contains('case-cb')){
+    updateCount();
+    syncProgrammeFromSelection();
+  }
 });
+
 function updateCount(){
   var n = document.querySelectorAll('.case-cb:checked').length;
   document.getElementById('selCount').textContent = n + ' selected';
+  updateSubmitBtn();
 }
-document.getElementById('baProgSelect').addEventListener('change', function(){
-  var prog = this.value;
+
+function updateSubmitBtn(){
+  var n = document.querySelectorAll('.case-cb:checked').length;
+  var stage = document.getElementById('baStageSelect').value;
+  var btn = document.getElementById('baSubmitBtn');
+  if(n > 0 && stage){
+    btn.disabled = false;
+    btn.classList.remove('btn-secondary');
+    btn.classList.add('btn-warning');
+    btn.title = '';
+  } else {
+    btn.disabled = true;
+    btn.classList.remove('btn-warning');
+    btn.classList.add('btn-secondary');
+    btn.title = n === 0 ? 'Select at least one case first' : 'Select a target stage first';
+  }
+}
+
+// When checkboxes are ticked, auto-set programme if all selected cases share one programme
+function syncProgrammeFromSelection(){
+  var checked = document.querySelectorAll('.case-cb:checked');
+  if(checked.length === 0) return;
+  var progs = new Set();
+  checked.forEach(function(cb){
+    var row = cb.closest('tr');
+    // programme is stored on the group container
+    var grp = cb.closest('div[data-prog]');
+    if(grp) progs.add(grp.dataset.prog);
+  });
+  if(progs.size === 1){
+    var progSel = document.getElementById('baProgSelect');
+    var prog = Array.from(progs)[0];
+    if(progSel.value !== prog){
+      progSel.value = prog;
+      loadStages(prog);
+    }
+  } else if(progs.size > 1){
+    // Multi-programme selection: warn user
+    var warn = document.getElementById('baProgWarn');
+    if(warn) warn.style.display = '';
+  }
+}
+
+function loadStages(prog){
   var sel = document.getElementById('baStageSelect');
+  var warn = document.getElementById('baProgWarn');
+  if(warn) warn.style.display = 'none';
+  if(!prog){
+    sel.innerHTML = '<option value="">— select programme first —</option>';
+    updateSubmitBtn();
+    return;
+  }
   sel.innerHTML = '<option value="">Loading…</option>';
-  if(!prog){ sel.innerHTML='<option value="">— select programme first —</option>'; return; }
   fetch('/api/stages?programme='+encodeURIComponent(prog))
     .then(function(r){return r.json();})
     .then(function(data){
@@ -6598,8 +6656,35 @@ document.getElementById('baProgSelect').addEventListener('change', function(){
         o.value = s; o.textContent = s;
         sel.appendChild(o);
       });
+      updateSubmitBtn();
     })
-    .catch(function(){ sel.innerHTML='<option value="">Error loading stages</option>'; });
+    .catch(function(){
+      sel.innerHTML = '<option value="">Error loading stages</option>';
+      updateSubmitBtn();
+    });
+}
+
+document.getElementById('baProgSelect').addEventListener('change', function(){
+  loadStages(this.value);
+});
+
+document.getElementById('baStageSelect').addEventListener('change', function(){
+  updateSubmitBtn();
+});
+
+// On page load: auto-select programme if only one exists, and re-trigger stage load
+// if browser restored a previous value (handles Firefox/Chrome form state restoration)
+window.addEventListener('load', function(){
+  var progSel = document.getElementById('baProgSelect');
+  var opts = progSel.querySelectorAll('option[value]:not([value=""])');
+  if(opts.length === 1){
+    // Only one programme — auto-select it
+    progSel.value = opts[0].value;
+  }
+  if(progSel.value){
+    loadStages(progSel.value);
+  }
+  updateSubmitBtn();
 });
 </script>"""
     return render_page(content, scripts, active_page="bulk_advance",
