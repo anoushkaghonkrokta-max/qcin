@@ -3572,7 +3572,7 @@ def dashboard():
           <th style="text-align:center">R1</th>
           <th style="text-align:center">R2</th>
           <th style="text-align:center">Overdue</th>
-          <th style="text-align:center">Follow-ups</th>
+          <th style="text-align:center;cursor:help" title="Number of repeat follow-up emails sent after the first Overdue notification. Increments each time the scheduler fires a Followup email for this case.">Follow-ups</th>
           <th>Action Owner</th>
           <th>Actions</th>
         </tr>
