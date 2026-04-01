@@ -397,12 +397,10 @@ def process_email_queue(max_retries: int = 3) -> dict:
                     msg["From"]    = sender_email
                     msg["To"]      = item["to_email"]
                     recipients     = [item["to_email"]]
-                    if item.get("cc_email"):
-                        for cc in item["cc_email"].split(","):
-                            cc = cc.strip()
-                            if cc:
-                                msg["Cc"] = cc
-                                recipients.append(cc)
+                    cc_list = [cc.strip() for cc in item.get("cc_email", "").split(",") if cc.strip()]
+                    if cc_list:
+                        msg["Cc"] = ", ".join(cc_list)
+                        recipients.extend(cc_list)
                     msg.attach(MIMEText(item["body"] or "", "plain"))
                     smtp_conn.sendmail(sender_email, recipients, msg.as_string())
                     conn.execute(
@@ -1671,6 +1669,9 @@ def upsert_case(data: dict) -> str:
                 _cur_order_row["stage_order"] is not None and
                 cfg["stage_order"] < _cur_order_row["stage_order"]
             )
+            # Note: hold_days is intentionally NOT reset here — accumulated hold time
+            # is preserved across stage advances so TAT for the new stage is not inflated
+            # by hold periods that occurred in previous stages.
             conn.execute(
                 """UPDATE case_tracking SET
                    programme_name=?, organisation_name=?, current_stage=?, stage_start_date=?,
@@ -2518,13 +2519,15 @@ def manage_users():
             (_caller_board_id,)
         ).fetchall()]
 
-    # Build programme map per user (for program_head display)
+    # Build programme map per user (for program_head display and remap pre-selection)
     ph_prog_map = {}
+    ph_prog_id_map = {}
     for row in conn.execute(
-        """SELECT upm.user_id, p.programme_name
+        """SELECT upm.user_id, upm.programme_id, p.programme_name
            FROM user_programme_map upm JOIN programmes p ON p.id=upm.programme_id"""
     ).fetchall():
         ph_prog_map.setdefault(row["user_id"], []).append(row["programme_name"])
+        ph_prog_id_map.setdefault(row["user_id"], []).append(row["programme_id"])
 
     conn.close()
 
@@ -2549,9 +2552,11 @@ def manage_users():
         _uid = u["id"]
         _uname = u["username"]
         _urole = u["role"]
+        _mapped_ids = json.dumps(ph_prog_id_map.get(_uid, []))
         remap_btn = (
             f'<button class="btn btn-sm btn-outline-primary btn-remap" style="font-size:12px;padding:3px 8px" title="Map Programmes" '
-            f'data-uid="{h(_uid)}" data-uname="{h(_uname)}" data-urole="{h(_urole)}">'
+            f'data-uid="{h(_uid)}" data-uname="{h(_uname)}" data-urole="{h(_urole)}" '
+            f'data-progids="{h(_mapped_ids)}">'
             '<i class="bi bi-diagram-3"></i></button>'
             if _urole in _REMAP_ROLES else ""
         )
@@ -2691,7 +2696,7 @@ def manage_users():
         <h6 class="modal-title"><i class="bi bi-diagram-3-fill" style="color:#166534"></i> Re-map Programmes — <span id="remapPhUser"></span></h6>
         <button class="btn-close" data-bs-dismiss="modal"></button>
       </div>
-      <form method="post">
+      <form method="post" onsubmit="return validateRemap()">
         <input type="hidden" name="action" value="remap_ph">
         <input type="hidden" name="remap_user_id" id="remapPhUserId">
         <div class="modal-body pt-0">
@@ -2745,6 +2750,11 @@ document.addEventListener('click', function(e){
   } else if(btn.classList.contains('btn-remap')){
     document.getElementById('remapPhUserId').value = btn.dataset.uid;
     document.getElementById('remapPhUser').textContent = btn.dataset.uname + ' (' + btn.dataset.urole + ')';
+    var mappedIds = JSON.parse(btn.dataset.progids || '[]');
+    var opts = document.getElementById('remapProgSelect').options;
+    for(var i=0; i<opts.length; i++){
+      opts[i].selected = mappedIds.indexOf(parseInt(opts[i].value)) >= 0;
+    }
     new bootstrap.Modal(document.getElementById('remapPhModal')).show();
   } else if(btn.classList.contains('btn-del-user')){
     document.getElementById('delUserId').value = btn.dataset.uid;
@@ -2755,6 +2765,15 @@ document.addEventListener('click', function(e){
 
 function submitDeleteUser(){
   document.getElementById('deleteUserForm').submit();
+}
+function validateRemap(){
+  var opts = document.getElementById('remapProgSelect').options;
+  var selected = 0;
+  for(var i=0; i<opts.length; i++) if(opts[i].selected) selected++;
+  if(selected === 0){
+    return confirm('No programmes selected — this will remove all programme access for this user. Continue?');
+  }
+  return true;
 }
 function filterProgsByBoard(){
   var bid = document.getElementById('boardSelect').value;
@@ -4337,7 +4356,7 @@ document.getElementById('uploadForm').addEventListener('submit', function(){
 _TEMPLATE_COLS = ["Application_ID", "Organisation_Name", "Programme_Name", "Stage_Name",
                   "Date_of_Stage_Change", "Action_Owner_Name", "Action_Owner_Email", "Program_Officer_Email"]
 _TEMPLATE_EXAMPLE = ["APP-001", "Sample Hospital", "NABH Full Accreditation Hospitals",
-                     "Application In Progress", date.today().isoformat(),
+                     "Application In Progress", now_ist().date().isoformat(),
                      "Mr. Applicant", "applicant@example.com", "po@qci.org.in"]
 
 
@@ -6468,7 +6487,7 @@ def email_preview():
             "Action_Owner_Name": "Dr. Sharma",
             "Days_Remaining": "5",
             "TAT_Days": "10",
-            "Stage_Start_Date": date.today().strftime("%Y-%m-%d"),
+            "Stage_Start_Date": now_ist().date().strftime("%Y-%m-%d"),
             "Programme_Name": programme,
             "Followup_Count": "1",
             "PO_Name": session.get("full_name", "Program Officer"),
@@ -7737,8 +7756,12 @@ def system_settings():
             flash(f"Scheduler updated to {hour:02d}:{minute:02d} IST. Effective on next restart.", "success")
 
         elif action == "save_webhook":
-            set_app_setting("webhook_url", request.form.get("webhook_url", "").strip())
-            flash("Webhook URL saved.", "success")
+            wh_url = request.form.get("webhook_url", "").strip()
+            if wh_url and not (wh_url.startswith("https://") or wh_url.startswith("http://")):
+                flash("Webhook URL must start with https:// or http://", "error")
+            else:
+                set_app_setting("webhook_url", wh_url)
+                flash("Webhook URL saved.", "success")
 
         elif action == "save_2fa":
             uid = request.form.get("user_id")
@@ -8311,7 +8334,7 @@ def export_report():
                 "Yes" if c["overdue_sent"] else "No", c["overdue_count"]
             ])
 
-        fname_base = f"qci_export_{date.today()}"
+        fname_base = f"qci_export_{now_ist().date()}"
         output = io.StringIO()
         w = csv.writer(output)
         w.writerow(headers_row)
