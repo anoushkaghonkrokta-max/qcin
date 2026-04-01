@@ -55,6 +55,27 @@ class _SMTP_SSL_IPv4(smtplib.SMTP_SSL):
         return self.context.wrap_socket(sock, server_hostname=self._tls_hostname)
 
 
+def _send_via_sendgrid(api_key: str, from_email: str, to_emails: list,
+                       subject: str, body_text: str) -> None:
+    """Send email via SendGrid v3 Mail Send API (HTTPS, no extra dependencies)."""
+    payload = json.dumps({
+        "personalizations": [{"to": [{"email": e} for e in to_emails if e]}],
+        "from": {"email": from_email},
+        "subject": subject,
+        "content": [{"type": "text/plain", "value": body_text}],
+    }).encode()
+    req = urllib.request.Request(
+        "https://api.sendgrid.com/v3/mail/send",
+        data=payload,
+        headers={"Authorization": f"Bearer {api_key}",
+                 "Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        if resp.status not in (200, 202):
+            raise RuntimeError(f"SendGrid API returned HTTP {resp.status}")
+
+
 def h(v):
     """HTML-escape a value for safe injection into f-string HTML."""
     if v is None:
@@ -327,6 +348,36 @@ def process_email_queue(max_retries: int = 3) -> dict:
 
     for (sender_email, smtp_host, smtp_port, sender_password_enc), items in groups.items():
         pw = decrypt_str(sender_password_enc) if sender_password_enc else ""
+
+        if smtp_host == "sendgrid":
+            # ── SendGrid API path ─────────────────────────────────────────────
+            for item in items:
+                try:
+                    recipients = [item["to_email"]]
+                    if item.get("cc_email"):
+                        for cc in item["cc_email"].split(","):
+                            cc = cc.strip()
+                            if cc:
+                                recipients.append(cc)
+                    _send_via_sendgrid(pw, sender_email, recipients,
+                                       item["subject"] or "", item["body"] or "")
+                    conn.execute(
+                        "UPDATE email_queue SET status='sent', last_attempt=? WHERE id=?",
+                        (now_ist().strftime("%Y-%m-%d %H:%M:%S"), item["id"])
+                    )
+                    sent += 1
+                except Exception as e:
+                    attempts = item["attempts"] + 1
+                    new_status = "failed" if attempts >= max_retries else "pending"
+                    conn.execute(
+                        "UPDATE email_queue SET status=?, attempts=?, last_attempt=?, error_msg=? WHERE id=?",
+                        (new_status, attempts, now_ist().strftime("%Y-%m-%d %H:%M:%S"),
+                         str(e)[:300], item["id"])
+                    )
+                    failed += 1
+            continue
+
+        # ── SMTP path ─────────────────────────────────────────────────────────
         smtp_conn = None
         try:
             if smtp_port == 465:
@@ -1214,25 +1265,28 @@ def send_notification(programme: str, ntype: str, to_email: str, cc_email: str,
     if not sender_email or not to_email:
         return False, "Missing sender or recipient email"
     try:
-        msg = MIMEMultipart()
-        msg["From"]    = sender_email
-        msg["To"]      = to_email
-        msg["CC"]      = cc_email or ""
-        msg["Subject"] = subject
-        msg.attach(MIMEText(body, "plain"))
         recipients = [to_email] + ([cc_email] if cc_email else [])
-        if smtp_port == 465:
-            _v4 = _smtp_ipv4_host(smtp_host, 465)
-            with _SMTP_SSL_IPv4(_v4, 465, timeout=15, context=ssl.create_default_context(), tls_hostname=smtp_host) as s:
-                s.login(sender_email, sender_password)
-                s.sendmail(sender_email, recipients, msg.as_string())
+        if smtp_host == "sendgrid":
+            _send_via_sendgrid(sender_password, sender_email, recipients, subject, body)
         else:
-            _v4 = _smtp_ipv4_host(smtp_host, smtp_port)
-            with smtplib.SMTP(_v4, smtp_port, timeout=15) as s:
-                s._host = smtp_host
-                s.starttls(context=ssl.create_default_context())
-                s.login(sender_email, sender_password)
-                s.sendmail(sender_email, recipients, msg.as_string())
+            msg = MIMEMultipart()
+            msg["From"]    = sender_email
+            msg["To"]      = to_email
+            msg["CC"]      = cc_email or ""
+            msg["Subject"] = subject
+            msg.attach(MIMEText(body, "plain"))
+            if smtp_port == 465:
+                _v4 = _smtp_ipv4_host(smtp_host, 465)
+                with _SMTP_SSL_IPv4(_v4, 465, timeout=15, context=ssl.create_default_context(), tls_hostname=smtp_host) as s:
+                    s.login(sender_email, sender_password)
+                    s.sendmail(sender_email, recipients, msg.as_string())
+            else:
+                _v4 = _smtp_ipv4_host(smtp_host, smtp_port)
+                with smtplib.SMTP(_v4, smtp_port, timeout=15) as s:
+                    s._host = smtp_host
+                    s.starttls(context=ssl.create_default_context())
+                    s.login(sender_email, sender_password)
+                    s.sendmail(sender_email, recipients, msg.as_string())
         log_audit("email_sent", ph.get("Programme_Name", ""),
                   f"{ntype} to {to_email} | Subject: {subject[:80]}", "system")
         return True, ""
@@ -1548,12 +1602,16 @@ def run_weekly_digest():
             pw = decrypt_str(cfg["sender_password"]) if cfg["sender_password"] else ""
             smtp_host = cfg["smtp_host"] or "smtp.gmail.com"
             smtp_port = cfg["smtp_port"] or 587
-            _v4 = _smtp_ipv4_host(smtp_host, smtp_port)
-            with smtplib.SMTP(_v4, smtp_port, timeout=15) as s:
-                s._host = smtp_host
-                s.starttls(context=ssl.create_default_context())
-                s.login(cfg["sender_email"], pw)
-                s.sendmail(cfg["sender_email"], [user["email"]], msg.as_string())
+            if smtp_host == "sendgrid":
+                _send_via_sendgrid(pw, cfg["sender_email"], [user["email"]],
+                                   msg["Subject"], body)
+            else:
+                _v4 = _smtp_ipv4_host(smtp_host, smtp_port)
+                with smtplib.SMTP(_v4, smtp_port, timeout=15) as s:
+                    s._host = smtp_host
+                    s.starttls(context=ssl.create_default_context())
+                    s.login(cfg["sender_email"], pw)
+                    s.sendmail(cfg["sender_email"], [user["email"]], msg.as_string())
             log.info("Weekly digest sent to %s", user["email"])
         except Exception as e:
             log.warning("Weekly digest failed for %s: %s", user["email"], e)
@@ -5286,35 +5344,57 @@ def settings():
         <div style="font-size:12px;font-weight:600;color:#64748b;text-transform:uppercase;letter-spacing:.5px;margin-bottom:12px">
           <i class="bi bi-envelope-at"></i> Outbound Email Settings
         </div>
-        <form method="post" class="row g-2 align-items-end">
+        <form method="post" class="row g-2 align-items-end" id="emailForm_{pid_safe}"
+              onsubmit="prepEmailForm('{pid_safe}')">
           <input type="hidden" name="action" value="update_sender">
           <input type="hidden" name="programme_name" value="{pname}">
-          <div class="col-md-4">
+          <input type="hidden" name="smtp_host" id="smtp_host_val_{pid_safe}"
+                 value="{p.get('smtp_host','smtp.gmail.com')}">
+          <input type="hidden" name="smtp_port" id="smtp_port_val_{pid_safe}"
+                 value="{p.get('smtp_port', 587)}">
+          <div class="col-md-2">
+            <label class="form-label" style="font-size:12px">Provider</label>
+            <select class="form-select form-select-sm" id="provider_{pid_safe}"
+                    onchange="toggleEmailProvider('{pid_safe}')">
+              <option value="smtp" {'selected' if p.get('smtp_host','smtp.gmail.com') != 'sendgrid' else ''}>SMTP</option>
+              <option value="sendgrid" {'selected' if p.get('smtp_host') == 'sendgrid' else ''}>SendGrid API</option>
+            </select>
+          </div>
+          <div class="col-md-3">
             <label class="form-label" style="font-size:12px">Sender Email</label>
             <input type="email" class="form-control form-control-sm" name="sender_email"
                    value="{p.get('sender_email') or ''}" placeholder="notifications@yourdomain.com">
           </div>
           <div class="col-md-3">
-            <label class="form-label" style="font-size:12px">Password <span style="color:#94a3b8">(blank = keep)</span></label>
+            <label class="form-label" style="font-size:12px" id="pwLabel_{pid_safe}">
+              {'API Key' if p.get('smtp_host') == 'sendgrid' else 'Password'} <span style="color:#94a3b8">(blank = keep)</span>
+            </label>
             <input type="password" class="form-control form-control-sm" name="sender_password"
-                   placeholder="••••••••" autocomplete="new-password">
+                   placeholder="{'SG.xxx…' if p.get('smtp_host') == 'sendgrid' else '••••••••'}"
+                   autocomplete="new-password">
           </div>
-          <div class="col-md-3">
-            <label class="form-label" style="font-size:12px">SMTP Host</label>
-            <input type="text" class="form-control form-control-sm" name="smtp_host"
-                   value="{p.get('smtp_host','smtp.gmail.com')}" placeholder="smtp.gmail.com">
-          </div>
-          <div class="col-md-1">
-            <label class="form-label" style="font-size:12px">Port</label>
-            <input type="number" class="form-control form-control-sm" name="smtp_port"
-                   value="{p.get('smtp_port', 587)}" placeholder="587">
+          <div id="smtpFields_{pid_safe}" {'style="display:none"' if p.get('smtp_host') == 'sendgrid' else ''}
+               class="col-md-3 d-flex gap-2">
+            <div style="flex:1">
+              <label class="form-label" style="font-size:12px">SMTP Host</label>
+              <input type="text" class="form-control form-control-sm" id="smtpHostInput_{pid_safe}"
+                     value="{p.get('smtp_host','smtp.gmail.com') if p.get('smtp_host') != 'sendgrid' else 'smtp.gmail.com'}"
+                     placeholder="smtp.gmail.com">
+            </div>
+            <div style="width:72px">
+              <label class="form-label" style="font-size:12px">Port</label>
+              <input type="number" class="form-control form-control-sm" id="smtpPortInput_{pid_safe}"
+                     value="{p.get('smtp_port', 587) if p.get('smtp_host') != 'sendgrid' else 587}"
+                     placeholder="587">
+            </div>
           </div>
           <div class="col-auto">
             <button class="btn btn-sm btn-primary" type="submit">Save</button>
           </div>
         </form>
         <div style="font-size:11px;color:#94a3b8;margin-top:6px">
-          Gmail: smtp.gmail.com:587 · Outlook: smtp.office365.com:587 · Port 465 = SSL
+          SMTP: Gmail smtp.gmail.com:587 · Outlook smtp.office365.com:587 · Port 465 = SSL &nbsp;|&nbsp;
+          SendGrid: create API key at sendgrid.com, enter as password above
         </div>
       </div>
     </div>
@@ -7931,20 +8011,29 @@ def system_settings():
 
     <div class="card mb-4">
       <div class="card-header d-flex align-items-center justify-content-between">
-        <span><i class="bi bi-plug-fill" style="color:#0094ca"></i> SMTP Connection Test</span>
+        <span><i class="bi bi-plug-fill" style="color:#0094ca"></i> Email Connection Test</span>
         <span class="badge" style="background:#166534;font-size:11px;font-weight:500;letter-spacing:.3px">
           <i class="bi bi-shield-lock-fill"></i> TLS 1.2+ &nbsp;·&nbsp; Certificate Verified
         </span>
       </div>
       <div class="card-body p-4">
         <div class="row g-2 mb-2">
-          <div class="col-6"><input type="email" class="form-control form-control-sm" id="test_smtp_user" placeholder="sender@gmail.com"></div>
-          <div class="col-6"><input type="password" class="form-control form-control-sm" id="test_smtp_pass" placeholder="App password"></div>
+          <div class="col-4">
+            <select class="form-select form-select-sm" id="test_provider" onchange="toggleTestProvider()">
+              <option value="smtp">SMTP</option>
+              <option value="sendgrid">SendGrid API</option>
+            </select>
+          </div>
+          <div class="col-4"><input type="email" class="form-control form-control-sm" id="test_smtp_user" placeholder="sender@yourdomain.com"></div>
+          <div class="col-4"><input type="password" class="form-control form-control-sm" id="test_smtp_pass" placeholder="Password / API Key"></div>
         </div>
-        <div class="row g-2 mb-3">
+        <div class="row g-2 mb-3" id="testSmtpHostRow">
           <div class="col-5"><input type="text" class="form-control form-control-sm" id="test_smtp_host" value="smtp.gmail.com"></div>
           <div class="col-3"><input type="number" class="form-control form-control-sm" id="test_smtp_port" value="587"></div>
           <div class="col-4"><input type="email" class="form-control form-control-sm" id="test_smtp_to" placeholder="Test recipient"></div>
+        </div>
+        <div class="row g-2 mb-3" id="testSgToRow" style="display:none">
+          <div class="col-12"><input type="email" class="form-control form-control-sm" id="test_sg_to" placeholder="Test recipient"></div>
         </div>
         <button class="btn btn-primary btn-sm" onclick="testSmtp()" id="smtpTestBtn">
           <i class="bi bi-send"></i> Send Test Email
@@ -8007,7 +8096,41 @@ def system_settings():
   </div>
 </div>"""
     scripts = """<script>
+function toggleEmailProvider(pid) {
+  var prov = document.getElementById('provider_' + pid).value;
+  var smtpFields = document.getElementById('smtpFields_' + pid);
+  var pwLabel = document.getElementById('pwLabel_' + pid);
+  if (prov === 'sendgrid') {
+    smtpFields.style.display = 'none';
+    pwLabel.childNodes[0].textContent = 'API Key ';
+  } else {
+    smtpFields.style.display = '';
+    pwLabel.childNodes[0].textContent = 'Password ';
+  }
+}
+function prepEmailForm(pid) {
+  var prov = document.getElementById('provider_' + pid).value;
+  if (prov === 'sendgrid') {
+    document.getElementById('smtp_host_val_' + pid).value = 'sendgrid';
+    document.getElementById('smtp_port_val_' + pid).value = '587';
+  } else {
+    document.getElementById('smtp_host_val_' + pid).value =
+      document.getElementById('smtpHostInput_' + pid).value;
+    document.getElementById('smtp_port_val_' + pid).value =
+      document.getElementById('smtpPortInput_' + pid).value;
+  }
+}
+function toggleTestProvider() {
+  var prov = document.getElementById('test_provider').value;
+  document.getElementById('testSmtpHostRow').style.display = prov === 'sendgrid' ? 'none' : '';
+  document.getElementById('testSgToRow').style.display = prov === 'sendgrid' ? '' : 'none';
+}
 function testSmtp(){
+  var prov = document.getElementById('test_provider').value;
+  var host = prov === 'sendgrid' ? 'sendgrid' : document.getElementById('test_smtp_host').value;
+  var to = prov === 'sendgrid'
+    ? document.getElementById('test_sg_to').value
+    : document.getElementById('test_smtp_to').value;
   var btn = document.getElementById('smtpTestBtn');
   btn.innerHTML = '<span class="spinner-border spinner-border-sm"></span> Testing…';
   btn.disabled = true;
@@ -8017,9 +8140,9 @@ function testSmtp(){
     body: JSON.stringify({
       email: document.getElementById('test_smtp_user').value,
       password: document.getElementById('test_smtp_pass').value,
-      host: document.getElementById('test_smtp_host').value,
-      port: parseInt(document.getElementById('test_smtp_port').value),
-      to: document.getElementById('test_smtp_to').value
+      host: host,
+      port: parseInt(document.getElementById('test_smtp_port').value || 587),
+      to: to
     })
   }).then(function(r){
     var ct = r.headers.get('content-type') || '';
@@ -8060,23 +8183,28 @@ def test_smtp():
     if not sender or not password:
         return jsonify({"ok": False, "error": "Sender email and password required"})
     try:
-        msg = MIMEMultipart()
-        msg["From"] = sender
-        msg["To"] = to
-        msg["Subject"] = "QCI Notify — SMTP Test"
-        msg.attach(MIMEText("This is a test email from QCI Notification Engine. SMTP is working correctly.", "plain"))
-        if port == 465:
-            _v4 = _smtp_ipv4_host(host, 465)
-            with _SMTP_SSL_IPv4(_v4, 465, timeout=15, context=ssl.create_default_context(), tls_hostname=host) as s:
-                s.login(sender, password)
-                s.sendmail(sender, [to], msg.as_string())
+        if host == "sendgrid":
+            _send_via_sendgrid(password, sender, [to],
+                               "QCI Notify — SendGrid Test",
+                               "This is a test email from QCI Notification Engine. SendGrid API is working correctly.")
         else:
-            _v4 = _smtp_ipv4_host(host, port)
-            with smtplib.SMTP(_v4, port, timeout=15) as s:
-                s._host = host
-                s.starttls(context=ssl.create_default_context())
-                s.login(sender, password)
-                s.sendmail(sender, [to], msg.as_string())
+            msg = MIMEMultipart()
+            msg["From"] = sender
+            msg["To"] = to
+            msg["Subject"] = "QCI Notify — SMTP Test"
+            msg.attach(MIMEText("This is a test email from QCI Notification Engine. SMTP is working correctly.", "plain"))
+            if port == 465:
+                _v4 = _smtp_ipv4_host(host, 465)
+                with _SMTP_SSL_IPv4(_v4, 465, timeout=15, context=ssl.create_default_context(), tls_hostname=host) as s:
+                    s.login(sender, password)
+                    s.sendmail(sender, [to], msg.as_string())
+            else:
+                _v4 = _smtp_ipv4_host(host, port)
+                with smtplib.SMTP(_v4, port, timeout=15) as s:
+                    s._host = host
+                    s.starttls(context=ssl.create_default_context())
+                    s.login(sender, password)
+                    s.sendmail(sender, [to], msg.as_string())
         return jsonify({"ok": True})
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)[:200]})
