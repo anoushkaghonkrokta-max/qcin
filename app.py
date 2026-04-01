@@ -304,9 +304,9 @@ def process_email_queue(max_retries: int = 3) -> dict:
         smtp_conn = None
         try:
             if smtp_port == 465:
-                smtp_conn = smtplib.SMTP_SSL(smtp_host, 465, timeout=20)
+                smtp_conn = smtplib.SMTP_SSL(smtp_host, 465, timeout=20, source_address=("0.0.0.0", 0))
             else:
-                smtp_conn = smtplib.SMTP(smtp_host, smtp_port, timeout=20)
+                smtp_conn = smtplib.SMTP(smtp_host, smtp_port, timeout=20, source_address=("0.0.0.0", 0))
                 smtp_conn.starttls()
             smtp_conn.login(sender_email, pw)
 
@@ -1193,11 +1193,11 @@ def send_notification(programme: str, ntype: str, to_email: str, cc_email: str,
         msg.attach(MIMEText(body, "plain"))
         recipients = [to_email] + ([cc_email] if cc_email else [])
         if smtp_port == 465:
-            with smtplib.SMTP_SSL(smtp_host, 465, timeout=15) as s:
+            with smtplib.SMTP_SSL(smtp_host, 465, timeout=15, source_address=("0.0.0.0", 0)) as s:
                 s.login(sender_email, sender_password)
                 s.sendmail(sender_email, recipients, msg.as_string())
         else:
-            with smtplib.SMTP(smtp_host, smtp_port, timeout=15) as s:
+            with smtplib.SMTP(smtp_host, smtp_port, timeout=15, source_address=("0.0.0.0", 0)) as s:
                 s.starttls()
                 s.login(sender_email, sender_password)
                 s.sendmail(sender_email, recipients, msg.as_string())
@@ -1516,7 +1516,7 @@ def run_weekly_digest():
             pw = decrypt_str(cfg["sender_password"]) if cfg["sender_password"] else ""
             smtp_host = cfg["smtp_host"] or "smtp.gmail.com"
             smtp_port = cfg["smtp_port"] or 587
-            with smtplib.SMTP(smtp_host, smtp_port, timeout=15) as s:
+            with smtplib.SMTP(smtp_host, smtp_port, timeout=15, source_address=("0.0.0.0", 0)) as s:
                 s.starttls()
                 s.login(cfg["sender_email"], pw)
                 s.sendmail(cfg["sender_email"], [user["email"]], msg.as_string())
@@ -8021,11 +8021,11 @@ def test_smtp():
         msg["Subject"] = "QCI Notify — SMTP Test"
         msg.attach(MIMEText("This is a test email from QCI Notification Engine. SMTP is working correctly.", "plain"))
         if port == 465:
-            with smtplib.SMTP_SSL(host, 465, timeout=15) as s:
+            with smtplib.SMTP_SSL(host, 465, timeout=15, source_address=("0.0.0.0", 0)) as s:
                 s.login(sender, password)
                 s.sendmail(sender, [to], msg.as_string())
         else:
-            with smtplib.SMTP(host, port, timeout=15) as s:
+            with smtplib.SMTP(host, port, timeout=15, source_address=("0.0.0.0", 0)) as s:
                 s.starttls()
                 s.login(sender, password)
                 s.sendmail(sender, [to], msg.as_string())
