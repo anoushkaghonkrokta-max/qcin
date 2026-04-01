@@ -10,6 +10,7 @@ import logging
 import os
 import secrets
 import smtplib
+import socket
 import ssl
 import psycopg2
 import psycopg2.extras
@@ -28,6 +29,30 @@ from flask import (Flask, flash, jsonify, redirect, render_template_string,
                    request, url_for, Response, session)
 from markupsafe import escape as _xe
 from werkzeug.security import check_password_hash as _check_pw
+
+
+def _smtp_ipv4_host(hostname, port):
+    """Resolve hostname to first IPv4 address to avoid IPv6 routing failures on Railway.
+    Returns hostname unchanged if no IPv4 record is found."""
+    try:
+        results = socket.getaddrinfo(hostname, port, socket.AF_INET, socket.SOCK_STREAM)
+        if results:
+            return results[0][4][0]
+    except Exception:
+        pass
+    return hostname
+
+
+class _SMTP_SSL_IPv4(smtplib.SMTP_SSL):
+    """SMTP_SSL subclass that connects to a pre-resolved IPv4 address while verifying
+    TLS certificates against the original hostname."""
+    def __init__(self, host, port=465, *args, tls_hostname=None, **kwargs):
+        self._tls_hostname = tls_hostname or host
+        super().__init__(host, port, *args, **kwargs)
+
+    def _get_socket(self, host, port, timeout):
+        sock = socket.create_connection((host, port), timeout)
+        return self.context.wrap_socket(sock, server_hostname=self._tls_hostname)
 
 
 def h(v):
@@ -305,9 +330,12 @@ def process_email_queue(max_retries: int = 3) -> dict:
         smtp_conn = None
         try:
             if smtp_port == 465:
-                smtp_conn = smtplib.SMTP_SSL(smtp_host, 465, timeout=20, source_address=("0.0.0.0", 0), context=ssl.create_default_context())
+                _v4 = _smtp_ipv4_host(smtp_host, 465)
+                smtp_conn = _SMTP_SSL_IPv4(_v4, 465, timeout=20, context=ssl.create_default_context(), tls_hostname=smtp_host)
             else:
-                smtp_conn = smtplib.SMTP(smtp_host, smtp_port, timeout=20, source_address=("0.0.0.0", 0))
+                _v4 = _smtp_ipv4_host(smtp_host, smtp_port)
+                smtp_conn = smtplib.SMTP(_v4, smtp_port, timeout=20)
+                smtp_conn._host = smtp_host
                 smtp_conn.starttls(context=ssl.create_default_context())
             smtp_conn.login(sender_email, pw)
 
@@ -1194,11 +1222,14 @@ def send_notification(programme: str, ntype: str, to_email: str, cc_email: str,
         msg.attach(MIMEText(body, "plain"))
         recipients = [to_email] + ([cc_email] if cc_email else [])
         if smtp_port == 465:
-            with smtplib.SMTP_SSL(smtp_host, 465, timeout=15, source_address=("0.0.0.0", 0), context=ssl.create_default_context()) as s:
+            _v4 = _smtp_ipv4_host(smtp_host, 465)
+            with _SMTP_SSL_IPv4(_v4, 465, timeout=15, context=ssl.create_default_context(), tls_hostname=smtp_host) as s:
                 s.login(sender_email, sender_password)
                 s.sendmail(sender_email, recipients, msg.as_string())
         else:
-            with smtplib.SMTP(smtp_host, smtp_port, timeout=15, source_address=("0.0.0.0", 0)) as s:
+            _v4 = _smtp_ipv4_host(smtp_host, smtp_port)
+            with smtplib.SMTP(_v4, smtp_port, timeout=15) as s:
+                s._host = smtp_host
                 s.starttls(context=ssl.create_default_context())
                 s.login(sender_email, sender_password)
                 s.sendmail(sender_email, recipients, msg.as_string())
@@ -1517,7 +1548,9 @@ def run_weekly_digest():
             pw = decrypt_str(cfg["sender_password"]) if cfg["sender_password"] else ""
             smtp_host = cfg["smtp_host"] or "smtp.gmail.com"
             smtp_port = cfg["smtp_port"] or 587
-            with smtplib.SMTP(smtp_host, smtp_port, timeout=15, source_address=("0.0.0.0", 0)) as s:
+            _v4 = _smtp_ipv4_host(smtp_host, smtp_port)
+            with smtplib.SMTP(_v4, smtp_port, timeout=15) as s:
+                s._host = smtp_host
                 s.starttls(context=ssl.create_default_context())
                 s.login(cfg["sender_email"], pw)
                 s.sendmail(cfg["sender_email"], [user["email"]], msg.as_string())
@@ -8033,11 +8066,14 @@ def test_smtp():
         msg["Subject"] = "QCI Notify — SMTP Test"
         msg.attach(MIMEText("This is a test email from QCI Notification Engine. SMTP is working correctly.", "plain"))
         if port == 465:
-            with smtplib.SMTP_SSL(host, 465, timeout=15, source_address=("0.0.0.0", 0), context=ssl.create_default_context()) as s:
+            _v4 = _smtp_ipv4_host(host, 465)
+            with _SMTP_SSL_IPv4(_v4, 465, timeout=15, context=ssl.create_default_context(), tls_hostname=host) as s:
                 s.login(sender, password)
                 s.sendmail(sender, [to], msg.as_string())
         else:
-            with smtplib.SMTP(host, port, timeout=15, source_address=("0.0.0.0", 0)) as s:
+            _v4 = _smtp_ipv4_host(host, port)
+            with smtplib.SMTP(_v4, port, timeout=15) as s:
+                s._host = host
                 s.starttls(context=ssl.create_default_context())
                 s.login(sender, password)
                 s.sendmail(sender, [to], msg.as_string())
