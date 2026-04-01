@@ -295,10 +295,10 @@ function buildSystemDoc() {
         ["DB Driver",        "psycopg2",           "Connection pool via SimpleConnectionPool"],
         ["WSGI Server",      "Gunicorn",           "1 worker (APScheduler constraint)"],
         ["Background Jobs",  "APScheduler",        "BackgroundScheduler, Asia/Kolkata timezone"],
-        ["Email Dispatch",   "smtplib (SMTP)",     "Configurable per board, pooled connections"],
-        ["Encryption",       "cryptography/Fernet","SMTP passwords encrypted at rest"],
+        ["Email Dispatch",   "smtplib / SendGrid API", "Provider selectable per programme; SendGrid recommended on Railway"],
+        ["Encryption",       "cryptography/Fernet","Credentials (SMTP passwords, API keys) encrypted at rest"],
         ["2FA",              "pyotp (TOTP)",       "Optional per user"],
-        ["Deployment",       "Render",             "Web service + PostgreSQL add-on"],
+        ["Deployment",       "Railway",            "Web service + PostgreSQL add-on"],
         ["Frontend",         "Jinja2 + HTML/CSS",  "No frontend framework"],
       ]
     ),
@@ -453,14 +453,22 @@ function buildSystemDoc() {
 
     h2("Email Queue System"),
     ...screenshotPlaceholder("Screenshot: Email Queue Dashboard"),
-    body("Emails are never sent synchronously during an HTTP request. The notification check writes jobs to email_queue with status='pending'. A dispatch step reads pending emails, attempts SMTP delivery, and updates status to 'sent' or 'failed'. SMTP connections are pooled by sender credentials — one connection per group of emails, not one per email."),
+    body("Emails are never sent synchronously during an HTTP request. The notification check writes jobs to email_queue with status='pending'. A dispatch step reads pending emails, dispatches via the configured provider, and updates status to 'sent' or 'failed'. SMTP connections are pooled by sender credentials — one connection per group. SendGrid emails are dispatched individually via HTTPS and do not require an open TCP port."),
     spacer(),
 
-    h2("SMTP Configuration Priority"),
+    h2("Email Provider Options"),
+    body("Each programme can use one of two outbound providers, set under Settings → Outbound Email Settings:"),
+    dataTable(["Provider","How to configure","Best for"],[
+      ["SMTP","Enter smtp_host, port, sender email, password","Local/dev, Gmail, Office365 (non-Railway)"],
+      ["SendGrid API","Select 'SendGrid API', enter sender email and SendGrid API key","Railway and any cloud host that blocks SMTP ports"],
+    ]),
+    spacer(),
+
+    h2("Email Configuration Priority"),
     body("Highest priority wins:"),
-    numbered("Stage-level SMTP config"),
-    numbered("Board-level SMTP config"),
-    numbered("System-level fallback SMTP (environment variables)"),
+    numbered("Stage-level email config"),
+    numbered("Board-level email config"),
+    numbered("System-level fallback (environment variables)"),
     spacer(),
 
     pageBreak(),
@@ -470,7 +478,7 @@ function buildSystemDoc() {
     numbered("Query all cases with status = 'Active'"),
     numbered("For each case: compute days_elapsed = today - stage_start_date (excluding weekends and holidays)"),
     numbered("Evaluate R1, R2, Overdue, Followup eligibility and enqueue matching email jobs"),
-    numbered("Dispatch the email queue (SMTP send loop with connection pooling)"),
+    numbered("Dispatch the email queue (SMTP pooled connections or SendGrid API depending on programme config)"),
     numbered("Write all actions to the audit log"),
     spacer(),
 
@@ -490,7 +498,7 @@ function buildSystemDoc() {
     h2("Role-Based Access Control (RBAC)"),
     dataTable(["Role","Access Level"],[
       ["super_admin","Full access: all boards, system settings, scheduler, API keys, audit log"],
-      ["board_admin","Full access to their board: programmes, stages, users, email, SMTP"],
+      ["board_admin","Full access to their board: programmes, stages, users, email configuration (SMTP or SendGrid)"],
       ["board_ceo","Read-only dashboard for their board; receives weekly digest"],
       ["program_head","View cases in their programme; receives escalation emails"],
       ["program_officer","Create/edit/advance cases in their board's programmes"],
@@ -509,7 +517,7 @@ function buildSystemDoc() {
     spacer(),
 
     h2("Fernet Encryption"),
-    body("SMTP passwords are encrypted at rest using Fernet (cryptography library). Key = FERNET_KEY environment variable (32-byte URL-safe base64). Loss of this key requires re-entering all SMTP passwords."),
+    body("SMTP passwords and SendGrid API keys are encrypted at rest using Fernet (cryptography library). Key = FERNET_KEY environment variable (32-byte URL-safe base64). Loss of this key requires re-entering all email credentials."),
     spacer(),
 
     h2("Audit Log Hash-Chaining"),
@@ -523,7 +531,7 @@ function buildSystemDoc() {
     dataTable(["Variable","Description","Example"],[
       ["DATABASE_URL","PostgreSQL connection string","postgresql://user:pass@host:5432/db"],
       ["SECRET_KEY","Flask session signing key (64-char hex)","3c6cd977f7ce..."],
-      ["FERNET_KEY","Fernet key for SMTP password encryption","bb4pSsPXTV...="],
+      ["FERNET_KEY","Fernet key for email credential encryption (SMTP passwords & SendGrid API keys)","bb4pSsPXTV...="],
       ["DISABLE_APSCHEDULER","Set 'true' to disable in-process scheduler","false (default)"],
       ["ADMIN_EMAIL","Super admin email for first-run setup","admin@example.com"],
     ]),
@@ -1047,13 +1055,13 @@ function buildUserGuide() {
     bullet("Create and manage programmes"),
     bullet("Set up stages with TAT, reminder thresholds, and email configuration"),
     bullet("Customise email templates"),
-    bullet("Configure SMTP settings (the email server)"),
+    bullet("Configure outbound email settings (SMTP or SendGrid API)"),
     bullet("Manage users on your board (create, reset passwords, assign roles)"),
     bullet("View the audit log"),
     spacer(),
     body("Getting started as a new Board Admin:"),
     numbered("Log in and go to Settings"),
-    numbered("Set up your SMTP email configuration"),
+    numbered("Set up your outbound email configuration (Settings → Outbound Email Settings — choose SMTP or SendGrid API)"),
     numbered("Create your programmes and add stages to each"),
     numbered("Set the TAT and reminder days for each stage"),
     numbered("Customise email templates if needed (defaults are provided)"),
@@ -1069,7 +1077,7 @@ function buildUserGuide() {
     bullet("Create and revoke API keys for technical integrations"),
     bullet("View full audit log across all boards"),
     bullet("Trigger a manual scheduler run"),
-    bullet("Test SMTP connectivity"),
+    bullet("Test email connectivity (SMTP or SendGrid) via the Email Connection Test card"),
     spacer(),
     body("System Settings you control:"),
     dataTable(["Setting","What It Does"],[
