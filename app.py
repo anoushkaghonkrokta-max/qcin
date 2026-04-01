@@ -6805,19 +6805,27 @@ function loadStages(prog){
   }
   sel.innerHTML = '<option value="">Loading…</option>';
   fetch('/api/stages?programme='+encodeURIComponent(prog))
-    .then(function(r){return r.json();})
+    .then(function(r){
+      if(!r.ok) throw new Error('HTTP ' + r.status);
+      return r.json();
+    })
     .then(function(data){
-      var stages = Array.isArray(data) ? data : (data.stages||[]);
-      sel.innerHTML = '<option value="">— select stage —</option>';
-      stages.forEach(function(s){
-        var o = document.createElement('option');
-        o.value = s.stage_name; o.textContent = s.stage_name;
-        sel.appendChild(o);
-      });
+      var stages = Array.isArray(data) ? data : [];
+      if(stages.length === 0){
+        sel.innerHTML = '<option value="">No stages configured</option>';
+      } else {
+        sel.innerHTML = '<option value="">— select stage —</option>';
+        stages.forEach(function(s){
+          var o = document.createElement('option');
+          o.value = s.stage_name; o.textContent = s.stage_name;
+          sel.appendChild(o);
+        });
+      }
       updateSubmitBtn();
     })
-    .catch(function(){
-      sel.innerHTML = '<option value="">Error loading stages</option>';
+    .catch(function(err){
+      sel.innerHTML = '<option value="">Error loading stages — refresh and retry</option>';
+      console.error('loadStages error:', err);
       updateSubmitBtn();
     });
 }
@@ -8528,7 +8536,9 @@ def manage_api_keys():
                 (key_hash, key_prefix, name, board_id, now_ist().strftime("%Y-%m-%d %H:%M:%S"))
             )
             conn.commit()
-            flash(f"API key created. Copy it now — it won't be shown again: {raw_key}", "success")
+            # Store in session for one-time display in a copy modal (never stored in DB)
+            session['_new_api_key'] = raw_key
+            session['_new_api_key_name'] = name
         elif action == "revoke":
             conn.execute("UPDATE api_keys SET is_active=0 WHERE id=?", (request.form["key_id"],))
             conn.commit()
@@ -8539,6 +8549,10 @@ def manage_api_keys():
     ).fetchall()]
     boards = [dict(r) for r in conn.execute("SELECT id, board_name FROM boards ORDER BY board_name").fetchall()]
     conn.close()
+
+    # One-time display of newly created key — popped from session so it only shows once
+    new_key       = session.pop('_new_api_key', None)
+    new_key_name  = session.pop('_new_api_key_name', 'New Key')
 
     board_opts = "".join(f'<option value="{b["id"]}">{b["board_name"]}</option>' for b in boards)
     key_rows = ""
@@ -8561,7 +8575,69 @@ def manage_api_keys():
           <td>{revoke_btn}</td>
         </tr>"""
 
+    # New-key copy modal — only rendered when a key was just created
+    new_key_modal = ""
+    new_key_script = ""
+    if new_key:
+        new_key_modal = f"""
+<div class="modal fade" id="newKeyModal" tabindex="-1" data-bs-backdrop="static" data-bs-keyboard="false">
+  <div class="modal-dialog modal-dialog-centered">
+    <div class="modal-content">
+      <div class="modal-header" style="background:#f0fdf4;border-bottom:1px solid #bbf7d0">
+        <h6 class="modal-title">
+          <i class="bi bi-key-fill" style="color:#059669"></i>
+          API Key Created — <span style="color:#059669">{h(new_key_name)}</span>
+        </h6>
+      </div>
+      <div class="modal-body p-4">
+        <div style="background:#fef9c3;border:1px solid #fde68a;border-radius:8px;padding:10px 12px;
+                    font-size:12px;color:#92400e;margin-bottom:16px">
+          <i class="bi bi-exclamation-triangle-fill"></i>
+          <strong>Copy this key now.</strong> It will not be shown again — we only store a hash.
+        </div>
+        <label class="form-label" style="font-size:12px;font-weight:600">Your API Key</label>
+        <div class="input-group">
+          <input type="text" class="form-control" id="newApiKeyInput"
+                 value="{h(new_key)}" readonly
+                 style="font-family:monospace;font-size:13px;background:#f8fafc">
+          <button class="btn btn-outline-secondary" type="button" id="copyKeyBtn"
+                  onclick="copyApiKey()" title="Copy to clipboard">
+            <i class="bi bi-clipboard" id="copyKeyIcon"></i>
+          </button>
+        </div>
+        <div id="copyKeyFeedback" style="font-size:12px;color:#059669;margin-top:6px;display:none">
+          <i class="bi bi-check-circle-fill"></i> Copied to clipboard!
+        </div>
+      </div>
+      <div class="modal-footer border-0">
+        <button type="button" class="btn btn-success" data-bs-dismiss="modal">
+          Done — I&#39;ve saved the key
+        </button>
+      </div>
+    </div>
+  </div>
+</div>"""
+        new_key_script = """
+<script>
+function copyApiKey(){
+  var inp = document.getElementById('newApiKeyInput');
+  inp.select(); inp.setSelectionRange(0, 99999);
+  navigator.clipboard.writeText(inp.value).then(function(){
+    document.getElementById('copyKeyIcon').className = 'bi bi-clipboard-check';
+    document.getElementById('copyKeyBtn').className = 'btn btn-outline-success';
+    document.getElementById('copyKeyFeedback').style.display = '';
+  }).catch(function(){
+    document.execCommand('copy');
+    document.getElementById('copyKeyFeedback').style.display = '';
+  });
+}
+document.addEventListener('DOMContentLoaded', function(){
+  new bootstrap.Modal(document.getElementById('newKeyModal')).show();
+});
+</script>"""
+
     content = f"""
+{new_key_modal}
 <div class="row g-4">
   <div class="col-lg-8">
     <div class="card">
@@ -8623,7 +8699,7 @@ X-API-Key: your-key-here</pre>
     </div>
   </div>
 </div>"""
-    return render_page(content, active_page="api_keys", page_title="API Keys")
+    return render_page(content, new_key_script, active_page="api_keys", page_title="API Keys")
 
 
 @app.route("/healthz")
