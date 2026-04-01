@@ -10,6 +10,7 @@ import logging
 import os
 import secrets
 import smtplib
+import ssl
 import psycopg2
 import psycopg2.extras
 import psycopg2.pool
@@ -304,10 +305,10 @@ def process_email_queue(max_retries: int = 3) -> dict:
         smtp_conn = None
         try:
             if smtp_port == 465:
-                smtp_conn = smtplib.SMTP_SSL(smtp_host, 465, timeout=20, source_address=("0.0.0.0", 0))
+                smtp_conn = smtplib.SMTP_SSL(smtp_host, 465, timeout=20, source_address=("0.0.0.0", 0), context=ssl.create_default_context())
             else:
                 smtp_conn = smtplib.SMTP(smtp_host, smtp_port, timeout=20, source_address=("0.0.0.0", 0))
-                smtp_conn.starttls()
+                smtp_conn.starttls(context=ssl.create_default_context())
             smtp_conn.login(sender_email, pw)
 
             for item in items:
@@ -1193,12 +1194,12 @@ def send_notification(programme: str, ntype: str, to_email: str, cc_email: str,
         msg.attach(MIMEText(body, "plain"))
         recipients = [to_email] + ([cc_email] if cc_email else [])
         if smtp_port == 465:
-            with smtplib.SMTP_SSL(smtp_host, 465, timeout=15, source_address=("0.0.0.0", 0)) as s:
+            with smtplib.SMTP_SSL(smtp_host, 465, timeout=15, source_address=("0.0.0.0", 0), context=ssl.create_default_context()) as s:
                 s.login(sender_email, sender_password)
                 s.sendmail(sender_email, recipients, msg.as_string())
         else:
             with smtplib.SMTP(smtp_host, smtp_port, timeout=15, source_address=("0.0.0.0", 0)) as s:
-                s.starttls()
+                s.starttls(context=ssl.create_default_context())
                 s.login(sender_email, sender_password)
                 s.sendmail(sender_email, recipients, msg.as_string())
         log_audit("email_sent", ph.get("Programme_Name", ""),
@@ -1517,7 +1518,7 @@ def run_weekly_digest():
             smtp_host = cfg["smtp_host"] or "smtp.gmail.com"
             smtp_port = cfg["smtp_port"] or 587
             with smtplib.SMTP(smtp_host, smtp_port, timeout=15, source_address=("0.0.0.0", 0)) as s:
-                s.starttls()
+                s.starttls(context=ssl.create_default_context())
                 s.login(cfg["sender_email"], pw)
                 s.sendmail(cfg["sender_email"], [user["email"]], msg.as_string())
             log.info("Weekly digest sent to %s", user["email"])
@@ -7896,7 +7897,12 @@ def system_settings():
     </div>
 
     <div class="card mb-4">
-      <div class="card-header"><i class="bi bi-plug-fill" style="color:#0094ca"></i> SMTP Connection Test</div>
+      <div class="card-header d-flex align-items-center justify-content-between">
+        <span><i class="bi bi-plug-fill" style="color:#0094ca"></i> SMTP Connection Test</span>
+        <span class="badge" style="background:#166534;font-size:11px;font-weight:500;letter-spacing:.3px">
+          <i class="bi bi-shield-lock-fill"></i> TLS 1.2+ &nbsp;·&nbsp; Certificate Verified
+        </span>
+      </div>
       <div class="card-body p-4">
         <div class="row g-2 mb-2">
           <div class="col-6"><input type="email" class="form-control form-control-sm" id="test_smtp_user" placeholder="sender@gmail.com"></div>
@@ -8027,12 +8033,12 @@ def test_smtp():
         msg["Subject"] = "QCI Notify — SMTP Test"
         msg.attach(MIMEText("This is a test email from QCI Notification Engine. SMTP is working correctly.", "plain"))
         if port == 465:
-            with smtplib.SMTP_SSL(host, 465, timeout=15, source_address=("0.0.0.0", 0)) as s:
+            with smtplib.SMTP_SSL(host, 465, timeout=15, source_address=("0.0.0.0", 0), context=ssl.create_default_context()) as s:
                 s.login(sender, password)
                 s.sendmail(sender, [to], msg.as_string())
         else:
             with smtplib.SMTP(host, port, timeout=15, source_address=("0.0.0.0", 0)) as s:
-                s.starttls()
+                s.starttls(context=ssl.create_default_context())
                 s.login(sender, password)
                 s.sendmail(sender, [to], msg.as_string())
         return jsonify({"ok": True})
