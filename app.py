@@ -7982,7 +7982,13 @@ function testSmtp(){
       port: parseInt(document.getElementById('test_smtp_port').value),
       to: document.getElementById('test_smtp_to').value
     })
-  }).then(r=>r.json()).then(d=>{
+  }).then(function(r){
+    var ct = r.headers.get('content-type') || '';
+    if (!ct.includes('application/json')) {
+      throw new Error('Session expired — please refresh the page and log in again.');
+    }
+    return r.json();
+  }).then(d=>{
     var res = document.getElementById('smtpTestResult');
     if(d.ok){
       res.innerHTML = '<span style="color:#00984C"><i class="bi bi-check-circle-fill"></i> Test email sent successfully!</span>';
@@ -7992,7 +7998,7 @@ function testSmtp(){
     btn.innerHTML = '<i class="bi bi-send"></i> Send Test Email';
     btn.disabled = false;
   }).catch(e=>{
-    document.getElementById('smtpTestResult').innerHTML = '<span style="color:#dc2626">Network error: '+e+'</span>';
+    document.getElementById('smtpTestResult').innerHTML = '<span style="color:#dc2626"><i class="bi bi-x-circle-fill"></i> ' + e.message + '</span>';
     btn.innerHTML = '<i class="bi bi-send"></i> Send Test Email';
     btn.disabled = false;
   });
