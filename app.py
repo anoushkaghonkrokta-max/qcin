@@ -3641,7 +3641,7 @@ def dashboard():
     {"&nbsp;" + saved_filter_btns if saved_filter_btns else ""}
     </span>
     <form method="get" class="d-flex gap-2 align-items-center flex-wrap" id="filterForm">
-      <select name="status" class="form-select form-select-sm" style="width:auto">
+      <select name="status" class="form-select form-select-sm" style="width:auto" onchange="this.form.submit()">
         <option value="Active" {"selected" if status_filter=="Active" else ""}>Active</option>
         <option value="On Hold" {"selected" if status_filter=="On Hold" else ""}>On Hold</option>
         <option value="Closed" {"selected" if status_filter=="Closed" else ""}>Closed</option>
@@ -3649,17 +3649,17 @@ def dashboard():
         <option value="Suspended" {"selected" if status_filter=="Suspended" else ""}>Suspended</option>
         <option value="All" {"selected" if status_filter=="All" else ""}>All Statuses</option>
       </select>
-      <select name="programme" class="form-select form-select-sm" style="width:auto">
+      <select name="programme" class="form-select form-select-sm" style="width:auto" onchange="this.form.submit()">
         <option value="">All Programmes</option>
         {opt_programmes}
       </select>
-      <select name="owner_type" class="form-select form-select-sm" style="width:auto">
+      <select name="owner_type" class="form-select form-select-sm" style="width:auto" onchange="this.form.submit()">
         <option value="">All Owners</option>
         <option value="Applicant" {"selected" if owner_filter=="Applicant" else ""}>Applicant</option>
         <option value="Assessor" {"selected" if owner_filter=="Assessor" else ""}>Assessor</option>
         <option value="Program Officer" {"selected" if owner_filter=="Program Officer" else ""}>Program Officer</option>
       </select>
-      <select name="sort" class="form-select form-select-sm" style="width:auto">
+      <select name="sort" class="form-select form-select-sm" style="width:auto" onchange="this.form.submit()">
         <option value="elapsed_desc" {"selected" if sort=="elapsed_desc" else ""}>Days Elapsed ↓</option>
         <option value="elapsed_asc"  {"selected" if sort=="elapsed_asc" else ""}>Days Elapsed ↑</option>
         <option value="app_asc"      {"selected" if sort=="app_asc" else ""}>Application ID</option>
