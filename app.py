@@ -868,11 +868,41 @@ def init_db():
         "ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS key_prefix TEXT",
         "ALTER TABLE case_tracking ADD COLUMN IF NOT EXISTS iteration_count INTEGER NOT NULL DEFAULT 1",
         "ALTER TABLE case_tracking ADD COLUMN IF NOT EXISTS escalation_tier INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE programmes ADD COLUMN IF NOT EXISTS sender_email TEXT",
+        "ALTER TABLE programmes ADD COLUMN IF NOT EXISTS sender_password TEXT",
+        "ALTER TABLE programmes ADD COLUMN IF NOT EXISTS smtp_host TEXT NOT NULL DEFAULT 'smtp.gmail.com'",
+        "ALTER TABLE programmes ADD COLUMN IF NOT EXISTS smtp_port INTEGER NOT NULL DEFAULT 587",
     ]:
         try:
             conn.execute(sql)
         except Exception:
             conn.rollback()
+    # One-time migration: copy email settings from programme_config into programmes
+    # (only where programmes row has no sender_email yet but programme_config does)
+    try:
+        conn.execute("""
+            UPDATE programmes
+            SET sender_email    = (SELECT MAX(pc.sender_email) FROM programme_config pc
+                                   WHERE pc.programme_name = programmes.programme_name),
+                sender_password = (SELECT MAX(pc.sender_password) FROM programme_config pc
+                                   WHERE pc.programme_name = programmes.programme_name),
+                smtp_host       = COALESCE(
+                                    (SELECT MAX(pc.smtp_host) FROM programme_config pc
+                                     WHERE pc.programme_name = programmes.programme_name),
+                                    'smtp.gmail.com'),
+                smtp_port       = COALESCE(
+                                    (SELECT MAX(pc.smtp_port) FROM programme_config pc
+                                     WHERE pc.programme_name = programmes.programme_name),
+                                    587)
+            WHERE programmes.sender_email IS NULL
+              AND EXISTS (
+                  SELECT 1 FROM programme_config pc
+                  WHERE pc.programme_name = programmes.programme_name
+                    AND pc.sender_email IS NOT NULL
+              )
+        """)
+    except Exception:
+        pass
     conn.commit()
     conn.close()
 
@@ -1307,21 +1337,23 @@ def run_daily_check(board_id=None) -> dict:
     summary = {"r1": 0, "r2": 0, "overdue": 0, "followup": 0,
                "skipped_milestone": 0, "errors": []}
 
-    # Pre-fetch programme_config to avoid N+1 queries per case
+    # Pre-fetch programme_config for per-stage settings (overdue_interval_days)
     _pc_rows = conn.execute(
-        "SELECT programme_name, stage_name, overdue_interval_days, "
-        "sender_email, sender_password, smtp_host, smtp_port "
-        "FROM programme_config"
+        "SELECT programme_name, stage_name, overdue_interval_days FROM programme_config"
     ).fetchall()
     _pc_lookup = {(r["programme_name"], r["stage_name"]): dict(r) for r in _pc_rows}
 
-    # Pre-fetch programme notification_emails for CC injection
+    # Pre-fetch email credentials + notification_emails from programmes table
     try:
-        _prog_notif_rows = conn.execute(
-            "SELECT programme_name, notification_emails FROM programmes WHERE notification_emails IS NOT NULL"
+        _prog_rows = conn.execute(
+            "SELECT programme_name, notification_emails, "
+            "sender_email, sender_password, smtp_host, smtp_port FROM programmes"
         ).fetchall()
-        _prog_notif_map = {r["programme_name"]: r["notification_emails"] for r in _prog_notif_rows}
+        _prog_map = {r["programme_name"]: dict(r) for r in _prog_rows}
+        _prog_notif_map = {r["programme_name"]: r["notification_emails"]
+                           for r in _prog_rows if r["notification_emails"]}
     except Exception:
+        _prog_map = {}
         _prog_notif_map = {}
 
     # Pre-fetch programme → programme_head email mapping for escalations
@@ -1359,13 +1391,14 @@ def run_daily_check(board_id=None) -> dict:
         r1_day  = case["reminder1_day"]
         r2_day  = case["reminder2_day"]
 
-        cfg = _pc_lookup.get((case["programme_name"], case["current_stage"]))
+        cfg      = _pc_lookup.get((case["programme_name"], case["current_stage"]))
+        prog_cfg = _prog_map.get(case["programme_name"], {})
 
         overdue_interval = cfg["overdue_interval_days"] if cfg else 3
-        sender_email     = cfg["sender_email"] if cfg and cfg["sender_email"] else None
-        sender_password  = decrypt_str(cfg["sender_password"]) if cfg and cfg["sender_password"] else ""
-        smtp_host        = cfg["smtp_host"] if cfg and cfg["smtp_host"] else "smtp.gmail.com"
-        smtp_port        = cfg["smtp_port"] if cfg and cfg["smtp_port"] else 587
+        sender_email     = prog_cfg.get("sender_email") or None
+        sender_password  = decrypt_str(prog_cfg["sender_password"]) if prog_cfg.get("sender_password") else ""
+        smtp_host        = prog_cfg.get("smtp_host") or "smtp.gmail.com"
+        smtp_port        = prog_cfg.get("smtp_port") or 587
 
         days_remaining = max(0, tat - elapsed)
         ph = {
@@ -1389,7 +1422,7 @@ def run_daily_check(board_id=None) -> dict:
             except ValueError:
                 pass
 
-        sender_pw_enc = cfg["sender_password"] if cfg and cfg["sender_password"] else ""
+        sender_pw_enc = prog_cfg.get("sender_password") or ""
         # Merge case CC emails with programme-level notification_emails
         _prog_extra_cc = _prog_notif_map.get(case["programme_name"], "")
         cc = ";".join(filter(None, [
@@ -1576,17 +1609,17 @@ def run_weekly_digest():
 
         body += "Log in to QCI Notify for full details.\n\nQCI Notification Engine (automated digest)"
 
-        # Get sender credentials from any programme in scope
+        # Get sender credentials from programmes table (now the authoritative source)
         cfg = None
         if bid:
             cfg = conn.execute(
                 "SELECT sender_email, sender_password, smtp_host, smtp_port "
-                "FROM programme_config WHERE board_id=? AND sender_email IS NOT NULL LIMIT 1", (bid,)
+                "FROM programmes WHERE board_id=? AND sender_email IS NOT NULL LIMIT 1", (bid,)
             ).fetchone()
         if not cfg:
             cfg = conn.execute(
                 "SELECT sender_email, sender_password, smtp_host, smtp_port "
-                "FROM programme_config WHERE sender_email IS NOT NULL LIMIT 1"
+                "FROM programmes WHERE sender_email IS NOT NULL LIMIT 1"
             ).fetchone()
         if not cfg or not cfg["sender_email"]:
             continue
@@ -5131,14 +5164,15 @@ def settings():
             smtp_host = request.form.get("smtp_host", "smtp.gmail.com").strip()
             smtp_port = int(request.form.get("smtp_port", 587) or 587)
             enc_pw = encrypt_str(password) if password else None
+            # Write email settings to programmes table (works even before stages are added)
             if enc_pw:
                 conn.execute(
-                    "UPDATE programme_config SET sender_email=?, sender_password=?, smtp_host=?, smtp_port=? WHERE programme_name=?",
+                    "UPDATE programmes SET sender_email=?, sender_password=?, smtp_host=?, smtp_port=? WHERE programme_name=?",
                     (email, enc_pw, smtp_host, smtp_port, prog),
                 )
             else:
                 conn.execute(
-                    "UPDATE programme_config SET sender_email=?, smtp_host=?, smtp_port=? WHERE programme_name=?",
+                    "UPDATE programmes SET sender_email=?, smtp_host=?, smtp_port=? WHERE programme_name=?",
                     (email, smtp_host, smtp_port, prog),
                 )
             conn.commit()
@@ -5203,11 +5237,7 @@ def settings():
                 (p["programme_name"],)
             ).fetchall()
             prog_stages[p["programme_name"]] = [dict(r) for r in rows]
-            # Merge sender info from first row
-            first = prog_stages[p["programme_name"]]
-            p["sender_email"] = first[0]["sender_email"] if first else None
-            p["smtp_host"] = first[0].get("smtp_host", "smtp.gmail.com") if first else "smtp.gmail.com"
-            p["smtp_port"] = first[0].get("smtp_port", 587) if first else 587
+            # sender info now lives in programmes table — already in p via SELECT *
 
     # Load board-specific holidays
     if bid is not None:
