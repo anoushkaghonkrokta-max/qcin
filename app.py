@@ -4195,26 +4195,22 @@ def bulk_upload():
                 }
                 if not data["application_id"]:
                     raise ValueError("Application_ID is empty")
-                # Validate date format (YYYY-MM-DD required)
+                # Validate date — DD-MM-YYYY preferred, YYYY-MM-DD accepted as fallback
                 _raw_date = data["stage_start_date"]
                 if not _raw_date:
                     data["stage_start_date"] = now_ist().date().isoformat()
                 else:
-                    try:
-                        datetime.strptime(_raw_date, "%Y-%m-%d")
-                    except ValueError:
-                        # Try common alternate formats: DD/MM/YYYY, MM/DD/YYYY
-                        _parsed = None
-                        for _fmt in ("%d/%m/%Y", "%m/%d/%Y", "%d-%m-%Y"):
-                            try:
-                                _parsed = datetime.strptime(_raw_date, _fmt).date().isoformat()
-                                break
-                            except ValueError:
-                                pass
-                        if _parsed:
-                            data["stage_start_date"] = _parsed
-                        else:
-                            raise ValueError(f"Date_of_Stage_Change '{_raw_date}' must be YYYY-MM-DD")
+                    _parsed = None
+                    for _fmt in ("%d-%m-%Y", "%d/%m/%Y", "%Y-%m-%d", "%m/%d/%Y"):
+                        try:
+                            _parsed = datetime.strptime(_raw_date, _fmt).date().isoformat()
+                            break
+                        except ValueError:
+                            pass
+                    if _parsed:
+                        data["stage_start_date"] = _parsed
+                    else:
+                        raise ValueError(f"Date_of_Stage_Change '{_raw_date}' must be DD-MM-YYYY (e.g. 20-03-2026)")
                 action = upsert_case(data)
                 if action == "created":
                     created += 1
@@ -4229,24 +4225,23 @@ def bulk_upload():
                   f"Uploaded: {created} created, {updated} updated, {failed} failed",
                   session.get("full_name") or session.get("username", ""), user_board_id())
 
-        if errors and request.form.get("download_errors"):
-            # Download error report as CSV
-            out = io.StringIO()
-            w = csv.DictWriter(out, fieldnames=["Row", "Application_ID", "Reason"])
-            w.writeheader()
-            for e in errors:
-                w.writerow({"Row": e["row"], "Application_ID": e["app_id"], "Reason": e["reason"]})
-            out.seek(0)
-            return Response(out.getvalue(), mimetype="text/csv",
-                            headers={"Content-Disposition": "attachment;filename=upload_errors.csv"})
+        if errors:
+            session['_upload_errors'] = errors[:200]
 
         msg = f"Upload complete — {created} created, {updated} updated, {failed} failed"
         if errors:
-            msg += f". <strong>{failed} row(s) failed</strong> — resubmit with 'Download Error Report' checked."
+            msg += f". <strong>{failed} row(s) failed</strong> — download the error report below."
         flash(msg, "success" if not failed else "warning")
         return redirect(url_for("bulk_upload"))
 
-    content = """
+    _has_upload_errors = bool(session.get('_upload_errors'))
+    _error_btn = (
+        '<div style="margin-bottom:16px">'
+        '<a href="/download-upload-errors" class="btn btn-warning btn-sm">'
+        '<i class="bi bi-download"></i> Download Error Report</a></div>'
+        if _has_upload_errors else ''
+    )
+    content = _error_btn + """
 <div class="row g-4 justify-content-center" style="max-width:860px;margin:0 auto">
   <div class="col-lg-7">
     <div class="card form-card">
@@ -4285,11 +4280,7 @@ def bulk_upload():
                 <div style="font-size:12px;color:#64748b;margin-top:6px;font-weight:500" id="fileLabel">No file selected</div>
                 <input type="file" id="csvInput" name="upload_file" accept=".csv,.xlsx,.xls" required style="display:none">
               </label>
-              <div class="form-check mt-3 mb-1" style="font-size:12px">
-                <input class="form-check-input" type="checkbox" name="download_errors" id="dlErrCheck" value="1">
-                <label class="form-check-label" for="dlErrCheck">Download error report if any rows fail</label>
-              </div>
-              <button type="submit" class="btn btn-primary w-100 mt-2" style="padding:10px">
+              <button type="submit" class="btn btn-primary w-100 mt-3" style="padding:10px">
                 <i class="bi bi-upload"></i> Upload &amp; Process
               </button>
             </form>
@@ -4311,7 +4302,7 @@ def bulk_upload():
             <tr><td><code>Organisation_Name</code></td><td style="color:#64748b;font-size:12px">City Hospital</td></tr>
             <tr><td><code>Programme_Name</code></td><td style="color:#64748b;font-size:12px">NABH Full Accreditation…</td></tr>
             <tr><td><code>Stage_Name</code></td><td style="color:#64748b;font-size:12px">Application In Progress</td></tr>
-            <tr><td><code>Date_of_Stage_Change</code></td><td style="color:#64748b;font-size:12px">2026-03-20</td></tr>
+            <tr><td><code>Date_of_Stage_Change</code></td><td style="color:#64748b;font-size:12px">20-03-2026</td></tr>
             <tr><td><code>Action_Owner_Name</code></td><td style="color:#64748b;font-size:12px">Mr. Applicant</td></tr>
             <tr><td><code>Action_Owner_Email</code></td><td style="color:#64748b;font-size:12px">applicant@hospital.in</td></tr>
             <tr><td><code>Program_Officer_Email</code></td><td style="color:#64748b;font-size:12px">po@qci.org.in</td></tr>
@@ -4356,8 +4347,25 @@ document.getElementById('uploadForm').addEventListener('submit', function(){
 _TEMPLATE_COLS = ["Application_ID", "Organisation_Name", "Programme_Name", "Stage_Name",
                   "Date_of_Stage_Change", "Action_Owner_Name", "Action_Owner_Email", "Program_Officer_Email"]
 _TEMPLATE_EXAMPLE = ["APP-001", "Sample Hospital", "NABH Full Accreditation Hospitals",
-                     "Application In Progress", now_ist().date().isoformat(),
+                     "Application In Progress", now_ist().date().strftime("%d-%m-%Y"),
                      "Mr. Applicant", "applicant@example.com", "po@qci.org.in"]
+
+
+@app.route("/download-upload-errors")
+@login_required
+def download_upload_errors():
+    errors = session.pop('_upload_errors', [])
+    if not errors:
+        flash("No error report available.", "warning")
+        return redirect(url_for("bulk_upload"))
+    out = io.StringIO()
+    w = csv.DictWriter(out, fieldnames=["Row", "Application_ID", "Reason"])
+    w.writeheader()
+    for e in errors:
+        w.writerow({"Row": e["row"], "Application_ID": e["app_id"], "Reason": e["reason"]})
+    out.seek(0)
+    return Response(out.getvalue(), mimetype="text/csv",
+                    headers={"Content-Disposition": "attachment; filename=upload_errors.csv"})
 
 
 @app.route("/csv-template")
