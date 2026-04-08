@@ -4151,15 +4151,21 @@ def bulk_upload():
                 if not HAS_XLSX:
                     flash("openpyxl is not installed. Install it with: pip3 install openpyxl", "error")
                     return redirect(url_for("bulk_upload"))
-                wb = openpyxl.load_workbook(io.BytesIO(f.stream.read()))
+                wb = openpyxl.load_workbook(io.BytesIO(f.stream.read()), data_only=True)
                 ws = wb.active
                 all_rows = list(ws.iter_rows(values_only=True))
                 if not all_rows:
                     flash("The uploaded file is empty.", "error")
                     return redirect(url_for("bulk_upload"))
                 headers = [str(h).strip() if h else "" for h in all_rows[0]]
+                def _cell_str(v):
+                    if v is None:
+                        return ""
+                    if isinstance(v, (datetime, date)):
+                        return v.strftime("%d-%m-%Y")
+                    return str(v).strip()
                 row_dicts = [
-                    {headers[i]: (str(v).strip() if v is not None else "")
+                    {headers[i]: _cell_str(v)
                      for i, v in enumerate(row) if i < len(headers)}
                     for row in all_rows[1:]
                 ]
@@ -4347,7 +4353,7 @@ document.getElementById('uploadForm').addEventListener('submit', function(){
 _TEMPLATE_COLS = ["Application_ID", "Organisation_Name", "Programme_Name", "Stage_Name",
                   "Date_of_Stage_Change", "Action_Owner_Name", "Action_Owner_Email", "Program_Officer_Email"]
 _TEMPLATE_EXAMPLE = ["APP-001", "Sample Hospital", "NABH Full Accreditation Hospitals",
-                     "Application In Progress", now_ist().date().strftime("%d-%m-%Y"),
+                     "Application In Progress", '=TEXT(TODAY(),"DD-MM-YYYY")',
                      "Mr. Applicant", "applicant@example.com", "po@qci.org.in"]
 
 
@@ -4373,8 +4379,11 @@ def download_upload_errors():
 def csv_template():
     output = io.StringIO()
     writer = csv.writer(output)
+    # Replace Excel formula with a plain date string for CSV
+    csv_example = [now_ist().date().strftime("%d-%m-%Y") if v.startswith("=") else v
+                   for v in _TEMPLATE_EXAMPLE]
     writer.writerow(_TEMPLATE_COLS)
-    writer.writerow(_TEMPLATE_EXAMPLE)
+    writer.writerow(csv_example)
     return Response(
         output.getvalue(),
         mimetype="text/csv",
