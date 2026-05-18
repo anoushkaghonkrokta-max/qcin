@@ -53,7 +53,7 @@ class TestLoginRoute:
         assert b"login" in r.data.lower() or b"Login" in r.data
 
     def test_post_invalid_credentials(self, client):
-        r = client.post("/login", data={"username": "bad", "password": "wrong"},
+        r = client.post("/login", data={"email": "bad@example.com", "password": "wrong"},
                         follow_redirects=True)
         assert r.status_code == 200
         # Should still be on login page (flash error)

@@ -12,6 +12,7 @@ import secrets
 import smtplib
 import socket
 import ssl
+import uuid
 import psycopg2
 import psycopg2.extras
 import psycopg2.pool
@@ -163,8 +164,8 @@ def set_app_setting(key: str, value: str):
 
 
 def log_audit(event_type: str, application_id: str = None, detail: str = "",
-              user_name: str = None, board_id: int = None):
-    """Write a tamper-evident row to audit_log. Each entry hashes previous entry + payload.
+              user_name: str = None, board_id: str = None):
+    """Write a tamper-evident row to notification_audit_log. Each entry hashes previous entry + payload.
     Never raises — audit failures must not crash the calling request."""
     try:
         conn = get_db()
@@ -173,7 +174,7 @@ def log_audit(event_type: str, application_id: str = None, detail: str = "",
         entry_hash = None
         try:
             prev_row = conn.execute(
-                "SELECT entry_hash FROM audit_log ORDER BY id DESC LIMIT 1"
+                "SELECT entry_hash FROM notification_audit_log ORDER BY id DESC LIMIT 1"
             ).fetchone()
             prev_hash = prev_row["entry_hash"] if prev_row and prev_row["entry_hash"] else "GENESIS"
             raw = f"{prev_hash}|{timestamp}|{event_type}|{application_id}|{detail}|{user_name}"
@@ -183,7 +184,7 @@ def log_audit(event_type: str, application_id: str = None, detail: str = "",
         # Try INSERT with entry_hash first; fall back to without if column missing
         try:
             conn.execute(
-                "INSERT INTO audit_log "
+                "INSERT INTO notification_audit_log "
                 "(timestamp, application_id, event_type, detail, user_name, board_id, entry_hash) "
                 "VALUES (?,?,?,?,?,?,?)",
                 (timestamp, application_id, event_type,
@@ -194,7 +195,7 @@ def log_audit(event_type: str, application_id: str = None, detail: str = "",
             # PostgreSQL requires a rollback after any failed statement before retrying
             conn.rollback()
             conn.execute(
-                "INSERT INTO audit_log "
+                "INSERT INTO notification_audit_log "
                 "(timestamp, application_id, event_type, detail, user_name, board_id) "
                 "VALUES (?,?,?,?,?,?)",
                 (timestamp, application_id, event_type,
@@ -225,7 +226,7 @@ def _verify_api_key(request) -> dict:
 
 
 def log_stage_transition(application_id: str, from_stage: str, to_stage: str,
-                         changed_by: str = None, board_id: int = None):
+                         changed_by: str = None, board_id: str = None):
     """Record a stage transition in stage_history."""
     conn = get_db()
     conn.execute(
@@ -274,18 +275,18 @@ def totp_generate_secret() -> str:
     return base64.b32encode(secrets.token_bytes(20)).decode().rstrip("=")
 
 
-def totp_provisioning_uri(secret: str, username: str) -> str:
+def totp_provisioning_uri(secret: str, user_identifier: str) -> str:
     import urllib.parse
     padded = secret + "=" * (-len(secret) % 8)
     params = urllib.parse.urlencode({"secret": padded, "issuer": "QCI Engine"})
-    return f"otpauth://totp/QCI%20Engine:{urllib.parse.quote(username)}?{params}"
+    return f"otpauth://totp/QCI%20Engine:{urllib.parse.quote(user_identifier)}?{params}"
 
 
 # ── Email queue helpers ───────────────────────────────────────────────────────
 def queue_email(programme_name: str, notification_type: str, to_email: str,
                 cc_email: str, sender_email: str, sender_password_enc: str,
                 ph: dict, smtp_host: str, smtp_port: int,
-                application_id: str = None, board_id: int = None,
+                application_id: str = None, board_id: str = None,
                 stage_name: str = None):
     """Resolve template + placeholders and add to email_queue.
     Per-stage overrides take priority over programme-level templates."""
@@ -441,7 +442,7 @@ def process_email_queue(max_retries: int = 3) -> dict:
     return {"sent": sent, "failed": failed}
 
 
-def queue_webhook(event_type: str, payload: dict, board_id: int = None):
+def queue_webhook(event_type: str, payload: dict, board_id: str = None):
     """Insert a webhook call into webhook_queue for async batch processing.
     Never blocks the caller — the scheduler drains the queue periodically."""
     url = get_app_setting("webhook_url", "").strip()
@@ -669,16 +670,32 @@ def init_db():
     conn = get_db()
     conn.executescript("""
         CREATE TABLE IF NOT EXISTS boards (
-            id         INTEGER PRIMARY KEY AUTOINCREMENT,
-            board_name TEXT NOT NULL UNIQUE
+            id    TEXT PRIMARY KEY,
+            name  TEXT NOT NULL UNIQUE,
+            code  TEXT UNIQUE
         );
-        CREATE TABLE IF NOT EXISTS programmes (
-            id             INTEGER PRIMARY KEY AUTOINCREMENT,
-            programme_name TEXT NOT NULL UNIQUE,
-            board_id       INTEGER NOT NULL REFERENCES boards(id)
+        CREATE TABLE IF NOT EXISTS programs (
+            id               TEXT PRIMARY KEY,
+            programme_name   TEXT NOT NULL UNIQUE,
+            board_id         TEXT REFERENCES boards(id),
+            code             TEXT,
+            service_line_id  TEXT
+        );
+        CREATE TABLE IF NOT EXISTS programme_notification_config (
+            id                   SERIAL PRIMARY KEY,
+            programme_name       TEXT NOT NULL UNIQUE,
+            notification_emails  TEXT,
+            sender_email         TEXT,
+            sender_password      TEXT,
+            smtp_host            TEXT NOT NULL DEFAULT 'smtp.gmail.com',
+            smtp_port            INTEGER NOT NULL DEFAULT 587,
+            tat_days             INTEGER NOT NULL DEFAULT 0,
+            reminder1_days       INTEGER NOT NULL DEFAULT 0,
+            reminder2_days       INTEGER NOT NULL DEFAULT 0,
+            overdue_days         INTEGER NOT NULL DEFAULT 0
         );
         CREATE TABLE IF NOT EXISTS programme_config (
-            id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+            id                   SERIAL PRIMARY KEY,
             programme_name       TEXT NOT NULL,
             stage_name           TEXT NOT NULL,
             stage_order          INTEGER NOT NULL DEFAULT 0,
@@ -695,15 +712,15 @@ def init_db():
             smtp_port            INTEGER NOT NULL DEFAULT 587
         );
         CREATE TABLE IF NOT EXISTS users (
-            id            INTEGER PRIMARY KEY AUTOINCREMENT,
-            username      TEXT NOT NULL UNIQUE,
+            id            TEXT PRIMARY KEY,
+            email         TEXT NOT NULL UNIQUE,
+            full_name     TEXT NOT NULL,
             password_hash TEXT NOT NULL,
             role          TEXT NOT NULL DEFAULT 'program_officer',
-            full_name     TEXT,
-            email         TEXT
+            board_id      TEXT REFERENCES boards(id)
         );
         CREATE TABLE IF NOT EXISTS case_tracking (
-            id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+            id                   SERIAL PRIMARY KEY,
             application_id       TEXT NOT NULL UNIQUE,
             programme_name       TEXT NOT NULL,
             organisation_name    TEXT NOT NULL,
@@ -726,7 +743,7 @@ def init_db():
             escalation_tier      INTEGER NOT NULL DEFAULT 0
         );
         CREATE TABLE IF NOT EXISTS email_templates (
-            id                INTEGER PRIMARY KEY AUTOINCREMENT,
+            id                SERIAL PRIMARY KEY,
             programme_name    TEXT NOT NULL,
             notification_type TEXT NOT NULL,
             subject_line      TEXT NOT NULL,
@@ -737,26 +754,26 @@ def init_db():
             key   TEXT PRIMARY KEY,
             value TEXT NOT NULL
         );
-        CREATE TABLE IF NOT EXISTS audit_log (
-            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+        CREATE TABLE IF NOT EXISTS notification_audit_log (
+            id              SERIAL PRIMARY KEY,
             timestamp       TEXT NOT NULL,
             application_id  TEXT,
             event_type      TEXT NOT NULL,
             detail          TEXT,
             user_name       TEXT,
-            board_id        INTEGER
+            board_id        TEXT
         );
         CREATE TABLE IF NOT EXISTS stage_history (
-            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            id              SERIAL PRIMARY KEY,
             timestamp       TEXT NOT NULL,
             application_id  TEXT NOT NULL,
             from_stage      TEXT,
             to_stage        TEXT NOT NULL,
             changed_by      TEXT,
-            board_id        INTEGER
+            board_id        TEXT
         );
         CREATE TABLE IF NOT EXISTS email_queue (
-            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            id              SERIAL PRIMARY KEY,
             queued_at       TEXT NOT NULL,
             application_id  TEXT,
             programme_name  TEXT,
@@ -773,7 +790,7 @@ def init_db():
             attempts        INTEGER NOT NULL DEFAULT 0,
             last_attempt    TEXT,
             error_msg       TEXT,
-            board_id        INTEGER
+            board_id        TEXT
         );
         CREATE TABLE IF NOT EXISTS scheduler_locks (
             lock_name       TEXT PRIMARY KEY,
@@ -784,18 +801,18 @@ def init_db():
             id           SERIAL PRIMARY KEY,
             holiday_date TEXT NOT NULL,
             name         TEXT NOT NULL,
-            board_id     INTEGER REFERENCES boards(id),
+            board_id     TEXT REFERENCES boards(id),
             UNIQUE(holiday_date, board_id)
         );
         CREATE TABLE IF NOT EXISTS user_programme_map (
             id           SERIAL PRIMARY KEY,
-            user_id      INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-            programme_id INTEGER NOT NULL REFERENCES programmes(id) ON DELETE CASCADE,
+            user_id      TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            programme_id TEXT NOT NULL REFERENCES programs(id) ON DELETE CASCADE,
             UNIQUE(user_id, programme_id)
         );
         CREATE TABLE IF NOT EXISTS saved_filters (
             id          SERIAL PRIMARY KEY,
-            user_id     INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            user_id     TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
             filter_name TEXT NOT NULL,
             filter_json TEXT NOT NULL,
             created_at  TEXT NOT NULL,
@@ -815,14 +832,14 @@ def init_db():
             key_hash   TEXT NOT NULL UNIQUE,
             key_prefix TEXT,
             name       TEXT NOT NULL,
-            board_id   INTEGER REFERENCES boards(id),
+            board_id   TEXT REFERENCES boards(id),
             created_at TEXT NOT NULL,
             last_used  TEXT,
             is_active  INTEGER NOT NULL DEFAULT 1
         );
         CREATE TABLE IF NOT EXISTS escalation_matrix (
             id               SERIAL PRIMARY KEY,
-            board_id         INTEGER REFERENCES boards(id),
+            board_id         TEXT REFERENCES boards(id),
             days_overdue_min INTEGER NOT NULL DEFAULT 1,
             days_overdue_max INTEGER,
             notify_role      TEXT NOT NULL DEFAULT 'program_head',
@@ -837,69 +854,49 @@ def init_db():
             status     TEXT NOT NULL DEFAULT 'pending',
             sent_at    TEXT,
             error      TEXT,
-            board_id   INTEGER REFERENCES boards(id)
+            board_id   TEXT REFERENCES boards(id)
         );
     """)
     # Migrate existing DBs: add columns if absent (IF NOT EXISTS is safe to re-run)
     for sql in [
         "ALTER TABLE programme_config ADD COLUMN IF NOT EXISTS smtp_host TEXT NOT NULL DEFAULT 'smtp.gmail.com'",
         "ALTER TABLE programme_config ADD COLUMN IF NOT EXISTS smtp_port INTEGER NOT NULL DEFAULT 587",
-        "ALTER TABLE programme_config ADD COLUMN IF NOT EXISTS board_id INTEGER",
-        "ALTER TABLE users ADD COLUMN IF NOT EXISTS board_id INTEGER",
+        "ALTER TABLE programme_config ADD COLUMN IF NOT EXISTS board_id TEXT",
         "ALTER TABLE users ADD COLUMN IF NOT EXISTS force_password_reset INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE users ADD COLUMN IF NOT EXISTS totp_secret TEXT",
         "ALTER TABLE users ADD COLUMN IF NOT EXISTS last_login TEXT",
-        "ALTER TABLE case_tracking ADD COLUMN IF NOT EXISTS board_id INTEGER",
+        "ALTER TABLE case_tracking ADD COLUMN IF NOT EXISTS board_id TEXT",
         "ALTER TABLE case_tracking ADD COLUMN IF NOT EXISTS cc_emails TEXT",
         "ALTER TABLE case_tracking ADD COLUMN IF NOT EXISTS suppress_until TEXT",
         "ALTER TABLE case_tracking ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'Active'",
-        "ALTER TABLE email_templates ADD COLUMN IF NOT EXISTS board_id INTEGER",
-        "ALTER TABLE holidays ADD COLUMN IF NOT EXISTS board_id INTEGER",
+        "ALTER TABLE email_templates ADD COLUMN IF NOT EXISTS board_id TEXT",
+        "ALTER TABLE holidays ADD COLUMN IF NOT EXISTS board_id TEXT",
         "ALTER TABLE case_tracking ADD COLUMN IF NOT EXISTS hold_days INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE case_tracking ADD COLUMN IF NOT EXISTS hold_start_date TEXT",
-        "ALTER TABLE audit_log ADD COLUMN IF NOT EXISTS entry_hash TEXT",
+        "ALTER TABLE notification_audit_log ADD COLUMN IF NOT EXISTS entry_hash TEXT",
         "ALTER TABLE programme_config ADD COLUMN IF NOT EXISTS is_optional INTEGER NOT NULL DEFAULT 0",
-        "ALTER TABLE programmes ADD COLUMN IF NOT EXISTS tat_days INTEGER NOT NULL DEFAULT 0",
-        "ALTER TABLE programmes ADD COLUMN IF NOT EXISTS reminder1_days INTEGER NOT NULL DEFAULT 0",
-        "ALTER TABLE programmes ADD COLUMN IF NOT EXISTS reminder2_days INTEGER NOT NULL DEFAULT 0",
-        "ALTER TABLE programmes ADD COLUMN IF NOT EXISTS overdue_days INTEGER NOT NULL DEFAULT 0",
-        "ALTER TABLE programmes ADD COLUMN IF NOT EXISTS notification_emails TEXT",
         "ALTER TABLE case_tracking ADD COLUMN IF NOT EXISTS escalation_sent INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS key_prefix TEXT",
         "ALTER TABLE case_tracking ADD COLUMN IF NOT EXISTS iteration_count INTEGER NOT NULL DEFAULT 1",
         "ALTER TABLE case_tracking ADD COLUMN IF NOT EXISTS escalation_tier INTEGER NOT NULL DEFAULT 0",
-        "ALTER TABLE programmes ADD COLUMN IF NOT EXISTS sender_email TEXT",
-        "ALTER TABLE programmes ADD COLUMN IF NOT EXISTS sender_password TEXT",
-        "ALTER TABLE programmes ADD COLUMN IF NOT EXISTS smtp_host TEXT NOT NULL DEFAULT 'smtp.gmail.com'",
-        "ALTER TABLE programmes ADD COLUMN IF NOT EXISTS smtp_port INTEGER NOT NULL DEFAULT 587",
     ]:
         try:
             conn.execute(sql)
         except Exception:
             conn.rollback()
-    # One-time migration: copy email settings from programme_config into programmes
-    # (only where programmes row has no sender_email yet but programme_config does)
+    # One-time migration: backfill email settings into programme_notification_config
     try:
         conn.execute("""
-            UPDATE programmes
-            SET sender_email    = (SELECT MAX(pc.sender_email) FROM programme_config pc
-                                   WHERE pc.programme_name = programmes.programme_name),
-                sender_password = (SELECT MAX(pc.sender_password) FROM programme_config pc
-                                   WHERE pc.programme_name = programmes.programme_name),
-                smtp_host       = COALESCE(
-                                    (SELECT MAX(pc.smtp_host) FROM programme_config pc
-                                     WHERE pc.programme_name = programmes.programme_name),
-                                    'smtp.gmail.com'),
-                smtp_port       = COALESCE(
-                                    (SELECT MAX(pc.smtp_port) FROM programme_config pc
-                                     WHERE pc.programme_name = programmes.programme_name),
-                                    587)
-            WHERE programmes.sender_email IS NULL
-              AND EXISTS (
-                  SELECT 1 FROM programme_config pc
-                  WHERE pc.programme_name = programmes.programme_name
-                    AND pc.sender_email IS NOT NULL
-              )
+            INSERT INTO programme_notification_config (programme_name, sender_email, sender_password, smtp_host, smtp_port)
+            SELECT DISTINCT programme_name,
+                   MAX(sender_email),
+                   MAX(sender_password),
+                   COALESCE(MAX(smtp_host), 'smtp.gmail.com'),
+                   COALESCE(MAX(smtp_port), 587)
+            FROM programme_config
+            WHERE sender_email IS NOT NULL
+            GROUP BY programme_name
+            ON CONFLICT (programme_name) DO NOTHING
         """)
     except Exception:
         pass
@@ -1073,7 +1070,7 @@ def migrate_data():
     # 1. Seed boards
     for b in _SEED_BOARDS:
         try:
-            conn.execute("INSERT INTO boards (board_name) VALUES (?)", (b,))
+            conn.execute("INSERT INTO boards (id, name, code) VALUES (?,?,?)", (str(uuid.uuid4()), b, b))
         except Exception:
             conn.rollback()  # PostgreSQL requires rollback after any failed statement
     conn.commit()
@@ -1089,20 +1086,20 @@ def migrate_data():
     for row in distinct_progs:
         pname = row[0]
         # Already in programmes table? Skip.
-        if conn.execute("SELECT id FROM programmes WHERE programme_name=?", (pname,)).fetchone():
+        if conn.execute("SELECT id FROM programs WHERE programme_name=?", (pname,)).fetchone():
             continue
         # Infer board by prefix
         board_row = None
         for b in _SEED_BOARDS:
             if pname.upper().startswith(b):
-                board_row = conn.execute("SELECT id FROM boards WHERE board_name=?", (b,)).fetchone()
+                board_row = conn.execute("SELECT id FROM boards WHERE name=?", (b,)).fetchone()
                 break
         if not board_row:
             board_row = conn.execute("SELECT id FROM boards ORDER BY id LIMIT 1").fetchone()
         if board_row:
             try:
-                conn.execute("INSERT INTO programmes (programme_name, board_id) VALUES (?,?)",
-                             (pname, board_row[0]))
+                conn.execute("INSERT INTO programs (id, programme_name, board_id) VALUES (?,?,?)",
+                             (str(uuid.uuid4()), pname, board_row[0]))
             except Exception:
                 conn.rollback()  # PostgreSQL requires rollback after any failed statement
     conn.commit()
@@ -1110,7 +1107,7 @@ def migrate_data():
     # 4. Backfill board_id on programme_config
     conn.execute("""
         UPDATE programme_config SET board_id = (
-            SELECT board_id FROM programmes WHERE programmes.programme_name = programme_config.programme_name
+            SELECT board_id FROM programs WHERE programs.programme_name = programme_config.programme_name
         ) WHERE board_id IS NULL
     """)
     conn.commit()
@@ -1127,14 +1124,14 @@ def migrate_data():
     # 6. Backfill board_id on email_templates
     conn.execute("""
         UPDATE email_templates SET board_id = (
-            SELECT board_id FROM programmes
-            WHERE programmes.programme_name = email_templates.programme_name
+            SELECT board_id FROM programs
+            WHERE programs.programme_name = email_templates.programme_name
         ) WHERE board_id IS NULL
     """)
     conn.commit()
 
     # 7. Default officer user → NABH board if no board assigned
-    nabh = conn.execute("SELECT id FROM boards WHERE board_name='NABH'").fetchone()
+    nabh = conn.execute("SELECT id FROM boards WHERE name='NABH'").fetchone()
     if nabh:
         conn.execute(
             "UPDATE users SET board_id=? WHERE role='program_officer' AND board_id IS NULL",
@@ -1148,39 +1145,39 @@ def seed_data():
     conn = get_db()
     # Always ensure admin exists; if ADMIN_PASSWORD env var is set, force-reset password
     _admin_pw = os.environ.get("ADMIN_PASSWORD", "admin123")
-    existing_admin = conn.execute("SELECT id FROM users WHERE username='admin'").fetchone()
+    existing_admin = conn.execute("SELECT id FROM users WHERE email='admin@qci.local'").fetchone()
     if not existing_admin:
         conn.execute(
-            "INSERT INTO users (username, password_hash, role, full_name) VALUES (?,?,?,?)",
-            ("admin", generate_password_hash(_admin_pw), "super_admin", "Super Administrator"),
+            "INSERT INTO users (id, email, password_hash, role, full_name) VALUES (?,?,?,?,?)",
+            (str(uuid.uuid4()), "admin@qci.local", generate_password_hash(_admin_pw), "super_admin", "Super Administrator"),
         )
         conn.commit()
         log.info("seed_data: admin user created")
     elif os.environ.get("ADMIN_PASSWORD"):
         # Force-reset password if env var explicitly set
         conn.execute(
-            "UPDATE users SET password_hash=? WHERE username='admin'",
+            "UPDATE users SET password_hash=? WHERE email='admin@qci.local'",
             (generate_password_hash(_admin_pw),)
         )
         conn.commit()
         log.info("seed_data: admin password reset from ADMIN_PASSWORD env var")
 
-    if conn.execute("SELECT COUNT(*) FROM users WHERE username='officer'").fetchone()[0] == 0:
-        nabh = conn.execute("SELECT id FROM boards WHERE board_name='NABH'").fetchone()
+    if conn.execute("SELECT COUNT(*) FROM users WHERE email='officer@qci.local'").fetchone()[0] == 0:
+        nabh = conn.execute("SELECT id FROM boards WHERE name='NABH'").fetchone()
         conn.execute(
-            "INSERT INTO users (username, password_hash, role, full_name, board_id) VALUES (?,?,?,?,?)",
-            ("officer", generate_password_hash("po123"), "program_officer", "Program Officer",
+            "INSERT INTO users (id, email, password_hash, role, full_name, board_id) VALUES (?,?,?,?,?,?)",
+            (str(uuid.uuid4()), "officer@qci.local", generate_password_hash("po123"), "program_officer", "Program Officer",
              nabh[0] if nabh else None),
         )
         conn.commit()
 
     if conn.execute("SELECT COUNT(*) FROM programme_config").fetchone()[0] == 0:
-        nabh = conn.execute("SELECT id FROM boards WHERE board_name='NABH'").fetchone()
+        nabh = conn.execute("SELECT id FROM boards WHERE name='NABH'").fetchone()
         nabh_id = nabh[0] if nabh else None
         # Insert programme record
         try:
-            conn.execute("INSERT INTO programmes (programme_name, board_id) VALUES (?,?)",
-                         ("NABH Full Accreditation Hospitals", nabh_id))
+            conn.execute("INSERT INTO programs (id, programme_name, board_id) VALUES (?,?,?)",
+                         (str(uuid.uuid4()), "NABH Full Accreditation Hospitals", nabh_id))
         except Exception:
             conn.rollback()  # PostgreSQL requires rollback after any failed statement
         for row in _SEED_STAGES:
@@ -1191,7 +1188,7 @@ def seed_data():
                 (*row, nabh_id),
             )
     if conn.execute("SELECT COUNT(*) FROM email_templates").fetchone()[0] == 0:
-        nabh = conn.execute("SELECT id FROM boards WHERE board_name='NABH'").fetchone()
+        nabh = conn.execute("SELECT id FROM boards WHERE name='NABH'").fetchone()
         nabh_id = nabh[0] if nabh else None
         for row in _SEED_TEMPLATES:
             conn.execute(
@@ -1244,7 +1241,7 @@ def user_programme_names():
     conn = get_db()
     rows = conn.execute(
         """SELECT p.programme_name FROM user_programme_map upm
-           JOIN programmes p ON p.id = upm.programme_id
+           JOIN programs p ON p.id = upm.programme_id
            WHERE upm.user_id=?""",
         (session["user_id"],)
     ).fetchall()
@@ -1343,11 +1340,11 @@ def run_daily_check(board_id=None) -> dict:
     ).fetchall()
     _pc_lookup = {(r["programme_name"], r["stage_name"]): dict(r) for r in _pc_rows}
 
-    # Pre-fetch email credentials + notification_emails from programmes table
+    # Pre-fetch email credentials + notification_emails from programme_notification_config
     try:
         _prog_rows = conn.execute(
             "SELECT programme_name, notification_emails, "
-            "sender_email, sender_password, smtp_host, smtp_port FROM programmes"
+            "sender_email, sender_password, smtp_host, smtp_port FROM programme_notification_config"
         ).fetchall()
         _prog_map = {r["programme_name"]: dict(r) for r in _prog_rows}
         _prog_notif_map = {r["programme_name"]: r["notification_emails"]
@@ -1359,7 +1356,7 @@ def run_daily_check(board_id=None) -> dict:
     # Pre-fetch programme → programme_head email mapping for escalations
     _ph_rows = conn.execute(
         """SELECT p.programme_name, u.email, u.full_name
-           FROM programmes p
+           FROM programs p
            JOIN user_programme_map upm ON upm.programme_id = p.id
            JOIN users u ON u.id = upm.user_id
            WHERE u.role='program_head' AND u.email IS NOT NULL"""
@@ -1514,7 +1511,7 @@ def run_daily_check(board_id=None) -> dict:
 
         # First overdue
         if tat > 0 and elapsed >= tat and not case["overdue_sent"]:
-            _send("OVERDUE")
+            _send("Overdue")
             conn.execute(
                 "UPDATE case_tracking SET overdue_sent=1, last_overdue_date=? WHERE id=?",
                 (today.isoformat(), case["id"]),
@@ -1527,7 +1524,7 @@ def run_daily_check(board_id=None) -> dict:
             last = datetime.strptime(case["last_overdue_date"], "%Y-%m-%d").date()
             if (today - last).days >= overdue_interval:
                 ph["Followup_Count"] = case["overdue_count"] + 1
-                _send("FOLLOWUP")
+                _send("Followup")
                 conn.execute(
                     "UPDATE case_tracking SET overdue_count=overdue_count+1, last_overdue_date=? WHERE id=?",
                     (today.isoformat(), case["id"]),
@@ -1562,7 +1559,7 @@ def run_weekly_digest():
     except Exception:
         _digest_db_hols = set()
     recipients = [dict(r) for r in conn.execute(
-        "SELECT u.*, b.board_name FROM users u LEFT JOIN boards b ON b.id=u.board_id "
+        "SELECT u.*, b.name AS board_name FROM users u LEFT JOIN boards b ON b.id=u.board_id "
         "WHERE u.role IN ('board_ceo','board_admin','super_admin') AND u.email IS NOT NULL"
     ).fetchall()]
 
@@ -1613,13 +1610,15 @@ def run_weekly_digest():
         cfg = None
         if bid:
             cfg = conn.execute(
-                "SELECT sender_email, sender_password, smtp_host, smtp_port "
-                "FROM programmes WHERE board_id=? AND sender_email IS NOT NULL LIMIT 1", (bid,)
+                "SELECT pnc.sender_email, pnc.sender_password, pnc.smtp_host, pnc.smtp_port "
+                "FROM programme_notification_config pnc "
+                "JOIN programs p ON p.programme_name = pnc.programme_name "
+                "WHERE p.board_id=? AND pnc.sender_email IS NOT NULL LIMIT 1", (bid,)
             ).fetchone()
         if not cfg:
             cfg = conn.execute(
                 "SELECT sender_email, sender_password, smtp_host, smtp_port "
-                "FROM programmes WHERE sender_email IS NOT NULL LIMIT 1"
+                "FROM programme_notification_config WHERE sender_email IS NOT NULL LIMIT 1"
             ).fetchone()
         if not cfg or not cfg["sender_email"]:
             continue
@@ -1652,7 +1651,7 @@ def run_weekly_digest():
         cutoff = (now_ist() - timedelta(days=90)).strftime("%Y-%m-%d")
         # Only purge high-volume low-value logs; retain structural events forever
         conn.execute(
-            "DELETE FROM audit_log WHERE timestamp < ? AND event_type IN "
+            "DELETE FROM notification_audit_log WHERE timestamp < ? AND event_type IN "
             "('email_sent','scheduled_check','run_check','bulk_advance')",
             (cutoff,)
         )
@@ -2296,9 +2295,9 @@ _LOGIN_PAGE = """<!doctype html>
   {% endfor %}{% endif %}{% endwith %}
   <form method="post">
     <div class="mb-3">
-      <label class="form-label">Username</label>
-      <input type="text" class="form-control" name="username" autofocus required
-             placeholder="Enter username" value="{{ prefill_user }}">
+      <label class="form-label">Email</label>
+      <input type="email" class="form-control" name="email" autofocus required
+             placeholder="Enter your email" value="{{ prefill_user }}">
     </div>
     <div class="mb-{% if show_totp %}3{% else %}4{% endif %}">
       <label class="form-label">Password</label>
@@ -2319,13 +2318,13 @@ _LOGIN_PAGE = """<!doctype html>
       <thead>
         <tr style="color:#94a3b8;border-bottom:1px solid #e2e8f0">
           <th style="text-align:left;padding-bottom:6px;font-weight:600">Role</th>
-          <th style="text-align:left;padding-bottom:6px;font-weight:600">Username</th>
+          <th style="text-align:left;padding-bottom:6px;font-weight:600">Email</th>
           <th style="text-align:left;padding-bottom:6px;font-weight:600">Password</th>
         </tr>
       </thead>
       <tbody>
-        <tr><td style="padding:4px 0;color:#1e293b">Super Admin</td><td><code>admin</code></td><td><code>admin123</code></td></tr>
-        <tr><td style="padding:4px 0;color:#1e293b">Program Officer</td><td><code>officer</code></td><td><code>po123</code></td></tr>
+        <tr><td style="padding:4px 0;color:#1e293b">Super Admin</td><td><code>admin@qci.local</code></td><td><code>admin123</code></td></tr>
+        <tr><td style="padding:4px 0;color:#1e293b">Program Officer</td><td><code>officer@qci.local</code></td><td><code>po123</code></td></tr>
       </tbody>
     </table>
     <div style="font-size:10px;color:#94a3b8;margin-top:10px;border-top:1px solid #e2e8f0;padding-top:8px">
@@ -2344,10 +2343,10 @@ def login():
     if "user_id" in session:
         return redirect(url_for("dashboard"))
     if request.method == "POST":
-        username = request.form["username"].strip()
+        email_input = request.form["email"].strip().lower()
         password = request.form["password"]
         conn = get_db()
-        user = conn.execute("SELECT * FROM users WHERE username=?", (username,)).fetchone()
+        user = conn.execute("SELECT * FROM users WHERE email=?", (email_input,)).fetchone()
         conn.close()
         if user and check_password_hash(user["password_hash"], password):
             # 2FA check
@@ -2356,11 +2355,11 @@ def login():
                 if not totp_code:
                     flash("This account has 2FA enabled. Enter your authenticator code.", "info")
                     return render_template_string(_LOGIN_PAGE, get_flashed_messages=gfm,
-                                                  show_totp=True, prefill_user=username)
+                                                  show_totp=True, prefill_user=email_input)
                 if not totp_verify(user["totp_secret"], totp_code):
                     flash("Invalid 2FA code.", "error")
                     return render_template_string(_LOGIN_PAGE, get_flashed_messages=gfm,
-                                                  show_totp=True, prefill_user=username)
+                                                  show_totp=True, prefill_user=email_input)
             # Record last login
             conn3 = get_db()
             conn3.execute("UPDATE users SET last_login=? WHERE id=?",
@@ -2368,16 +2367,16 @@ def login():
             conn3.commit()
             conn3.close()
             session["user_id"]    = user["id"]
-            session["username"]   = user["username"]
+            session["email"]      = user["email"]
             session["role"]       = user["role"]
-            session["full_name"]  = user["full_name"] or user["username"]
+            session["full_name"]  = user["full_name"] or user["email"]
             session["board_id"]   = user["board_id"]
             session["csrf_token"] = secrets.token_hex(32)
             if user["board_id"]:
                 conn2 = get_db()
-                brow = conn2.execute("SELECT board_name FROM boards WHERE id=?", (user["board_id"],)).fetchone()
+                brow = conn2.execute("SELECT name FROM boards WHERE id=?", (user["board_id"],)).fetchone()
                 conn2.close()
-                session["board_name"] = brow["board_name"] if brow else ""
+                session["board_name"] = brow["name"] if brow else ""
             else:
                 session["board_name"] = ""
             if user["force_password_reset"]:
@@ -2385,7 +2384,7 @@ def login():
                 return redirect(url_for("force_pw_reset"))
             flash(f"Welcome back, {session['full_name']}!", "success")
             return redirect(url_for("dashboard"))
-        flash("Invalid username or password.", "error")
+        flash("Invalid email or password.", "error")
     from flask import get_flashed_messages as gfm
     return render_template_string(_LOGIN_PAGE, get_flashed_messages=gfm,
                                   show_totp=False, prefill_user="")
@@ -2463,23 +2462,23 @@ def manage_users():
                     conn.close()
                     return redirect(url_for("manage_users"))
                 board_id = request.form.get("board_id") or None
-                if board_id:
-                    board_id = int(board_id)
+                # board_id is now TEXT (UUID) — no int() cast needed
                 # board_admin can only create users in their own board
                 if not _is_super and _caller_board_id is not None:
                     board_id = _caller_board_id
+                new_uid = str(uuid.uuid4())
                 conn.execute(
-                    "INSERT INTO users (username, password_hash, role, full_name, email, board_id) VALUES (?,?,?,?,?,?)",
-                    (request.form["username"].strip(),
+                    "INSERT INTO users (id, email, password_hash, role, full_name, board_id) VALUES (?,?,?,?,?,?)",
+                    (new_uid,
+                     request.form["email"].strip().lower(),
                      generate_password_hash(request.form["password"]),
                      role,
                      request.form["full_name"].strip(),
-                     request.form["email"].strip(),
                      board_id),
                 )
                 conn.commit()
                 new_user = conn.execute(
-                    "SELECT id FROM users WHERE username=?", (request.form["username"].strip(),)
+                    "SELECT id FROM users WHERE id=?", (new_uid,)
                 ).fetchone()
                 if new_user and role in ("program_head", "program_officer", "board_ceo"):
                     prog_ids = request.form.getlist("programme_ids")
@@ -2487,12 +2486,12 @@ def manage_users():
                         try:
                             conn.execute(
                                 "INSERT INTO user_programme_map (user_id, programme_id) VALUES (?,?) ON CONFLICT (user_id, programme_id) DO NOTHING",
-                                (new_user["id"], int(pid))
+                                (new_user["id"], pid)
                             )
                         except Exception:
                             pass
                     conn.commit()
-                flash(f"User '{request.form['username']}' created.", "success")
+                flash(f"User '{request.form['email']}' created.", "success")
             except Exception as e:
                 flash(f"Error: {e}", "error")
         elif action == "delete":
@@ -2520,7 +2519,7 @@ def manage_users():
                     try:
                         conn.execute(
                             "INSERT INTO user_programme_map (user_id, programme_id) VALUES (?,?) ON CONFLICT (user_id, programme_id) DO NOTHING",
-                            (int(uid), int(pid))
+                            (uid, pid)
                         )
                     except Exception:
                         pass
@@ -2529,26 +2528,26 @@ def manage_users():
 
     if _is_super:
         users = [dict(r) for r in conn.execute(
-            """SELECT u.*, b.board_name FROM users u
+            """SELECT u.*, b.name AS board_name FROM users u
                LEFT JOIN boards b ON b.id = u.board_id
-               ORDER BY u.role, u.username"""
+               ORDER BY u.role, u.email"""
         ).fetchall()]
     else:
         users = [dict(r) for r in conn.execute(
-            """SELECT u.*, b.board_name FROM users u
+            """SELECT u.*, b.name AS board_name FROM users u
                LEFT JOIN boards b ON b.id = u.board_id
                WHERE u.board_id=?
-               ORDER BY u.role, u.username""",
+               ORDER BY u.role, u.email""",
             (_caller_board_id,)
         ).fetchall()]
-    boards = [dict(r) for r in conn.execute("SELECT * FROM boards ORDER BY board_name").fetchall()]
+    boards = [dict(r) for r in conn.execute("SELECT * FROM boards ORDER BY name").fetchall()]
     if _is_super:
         all_programmes = [dict(r) for r in conn.execute(
-            "SELECT p.*, b.board_name FROM programmes p JOIN boards b ON b.id=p.board_id ORDER BY b.board_name, p.programme_name"
+            "SELECT p.*, b.name AS board_name FROM programs p JOIN boards b ON b.id=p.board_id ORDER BY b.name, p.programme_name"
         ).fetchall()]
     else:
         all_programmes = [dict(r) for r in conn.execute(
-            "SELECT p.*, b.board_name FROM programmes p JOIN boards b ON b.id=p.board_id WHERE p.board_id=? ORDER BY p.programme_name",
+            "SELECT p.*, b.name AS board_name FROM programs p JOIN boards b ON b.id=p.board_id WHERE p.board_id=? ORDER BY p.programme_name",
             (_caller_board_id,)
         ).fetchall()]
 
@@ -2557,7 +2556,7 @@ def manage_users():
     ph_prog_id_map = {}
     for row in conn.execute(
         """SELECT upm.user_id, upm.programme_id, p.programme_name
-           FROM user_programme_map upm JOIN programmes p ON p.id=upm.programme_id"""
+           FROM user_programme_map upm JOIN programs p ON p.id=upm.programme_id"""
     ).fetchall():
         ph_prog_map.setdefault(row["user_id"], []).append(row["programme_name"])
         ph_prog_id_map.setdefault(row["user_id"], []).append(row["programme_id"])
@@ -2583,7 +2582,7 @@ def manage_users():
                 prog_cell = '<span style="color:#f59e0b;font-size:11px">None mapped</span>'
         last_login_cell = u.get("last_login") or '<span style="color:#94a3b8;font-size:11px">Never</span>'
         _uid = u["id"]
-        _uname = u["username"]
+        _uname = u["email"]
         _urole = u["role"]
         _mapped_ids = json.dumps(ph_prog_id_map.get(_uid, []))
         remap_btn = (
@@ -2600,9 +2599,8 @@ def manage_users():
             if not is_self else ""
         )
         rows += f"""<tr>
-          <td style="font-weight:600">{u['username']}</td>
+          <td style="font-weight:600">{u['email']}</td>
           <td>{u['full_name'] or '—'}</td>
-          <td>{u['email'] or '—'}</td>
           <td>{role_pill}</td>
           <td>{board_cell}</td>
           <td style="font-size:12px;color:#475569;max-width:180px">{prog_cell or '<span style="color:#94a3b8">—</span>'}</td>
@@ -2610,7 +2608,7 @@ def manage_users():
           <td>
             <div class="d-flex gap-1 align-items-center" style="white-space:nowrap">
               <button class="btn btn-sm btn-outline-secondary btn-reset-pw" style="font-size:12px;padding:3px 8px" title="Reset Password"
-                data-uid="{h(u['id'])}" data-uname="{h(u['username'])}">
+                data-uid="{h(u['id'])}" data-uname="{h(u['email'])}">
                 <i class="bi bi-key"></i></button>
               {remap_btn}
               {del_btn}
@@ -2619,7 +2617,7 @@ def manage_users():
         </tr>"""
 
     board_opts = '<option value="">— None —</option>' + "".join(
-        f'<option value="{b["id"]}">{b["board_name"]}</option>' for b in boards
+        f'<option value="{b["id"]}">{b["name"]}</option>' for b in boards
     )
     prog_opts_by_board = "".join(
         f'<option value="{p["id"]}" data-board="{p["board_id"]}">[{p["board_name"]}] {p["programme_name"]}</option>'
@@ -2643,7 +2641,7 @@ def manage_users():
       </div>
       <div style="overflow-x:auto">
         <table class="data-table" id="userTable">
-          <thead><tr><th>Username</th><th>Full Name</th><th>Email</th><th>Role</th><th>Board</th><th>Programmes</th><th>Last Login</th><th>Actions</th></tr></thead>
+          <thead><tr><th>Email</th><th>Full Name</th><th>Role</th><th>Board</th><th>Programmes</th><th>Last Login</th><th>Actions</th></tr></thead>
           <tbody>{rows}</tbody>
         </table>
       </div>
@@ -2656,16 +2654,12 @@ def manage_users():
         <form method="post">
           <input type="hidden" name="action" value="add">
           <div class="mb-3">
-            <label class="form-label">Username</label>
-            <input type="text" class="form-control" name="username" required>
+            <label class="form-label">Email</label>
+            <input type="email" class="form-control" name="email" required>
           </div>
           <div class="mb-3">
             <label class="form-label">Full Name</label>
-            <input type="text" class="form-control" name="full_name">
-          </div>
-          <div class="mb-3">
-            <label class="form-label">Email</label>
-            <input type="email" class="form-control" name="email">
+            <input type="text" class="form-control" name="full_name" required>
           </div>
           <div class="mb-3">
             <label class="form-label">Role</label>
@@ -2838,7 +2832,7 @@ function filterUsers(q){
 @app.route("/bulk-users", methods=["GET", "POST"])
 @admin_required
 def bulk_users():
-    """Bulk import users from CSV. Columns: username, full_name, email, role, board_name, password"""
+    """Bulk import users from CSV. Columns: email, full_name, role, board_name, password"""
     errors = []
     created = 0
     if request.method == "POST":
@@ -2847,7 +2841,7 @@ def bulk_users():
             flash("No file uploaded.", "error")
             return redirect(url_for("bulk_users"))
         conn = get_db()
-        boards = {r["board_name"].lower(): r["id"] for r in conn.execute("SELECT id, board_name FROM boards").fetchall()}
+        boards = {r["name"].lower(): r["id"] for r in conn.execute("SELECT id, name FROM boards").fetchall()}
         try:
             fname_u = (f.filename or "").lower()
             if fname_u.endswith(".xlsx") or fname_u.endswith(".xls"):
@@ -2871,9 +2865,9 @@ def bulk_users():
                 content_bytes = f.read().decode("utf-8-sig")
                 reader_iter = csv.DictReader(io.StringIO(content_bytes))
             for i, row in enumerate(reader_iter, 2):
-                uname = (row.get("username") or "").strip()
+                uname = (row.get("email") or "").strip().lower()
                 if not uname:
-                    errors.append(f"Row {i}: username missing")
+                    errors.append(f"Row {i}: email missing")
                     continue
                 role = (row.get("role") or "program_officer").strip()
                 if role not in ROLE_META:
@@ -2889,10 +2883,9 @@ def bulk_users():
                     force_reset = 0
                 try:
                     conn.execute(
-                        "INSERT INTO users (username, password_hash, role, full_name, email, board_id, force_password_reset) VALUES (?,?,?,?,?,?,?)",
-                        (uname, generate_password_hash(raw_pw), role,
+                        "INSERT INTO users (id, email, password_hash, role, full_name, board_id, force_password_reset) VALUES (?,?,?,?,?,?,?)",
+                        (str(uuid.uuid4()), uname, generate_password_hash(raw_pw), role,
                          (row.get("full_name") or "").strip(),
-                         (row.get("email") or "").strip() or None,
                          board_id, force_reset)
                     )
                     created += 1
@@ -2909,14 +2902,14 @@ def bulk_users():
         return redirect(url_for("bulk_users"))
 
     # Build CSV template download
-    template_csv = "username,full_name,email,role,board_name,password\njohn_doe,John Doe,john@org.com,program_officer,NABH,changeme123\n"
+    template_csv = "email,full_name,role,board_name,password\njohn@org.com,John Doe,program_officer,NABH,changeme123\n"
     content = f"""
 <div class="row g-4">
   <div class="col-lg-7">
     <div class="card">
       <div class="card-header"><i class="bi bi-upload" style="color:var(--accent)"></i> Bulk User Import</div>
       <div class="card-body p-4">
-        <p style="font-size:13px;color:#64748b">Upload a <strong>CSV or Excel (.xlsx)</strong> with columns: <code>username</code>, <code>full_name</code>, <code>email</code>, <code>role</code>, <code>board_name</code>, <code>password</code>.</p>
+        <p style="font-size:13px;color:#64748b">Upload a <strong>CSV or Excel (.xlsx)</strong> with columns: <code>email</code>, <code>full_name</code>, <code>role</code>, <code>board_name</code>, <code>password</code>.</p>
         <form method="post" enctype="multipart/form-data">
           <div class="upload-zone mb-3" onclick="document.getElementById('userCsvFile').click()">
             <i class="bi bi-file-earmark-person" style="font-size:32px;color:#94a3b8"></i>
@@ -2941,7 +2934,7 @@ def bulk_users():
         <strong>Notes:</strong>
         <ul style="font-size:12px;color:#64748b">
           <li>If password is blank, a random password is set. Ask users to reset on first login.</li>
-          <li>Duplicate usernames will be skipped with an error.</li>
+          <li>Duplicate email addresses will be skipped with an error.</li>
           <li>Programme mappings for programme_head must be done separately via Remap.</li>
         </ul>
         <a href="data:text/csv;charset=utf-8,{template_csv}" download="user_import_template.csv"
@@ -2971,14 +2964,14 @@ def ceo_dashboard():
             "SELECT * FROM case_tracking WHERE board_id=? AND (status='Active' OR status IS NULL)", (bid,)
         ).fetchall()]
         programmes = [dict(r) for r in conn.execute(
-            "SELECT * FROM programmes WHERE board_id=? ORDER BY programme_name", (bid,)
+            "SELECT * FROM programs WHERE board_id=? ORDER BY programme_name", (bid,)
         ).fetchall()]
     else:
         cases = [dict(r) for r in conn.execute(
             "SELECT * FROM case_tracking WHERE (status='Active' OR status IS NULL)"
         ).fetchall()]
         programmes = [dict(r) for r in conn.execute(
-            "SELECT p.*, b.board_name FROM programmes p JOIN boards b ON b.id=p.board_id ORDER BY b.board_name, p.programme_name"
+            "SELECT p.*, b.name AS board_name FROM programs p JOIN boards b ON b.id=p.board_id ORDER BY b.name, p.programme_name"
         ).fetchall()]
     try:
         _ceo_db_hols = {datetime.strptime(r[0][:10], "%Y-%m-%d").date()
@@ -3202,13 +3195,13 @@ def dashboard():
     ph_progs = user_programme_names()  # None unless program_head
     if bid is not None:
         programmes = [r[0] for r in conn.execute(
-            "SELECT programme_name FROM programmes WHERE board_id=? ORDER BY programme_name", (bid,)
+            "SELECT programme_name FROM programs WHERE board_id=? ORDER BY programme_name", (bid,)
         ).fetchall()]
         base_q = "SELECT * FROM case_tracking WHERE board_id=?"
         base_params = [bid]
     else:
         programmes = [r[0] for r in conn.execute(
-            "SELECT programme_name FROM programmes ORDER BY programme_name"
+            "SELECT programme_name FROM programs ORDER BY programme_name"
         ).fetchall()]
         base_q = "SELECT * FROM case_tracking WHERE 1=1"
         base_params = []
@@ -3928,11 +3921,11 @@ def log_stage():
     bid = user_board_id()
     if bid is not None:
         programmes = [r[0] for r in conn.execute(
-            "SELECT programme_name FROM programmes WHERE board_id=? ORDER BY programme_name", (bid,)
+            "SELECT programme_name FROM programs WHERE board_id=? ORDER BY programme_name", (bid,)
         ).fetchall()]
     else:
         programmes = [r[0] for r in conn.execute(
-            "SELECT programme_name FROM programmes ORDER BY programme_name"
+            "SELECT programme_name FROM programs ORDER BY programme_name"
         ).fetchall()]
     conn.close()
 
@@ -3948,7 +3941,7 @@ def log_stage():
             "program_officer_email": request.form["program_officer_email"].strip(),
         }
         try:
-            data["_changed_by"] = session.get("full_name") or session.get("username", "")
+            data["_changed_by"] = session.get("full_name") or session.get("email", "")
             action = upsert_case(data)
             flash(f"Case {data['application_id']} {action} successfully.", "success")
             return redirect(url_for("log_stage"))
@@ -4114,7 +4107,7 @@ def api_stages():
     # Verify programme belongs to user's board (unless super_admin)
     if bid is not None:
         allowed = conn.execute(
-            "SELECT id FROM programmes WHERE programme_name=? AND board_id=?", (programme, bid)
+            "SELECT id FROM programs WHERE programme_name=? AND board_id=?", (programme, bid)
         ).fetchone()
         if not allowed:
             conn.close()
@@ -4230,7 +4223,7 @@ def bulk_upload():
                     "action_owner_email": row.get("Action_Owner_Email", "").strip(),
                     "program_officer_email": row.get("Program_Officer_Email", "").strip(),
                     "cc_emails":          row.get("CC_Emails", "").strip(),
-                    "_changed_by":        session.get("full_name") or session.get("username", ""),
+                    "_changed_by":        session.get("full_name") or session.get("email", ""),
                 }
                 if not data["application_id"]:
                     raise ValueError("Application_ID is empty")
@@ -4262,7 +4255,7 @@ def bulk_upload():
 
         log_audit("bulk_upload", None,
                   f"Uploaded: {created} created, {updated} updated, {failed} failed",
-                  session.get("full_name") or session.get("username", ""), user_board_id())
+                  session.get("full_name") or session.get("email", ""), user_board_id())
 
         if errors:
             session['_upload_errors'] = errors[:200]
@@ -4477,11 +4470,11 @@ def edit_case(case_id):
         return redirect(url_for("dashboard"))
     if bid is not None:
         programmes = [r[0] for r in conn.execute(
-            "SELECT programme_name FROM programmes WHERE board_id=? ORDER BY programme_name", (bid,)
+            "SELECT programme_name FROM programs WHERE board_id=? ORDER BY programme_name", (bid,)
         ).fetchall()]
     else:
         programmes = [r[0] for r in conn.execute(
-            "SELECT programme_name FROM programmes ORDER BY programme_name"
+            "SELECT programme_name FROM programs ORDER BY programme_name"
         ).fetchall()]
     conn.close()
 
@@ -4500,7 +4493,7 @@ def edit_case(case_id):
             "suppress_until":     request.form.get("suppress_until", "").strip() or None,
         }
         try:
-            data["_changed_by"] = session.get("full_name") or session.get("username", "")
+            data["_changed_by"] = session.get("full_name") or session.get("email", "")
             upsert_case(data)
             # Update status separately (upsert_case doesn't manage status field)
             _sc = get_db()
@@ -4669,7 +4662,7 @@ def delete_case(case_id):
     flash(f"Case {row['application_id']} closed.", "success")
     conn.close()
     log_audit("case_closed", row["application_id"], "Case closed/removed",
-              session.get("full_name") or session.get("username", ""),
+              session.get("full_name") or session.get("email", ""),
               bid)
     return redirect(url_for("dashboard"))
 
@@ -4724,7 +4717,7 @@ def update_case_status():
 
     conn.commit()
     log_audit("status_change", app_id,
-              f"Status → {new_status}", session.get("full_name") or session.get("username", ""),
+              f"Status → {new_status}", session.get("full_name") or session.get("email", ""),
               case.get("board_id"))
     conn.close()
     flash(f"Case {app_id} status updated to {new_status}.", "success")
@@ -4779,7 +4772,7 @@ def settings():
                 bname = request.form.get("board_name", "").strip()
                 if bname:
                     try:
-                        conn.execute("INSERT INTO boards (board_name) VALUES (?)", (bname,))
+                        conn.execute("INSERT INTO boards (id, name, code) VALUES (?,?,?)", (str(uuid.uuid4()), bname, bname))
                         conn.commit()
                         flash(f"Board '{bname}' added.", "success")
                     except Exception as e:
@@ -4791,14 +4784,14 @@ def settings():
             if not pname or not board_id:
                 flash("Programme name and board are required.", "error")
             else:
-                board_id = int(board_id)
+                # board_id is TEXT (UUID) — no int() cast needed
                 if session.get("role") == "board_admin" and board_id != session.get("board_id"):
                     flash("Cannot add programme to another board.", "error")
                 else:
                     try:
                         conn.execute(
-                            "INSERT INTO programmes (programme_name, board_id) VALUES (?,?)",
-                            (pname, board_id)
+                            "INSERT INTO programs (id, programme_name, board_id) VALUES (?,?,?)",
+                            (str(uuid.uuid4()), pname, board_id)
                         )
                         conn.commit()
                         flash(f"Programme '{pname}' added.", "success")
@@ -4811,7 +4804,7 @@ def settings():
                 flash("Programme name missing.", "error")
             else:
                 ep_row = conn.execute(
-                    "SELECT board_id FROM programmes WHERE programme_name=?", (ep_name,)
+                    "SELECT board_id FROM programs WHERE programme_name=?", (ep_name,)
                 ).fetchone()
                 if not ep_row:
                     flash("Programme not found.", "error")
@@ -4820,17 +4813,20 @@ def settings():
                 else:
                     try:
                         conn.execute(
-                            """UPDATE programmes SET
-                               tat_days=?, reminder1_days=?, reminder2_days=?,
-                               overdue_days=?, notification_emails=?
-                               WHERE programme_name=?""",
+                            """INSERT INTO programme_notification_config
+                               (programme_name, tat_days, reminder1_days, reminder2_days, overdue_days, notification_emails)
+                               VALUES (?,?,?,?,?,?)
+                               ON CONFLICT (programme_name) DO UPDATE SET
+                               tat_days=EXCLUDED.tat_days, reminder1_days=EXCLUDED.reminder1_days,
+                               reminder2_days=EXCLUDED.reminder2_days, overdue_days=EXCLUDED.overdue_days,
+                               notification_emails=EXCLUDED.notification_emails""",
                             (
+                                ep_name,
                                 int(request.form.get("tat_days", 0) or 0),
                                 int(request.form.get("reminder1_days", 0) or 0),
                                 int(request.form.get("reminder2_days", 0) or 0),
                                 int(request.form.get("overdue_days", 0) or 0),
                                 request.form.get("notification_emails", "").strip() or None,
-                                ep_name,
                             )
                         )
                         conn.commit()
@@ -4846,7 +4842,7 @@ def settings():
             else:
                 # Determine board_id from programme
                 prog_row = conn.execute(
-                    "SELECT board_id FROM programmes WHERE programme_name=?", (pname,)
+                    "SELECT board_id FROM programs WHERE programme_name=?", (pname,)
                 ).fetchone()
                 prog_board_id = prog_row[0] if prog_row else None
                 if session.get("role") == "board_admin" and prog_board_id != session.get("board_id"):
@@ -4889,7 +4885,7 @@ def settings():
                 bid_del = request.form.get("board_id")
                 if bid_del:
                     prog_count = conn.execute(
-                        "SELECT COUNT(*) FROM programmes WHERE board_id=?", (bid_del,)
+                        "SELECT COUNT(*) FROM programs WHERE board_id=?", (bid_del,)
                     ).fetchone()[0]
                     if prog_count > 0:
                         flash(f"Cannot delete board — {prog_count} programme(s) still exist. Delete them first.", "error")
@@ -4910,7 +4906,7 @@ def settings():
                 flash("Programme name missing.", "error")
             else:
                 prog_row = conn.execute(
-                    "SELECT board_id FROM programmes WHERE programme_name=?", (pname_del,)
+                    "SELECT board_id FROM programs WHERE programme_name=?", (pname_del,)
                 ).fetchone()
                 if not prog_row:
                     flash("Programme not found.", "error")
@@ -4927,9 +4923,9 @@ def settings():
                         conn.execute("DELETE FROM email_templates WHERE programme_name=?", (pname_del,))
                         conn.execute(
                             "DELETE FROM user_programme_map WHERE programme_id IN "
-                            "(SELECT id FROM programmes WHERE programme_name=?)", (pname_del,)
+                            "(SELECT id FROM programs WHERE programme_name=?)", (pname_del,)
                         )
-                        conn.execute("DELETE FROM programmes WHERE programme_name=?", (pname_del,))
+                        conn.execute("DELETE FROM programs WHERE programme_name=?", (pname_del,))
                         conn.commit()
                         flash(f"Programme '{pname_del}' and all its stages deleted.", "success")
 
@@ -4940,7 +4936,7 @@ def settings():
                 flash("Programme or stage name missing.", "error")
             else:
                 prog_row = conn.execute(
-                    "SELECT board_id FROM programmes WHERE programme_name=?", (pname_del,)
+                    "SELECT board_id FROM programs WHERE programme_name=?", (pname_del,)
                 ).fetchone()
                 if session.get("role") == "board_admin" and prog_row and prog_row["board_id"] != session.get("board_id"):
                     flash("Cannot delete stages from another board's programme.", "error")
@@ -5017,7 +5013,7 @@ def settings():
                 flash("Source and destination cannot be the same programme.", "error")
             else:
                 dst_row = conn.execute(
-                    "SELECT id, board_id FROM programmes WHERE programme_name=?", (dst_prog,)
+                    "SELECT id, board_id FROM programs WHERE programme_name=?", (dst_prog,)
                 ).fetchone()
                 if not dst_row:
                     flash("Destination programme not found.", "error")
@@ -5079,10 +5075,10 @@ def settings():
                 flash("Source and destination cannot be the same programme.", "error")
             else:
                 src_row = conn.execute(
-                    "SELECT id, board_id FROM programmes WHERE programme_name=?", (src_prog,)
+                    "SELECT id, board_id FROM programs WHERE programme_name=?", (src_prog,)
                 ).fetchone()
                 dst_row2 = conn.execute(
-                    "SELECT id, board_id FROM programmes WHERE programme_name=?", (dst_prog,)
+                    "SELECT id, board_id FROM programs WHERE programme_name=?", (dst_prog,)
                 ).fetchone()
                 if not src_row or not dst_row2:
                     flash("Programme not found.", "error")
@@ -5164,16 +5160,21 @@ def settings():
             smtp_host = request.form.get("smtp_host", "smtp.gmail.com").strip()
             smtp_port = int(request.form.get("smtp_port", 587) or 587)
             enc_pw = encrypt_str(password) if password else None
-            # Write email settings to programmes table (works even before stages are added)
+            # Write email settings to programme_notification_config table
             if enc_pw:
                 conn.execute(
-                    "UPDATE programmes SET sender_email=?, sender_password=?, smtp_host=?, smtp_port=? WHERE programme_name=?",
-                    (email, enc_pw, smtp_host, smtp_port, prog),
+                    "INSERT INTO programme_notification_config (programme_name, sender_email, sender_password, smtp_host, smtp_port) "
+                    "VALUES (?,?,?,?,?) ON CONFLICT (programme_name) DO UPDATE SET "
+                    "sender_email=EXCLUDED.sender_email, sender_password=EXCLUDED.sender_password, "
+                    "smtp_host=EXCLUDED.smtp_host, smtp_port=EXCLUDED.smtp_port",
+                    (prog, email, enc_pw, smtp_host, smtp_port),
                 )
             else:
                 conn.execute(
-                    "UPDATE programmes SET sender_email=?, smtp_host=?, smtp_port=? WHERE programme_name=?",
-                    (email, smtp_host, smtp_port, prog),
+                    "INSERT INTO programme_notification_config (programme_name, sender_email, smtp_host, smtp_port) "
+                    "VALUES (?,?,?,?) ON CONFLICT (programme_name) DO UPDATE SET "
+                    "sender_email=EXCLUDED.sender_email, smtp_host=EXCLUDED.smtp_host, smtp_port=EXCLUDED.smtp_port",
+                    (prog, email, smtp_host, smtp_port),
                 )
             conn.commit()
             flash(f"Sender credentials updated for {prog}.", "success")
@@ -5212,7 +5213,7 @@ def settings():
     # Build Board → Programme → Stage hierarchy
     bid = user_board_id()
     all_boards = [dict(r) for r in conn.execute(
-        "SELECT * FROM boards ORDER BY board_name"
+        "SELECT * FROM boards ORDER BY name"
     ).fetchall()]
 
     # Filter boards visible to this user
@@ -5225,7 +5226,7 @@ def settings():
     board_programmes = {}
     for b in visible_boards:
         board_programmes[b["id"]] = [dict(r) for r in conn.execute(
-            "SELECT * FROM programmes WHERE board_id=? ORDER BY programme_name", (b["id"],)
+            "SELECT * FROM programs WHERE board_id=? ORDER BY programme_name", (b["id"],)
         ).fetchall()]
 
     # Load stages per programme
@@ -5471,7 +5472,7 @@ def settings():
         if session.get("role") == "super_admin":
             del_board_btn = f"""
     <form method="post" class="ms-2 flex-shrink-0"
-          onsubmit="return confirm('Delete board &quot;{b['board_name']}&quot;? All programmes must be deleted first.')">
+          onsubmit="return confirm('Delete board &quot;{b['name']}&quot;? All programmes must be deleted first.')">
       <input type="hidden" name="action" value="delete_board">
       <input type="hidden" name="board_id" value="{b['id']}">
       <button class="btn btn-sm btn-danger" style="font-size:11px;padding:4px 10px;white-space:nowrap">
@@ -5486,7 +5487,7 @@ def settings():
             style="background:transparent;color:#fff;font-weight:700;font-size:15px;border:none;box-shadow:none">
       <div class="d-flex align-items-center gap-3 w-100">
         <i class="bi bi-building" style="font-size:18px"></i>
-        <span>{b['board_name']}</span>
+        <span>{b['name']}</span>
         <span class="ms-auto" style="font-size:12px;opacity:.8">{prog_count} programme{"s" if prog_count != 1 else ""}</span>
       </div>
     </button>
@@ -5503,7 +5504,7 @@ def settings():
 
     # Board options for add_programme form
     board_opts = "".join(
-        f'<option value="{b["id"]}">{b["board_name"]}</option>'
+        f'<option value="{b["id"]}">{b["name"]}</option>'
         for b in visible_boards
     )
     # Programme options for add_stage form
@@ -6066,18 +6067,18 @@ def email_templates_page():
             (et_bid,)
         ).fetchall()]
         programmes = [r[0] for r in conn.execute(
-            "SELECT programme_name FROM programmes WHERE board_id=? ORDER BY programme_name",
+            "SELECT programme_name FROM programs WHERE board_id=? ORDER BY programme_name",
             (et_bid,)
         ).fetchall()]
         stage_overrides = [dict(r) for r in conn.execute(
             "SELECT seo.* FROM stage_email_override seo "
-            "JOIN programmes p ON seo.programme_name = p.programme_name "
+            "JOIN programs p ON seo.programme_name = p.programme_name "
             "WHERE p.board_id=? ORDER BY seo.programme_name, seo.stage_name",
             (et_bid,)
         ).fetchall()]
         stages_rows = conn.execute(
             "SELECT DISTINCT programme_name, stage_name, stage_order FROM programme_config "
-            "WHERE programme_name IN (SELECT programme_name FROM programmes WHERE board_id=?) "
+            "WHERE programme_name IN (SELECT programme_name FROM programs WHERE board_id=?) "
             "ORDER BY programme_name, stage_order",
             (et_bid,)
         ).fetchall()
@@ -6365,11 +6366,11 @@ def audit_log_page():
     bid = user_board_id()
     if bid is not None:
         rows = conn.execute(
-            "SELECT * FROM audit_log WHERE board_id=? OR board_id IS NULL ORDER BY id DESC LIMIT 500",
+            "SELECT * FROM notification_audit_log WHERE board_id=? OR board_id IS NULL ORDER BY id DESC LIMIT 500",
             (bid,)
         ).fetchall()
     else:
-        rows = conn.execute("SELECT * FROM audit_log ORDER BY id DESC LIMIT 500").fetchall()
+        rows = conn.execute("SELECT * FROM notification_audit_log ORDER BY id DESC LIMIT 500").fetchall()
     conn.close()
 
     EVENT_ICONS = {
@@ -6435,7 +6436,7 @@ def case_history(app_id):
         "SELECT * FROM stage_history WHERE application_id=? ORDER BY id ASC", (app_id,)
     ).fetchall()]
     audits = [dict(r) for r in conn.execute(
-        "SELECT * FROM audit_log WHERE application_id=? ORDER BY id ASC", (app_id,)
+        "SELECT * FROM notification_audit_log WHERE application_id=? ORDER BY id ASC", (app_id,)
     ).fetchall()]
     conn.close()
 
@@ -6510,7 +6511,7 @@ def email_preview():
     bid = user_board_id()
     if bid is not None:
         progs = [r[0] for r in conn.execute(
-            "SELECT programme_name FROM programmes WHERE board_id=? ORDER BY programme_name", (bid,)
+            "SELECT programme_name FROM programs WHERE board_id=? ORDER BY programme_name", (bid,)
         ).fetchall()]
     else:
         progs = [r[0] for r in conn.execute(
@@ -6570,7 +6571,7 @@ def email_preview():
             if test_email and programme:
                 cfg = conn.execute(
                     "SELECT sender_email, sender_password, smtp_host, smtp_port "
-                    "FROM programme_config WHERE programme_name=? AND sender_email IS NOT NULL LIMIT 1",
+                    "FROM programme_notification_config WHERE programme_name=? AND sender_email IS NOT NULL LIMIT 1",
                     (programme,)
                 ).fetchone()
                 if cfg and cfg["sender_email"]:
@@ -6665,7 +6666,7 @@ def bulk_advance():
         else:
             advanced = 0
             errors = []
-            user_name = session.get("full_name") or session.get("username", "")
+            user_name = session.get("full_name") or session.get("email", "")
             for cid in selected_ids:
                 case = conn.execute("SELECT * FROM case_tracking WHERE id=?", (cid,)).fetchone()
                 if not case:
@@ -6941,7 +6942,7 @@ def quick_advance_post():
     )
     conn.commit()
     conn.close()
-    user_name = session.get("full_name") or session.get("username", "")
+    user_name = session.get("full_name") or session.get("email", "")
     log_stage_transition(case["application_id"], old_stage, target_stage, user_name, case.get("board_id"))
     log_audit("stage_change", case["application_id"],
               f"Quick advance: {old_stage} → {target_stage}", user_name, case.get("board_id"))
@@ -7404,14 +7405,14 @@ def export_excel_page():
     ph_progs = user_programme_names()
     if bid is not None:
         programmes = [r[0] for r in conn.execute(
-            "SELECT DISTINCT programme_name FROM programmes WHERE board_id=? ORDER BY programme_name", (bid,)
+            "SELECT DISTINCT programme_name FROM programs WHERE board_id=? ORDER BY programme_name", (bid,)
         ).fetchall()]
         stages = [r[0] for r in conn.execute(
             "SELECT DISTINCT stage_name FROM programme_config WHERE board_id=? ORDER BY stage_name", (bid,)
         ).fetchall()]
     else:
         programmes = [r[0] for r in conn.execute(
-            "SELECT DISTINCT programme_name FROM programmes ORDER BY programme_name"
+            "SELECT DISTINCT programme_name FROM programs ORDER BY programme_name"
         ).fetchall()]
         stages = [r[0] for r in conn.execute(
             "SELECT DISTINCT stage_name FROM programme_config ORDER BY stage_name"
@@ -7590,14 +7591,14 @@ def export_excel():
             "SELECT * FROM stage_history WHERE board_id=? ORDER BY timestamp DESC LIMIT 2000", (bid,)
         ).fetchall()]
         audit = [dict(r) for r in conn.execute(
-            "SELECT * FROM audit_log WHERE board_id=? ORDER BY id DESC LIMIT 2000", (bid,)
+            "SELECT * FROM notification_audit_log WHERE board_id=? ORDER BY id DESC LIMIT 2000", (bid,)
         ).fetchall()]
     else:
         history = [dict(r) for r in conn.execute(
             "SELECT * FROM stage_history ORDER BY timestamp DESC LIMIT 2000"
         ).fetchall()]
         audit = [dict(r) for r in conn.execute(
-            "SELECT * FROM audit_log ORDER BY id DESC LIMIT 2000"
+            "SELECT * FROM notification_audit_log ORDER BY id DESC LIMIT 2000"
         ).fetchall()]
     try:
         _excl_db_hols = {datetime.strptime(r[0][:10], "%Y-%m-%d").date()
@@ -7828,10 +7829,10 @@ def system_settings():
                 conn.commit()
                 user = conn.execute("SELECT * FROM users WHERE id=?", (uid,)).fetchone()
                 conn.close()
-                uri = totp_provisioning_uri(secret, user["username"])
+                uri = totp_provisioning_uri(secret, user["email"])
                 import urllib.parse
                 qr_url = f"https://api.qrserver.com/v1/create-qr-code/?size=180x180&data={urllib.parse.quote(uri)}"
-                flash(f"2FA enabled for {user['username']}. Secret: {secret}", "success")
+                flash(f"2FA enabled for {user['email']}. Secret: {secret}", "success")
             else:
                 conn.execute("UPDATE users SET totp_secret=NULL WHERE id=?", (uid,))
                 conn.commit()
@@ -7911,11 +7912,11 @@ def system_settings():
     ph_escalation_days = get_app_setting("ph_escalation_days", "5")
 
     conn = get_db()
-    users = [dict(r) for r in conn.execute("SELECT id, username, totp_secret, force_password_reset FROM users ORDER BY username").fetchall()]
+    users = [dict(r) for r in conn.execute("SELECT id, email, totp_secret, force_password_reset FROM users ORDER BY email").fetchall()]
     holidays_list = [dict(r) for r in conn.execute("SELECT * FROM holidays ORDER BY holiday_date").fetchall()]
-    boards_list = [dict(r) for r in conn.execute("SELECT id, board_name FROM boards ORDER BY board_name").fetchall()]
+    boards_list = [dict(r) for r in conn.execute("SELECT id, name FROM boards ORDER BY name").fetchall()]
     esc_rules = [dict(r) for r in conn.execute(
-        "SELECT em.*, b.board_name FROM escalation_matrix em "
+        "SELECT em.*, b.name AS board_name FROM escalation_matrix em "
         "LEFT JOIN boards b ON em.board_id = b.id ORDER BY em.board_id, em.days_overdue_min"
     ).fetchall()]
     conn.close()
@@ -7925,7 +7926,7 @@ def system_settings():
         has_2fa = bool(u["totp_secret"])
         needs_reset = bool(u["force_password_reset"])
         user_rows += f"""<tr>
-  <td style="font-weight:600">{u['username']}</td>
+  <td style="font-weight:600">{u['email']}</td>
   <td><span class="pill {'pill-ok' if has_2fa else 'pill-muted'}">{('Enabled' if has_2fa else 'Off')}</span></td>
   <td>{'<span class="pill pill-warn">Required</span>' if needs_reset else '<span style="color:#94a3b8;font-size:12px">—</span>'}</td>
   <td style="white-space:nowrap">
@@ -7980,7 +7981,7 @@ def system_settings():
         esc_rows_html = '<tr><td colspan="4" style="text-align:center;color:#94a3b8;padding:16px;font-size:13px">No rules configured</td></tr>'
 
     board_opts_esc = '<option value="">All Boards</option>' + "".join(
-        f'<option value="{b["id"]}">{b["board_name"]}</option>' for b in boards_list)
+        f'<option value="{b["id"]}">{b["name"]}</option>' for b in boards_list)
 
     content = f"""
 <div class="row g-4">
@@ -8310,11 +8311,11 @@ def export_report():
 
     if bid is not None:
         programmes = [r[0] for r in conn.execute(
-            "SELECT programme_name FROM programmes WHERE board_id=? ORDER BY programme_name", (bid,)
+            "SELECT programme_name FROM programs WHERE board_id=? ORDER BY programme_name", (bid,)
         ).fetchall()]
     else:
         programmes = [r[0] for r in conn.execute(
-            "SELECT programme_name FROM programmes ORDER BY programme_name"
+            "SELECT programme_name FROM programs ORDER BY programme_name"
         ).fetchall()]
     if ph_progs is not None:
         programmes = [p for p in programmes if p in ph_progs]
@@ -8489,7 +8490,7 @@ def api_advance_case():
     if api_key.get("board_id"):
         _conn = get_db()
         _prog_row = _conn.execute(
-            "SELECT id FROM programmes WHERE programme_name=? AND board_id=?",
+            "SELECT id FROM programs WHERE programme_name=? AND board_id=?",
             (data["programme_name"].strip(), api_key["board_id"])
         ).fetchone()
         _conn.close()
@@ -8594,14 +8595,14 @@ def manage_api_keys():
     keys = [dict(r) for r in conn.execute(
         "SELECT id, name, key_prefix, board_id, created_at, last_used, is_active FROM api_keys ORDER BY id DESC"
     ).fetchall()]
-    boards = [dict(r) for r in conn.execute("SELECT id, board_name FROM boards ORDER BY board_name").fetchall()]
+    boards = [dict(r) for r in conn.execute("SELECT id, name FROM boards ORDER BY name").fetchall()]
     conn.close()
 
     # One-time display of newly created key — popped from session so it only shows once
     new_key       = session.pop('_new_api_key', None)
     new_key_name  = session.pop('_new_api_key_name', 'New Key')
 
-    board_opts = "".join(f'<option value="{b["id"]}">{b["board_name"]}</option>' for b in boards)
+    board_opts = "".join(f'<option value="{b["id"]}">{b["name"]}</option>' for b in boards)
     key_rows = ""
     for k in keys:
         status_badge = '<span class="badge bg-success">Active</span>' if k["is_active"] else '<span class="badge bg-secondary">Revoked</span>'
@@ -8755,7 +8756,7 @@ def healthz():
     try:
         conn = get_db()
         user_count = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
-        admin_exists = conn.execute("SELECT 1 FROM users WHERE username='admin'").fetchone() is not None
+        admin_exists = conn.execute("SELECT 1 FROM users WHERE email='admin@qci.local'").fetchone() is not None
         conn.close()
         return jsonify({
             "status": "ok",

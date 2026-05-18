@@ -53,8 +53,8 @@ class _Cursor:
 
 _PG_TO_SQLITE = [
     (re.compile(r"SERIAL\s+PRIMARY\s+KEY", re.I), "INTEGER PRIMARY KEY AUTOINCREMENT"),
-    (re.compile(r"ON\s+CONFLICT\s*\([^)]+\)\s+DO\s+NOTHING", re.I), ""),
-    (re.compile(r"ON\s+CONFLICT\s*\([^)]+\)\s+DO\s+UPDATE\s+SET\s+[^;]+", re.I), ""),
+    # Note: SQLite 3.24+ natively supports ON CONFLICT ... DO NOTHING / DO UPDATE SET
+    # so we do NOT strip those clauses — removing them breaks upsert semantics in tests.
     (re.compile(r"REFERENCES\s+\w+\(\w+\)(\s+ON\s+DELETE\s+CASCADE)?", re.I), ""),
     (re.compile(r"NULLS\s+(FIRST|LAST)", re.I), ""),
     (re.compile(r"ADD\s+COLUMN\s+IF\s+NOT\s+EXISTS", re.I), "ADD COLUMN"),
@@ -176,8 +176,8 @@ def client(flask_app):
 def auth_client(client):
     """Super admin session."""
     with client.session_transaction() as s:
-        s["user_id"] = 1
-        s["username"] = "admin"
+        s["user_id"] = "admin_test_uuid"
+        s["email"] = "admin@qci.local"
         s["role"] = "super_admin"
         s["full_name"] = "Test Admin"
         s["board_id"] = None
@@ -188,13 +188,13 @@ def auth_client(client):
 
 @pytest.fixture
 def board_admin_client(client):
-    """Board admin session (NABH, board_id=1)."""
+    """Board admin session (NABH)."""
     with client.session_transaction() as s:
-        s["user_id"] = 3
-        s["username"] = "ba_user"
+        s["user_id"] = "ba_test_uuid"
+        s["email"] = "boardadmin@qci.local"
         s["role"] = "board_admin"
         s["full_name"] = "Board Admin"
-        s["board_id"] = 1
+        s["board_id"] = "nabh_test_uuid"
         s["board_name"] = "NABH"
         s["csrf_token"] = "test-csrf"
     yield client
@@ -202,13 +202,13 @@ def board_admin_client(client):
 
 @pytest.fixture
 def officer_client(client):
-    """Program officer session (NABH, board_id=1)."""
+    """Program officer session (NABH)."""
     with client.session_transaction() as s:
-        s["user_id"] = 2
-        s["username"] = "officer"
+        s["user_id"] = "officer_test_uuid"
+        s["email"] = "officer@qci.local"
         s["role"] = "program_officer"
         s["full_name"] = "Test Officer"
-        s["board_id"] = 1
+        s["board_id"] = "nabh_test_uuid"
         s["board_name"] = "NABH"
         s["csrf_token"] = "test-csrf"
     yield client
