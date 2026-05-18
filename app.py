@@ -670,16 +670,16 @@ def init_db():
     conn = get_db()
     conn.executescript("""
         CREATE TABLE IF NOT EXISTS boards (
-            id    TEXT PRIMARY KEY,
+            id    VARCHAR(36) PRIMARY KEY,
             name  TEXT NOT NULL UNIQUE,
             code  TEXT UNIQUE
         );
         CREATE TABLE IF NOT EXISTS programs (
-            id               TEXT PRIMARY KEY,
+            id               VARCHAR(36) PRIMARY KEY,
             programme_name   TEXT NOT NULL UNIQUE,
-            board_id         TEXT REFERENCES boards(id),
+            board_id         VARCHAR(36) REFERENCES boards(id),
             code             TEXT,
-            service_line_id  TEXT
+            service_line_id  VARCHAR(36)
         );
         CREATE TABLE IF NOT EXISTS programme_notification_config (
             id                   SERIAL PRIMARY KEY,
@@ -712,12 +712,12 @@ def init_db():
             smtp_port            INTEGER NOT NULL DEFAULT 587
         );
         CREATE TABLE IF NOT EXISTS users (
-            id            TEXT PRIMARY KEY,
+            id            VARCHAR(36) PRIMARY KEY,
             email         TEXT NOT NULL UNIQUE,
             full_name     TEXT NOT NULL,
             password_hash TEXT NOT NULL,
             role          TEXT NOT NULL DEFAULT 'program_officer',
-            board_id      TEXT REFERENCES boards(id)
+            board_id      VARCHAR(36) REFERENCES boards(id)
         );
         CREATE TABLE IF NOT EXISTS case_tracking (
             id                   SERIAL PRIMARY KEY,
@@ -761,7 +761,7 @@ def init_db():
             event_type      TEXT NOT NULL,
             detail          TEXT,
             user_name       TEXT,
-            board_id        TEXT
+            board_id        VARCHAR(36)
         );
         CREATE TABLE IF NOT EXISTS stage_history (
             id              SERIAL PRIMARY KEY,
@@ -770,7 +770,7 @@ def init_db():
             from_stage      TEXT,
             to_stage        TEXT NOT NULL,
             changed_by      TEXT,
-            board_id        TEXT
+            board_id        VARCHAR(36)
         );
         CREATE TABLE IF NOT EXISTS email_queue (
             id              SERIAL PRIMARY KEY,
@@ -790,7 +790,7 @@ def init_db():
             attempts        INTEGER NOT NULL DEFAULT 0,
             last_attempt    TEXT,
             error_msg       TEXT,
-            board_id        TEXT
+            board_id        VARCHAR(36)
         );
         CREATE TABLE IF NOT EXISTS scheduler_locks (
             lock_name       TEXT PRIMARY KEY,
@@ -801,18 +801,18 @@ def init_db():
             id           SERIAL PRIMARY KEY,
             holiday_date TEXT NOT NULL,
             name         TEXT NOT NULL,
-            board_id     TEXT REFERENCES boards(id),
+            board_id     VARCHAR(36) REFERENCES boards(id),
             UNIQUE(holiday_date, board_id)
         );
         CREATE TABLE IF NOT EXISTS user_programme_map (
             id           SERIAL PRIMARY KEY,
-            user_id      TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-            programme_id TEXT NOT NULL REFERENCES programs(id) ON DELETE CASCADE,
+            user_id      VARCHAR(36) NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            programme_id VARCHAR(36) NOT NULL REFERENCES programs(id) ON DELETE CASCADE,
             UNIQUE(user_id, programme_id)
         );
         CREATE TABLE IF NOT EXISTS saved_filters (
             id          SERIAL PRIMARY KEY,
-            user_id     TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            user_id     VARCHAR(36) NOT NULL REFERENCES users(id) ON DELETE CASCADE,
             filter_name TEXT NOT NULL,
             filter_json TEXT NOT NULL,
             created_at  TEXT NOT NULL,
@@ -832,14 +832,14 @@ def init_db():
             key_hash   TEXT NOT NULL UNIQUE,
             key_prefix TEXT,
             name       TEXT NOT NULL,
-            board_id   TEXT REFERENCES boards(id),
+            board_id   VARCHAR(36) REFERENCES boards(id),
             created_at TEXT NOT NULL,
             last_used  TEXT,
             is_active  INTEGER NOT NULL DEFAULT 1
         );
         CREATE TABLE IF NOT EXISTS escalation_matrix (
             id               SERIAL PRIMARY KEY,
-            board_id         TEXT REFERENCES boards(id),
+            board_id         VARCHAR(36) REFERENCES boards(id),
             days_overdue_min INTEGER NOT NULL DEFAULT 1,
             days_overdue_max INTEGER,
             notify_role      TEXT NOT NULL DEFAULT 'program_head',
@@ -854,23 +854,23 @@ def init_db():
             status     TEXT NOT NULL DEFAULT 'pending',
             sent_at    TEXT,
             error      TEXT,
-            board_id   TEXT REFERENCES boards(id)
+            board_id   VARCHAR(36) REFERENCES boards(id)
         );
     """)
     # Migrate existing DBs: add columns if absent (IF NOT EXISTS is safe to re-run)
     for sql in [
         "ALTER TABLE programme_config ADD COLUMN IF NOT EXISTS smtp_host TEXT NOT NULL DEFAULT 'smtp.gmail.com'",
         "ALTER TABLE programme_config ADD COLUMN IF NOT EXISTS smtp_port INTEGER NOT NULL DEFAULT 587",
-        "ALTER TABLE programme_config ADD COLUMN IF NOT EXISTS board_id TEXT",
+        "ALTER TABLE programme_config ADD COLUMN IF NOT EXISTS board_id VARCHAR(36)",
         "ALTER TABLE users ADD COLUMN IF NOT EXISTS force_password_reset INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE users ADD COLUMN IF NOT EXISTS totp_secret TEXT",
         "ALTER TABLE users ADD COLUMN IF NOT EXISTS last_login TEXT",
-        "ALTER TABLE case_tracking ADD COLUMN IF NOT EXISTS board_id TEXT",
+        "ALTER TABLE case_tracking ADD COLUMN IF NOT EXISTS board_id VARCHAR(36)",
         "ALTER TABLE case_tracking ADD COLUMN IF NOT EXISTS cc_emails TEXT",
         "ALTER TABLE case_tracking ADD COLUMN IF NOT EXISTS suppress_until TEXT",
         "ALTER TABLE case_tracking ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'Active'",
-        "ALTER TABLE email_templates ADD COLUMN IF NOT EXISTS board_id TEXT",
-        "ALTER TABLE holidays ADD COLUMN IF NOT EXISTS board_id TEXT",
+        "ALTER TABLE email_templates ADD COLUMN IF NOT EXISTS board_id VARCHAR(36)",
+        "ALTER TABLE holidays ADD COLUMN IF NOT EXISTS board_id VARCHAR(36)",
         "ALTER TABLE case_tracking ADD COLUMN IF NOT EXISTS hold_days INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE case_tracking ADD COLUMN IF NOT EXISTS hold_start_date TEXT",
         "ALTER TABLE notification_audit_log ADD COLUMN IF NOT EXISTS entry_hash TEXT",
