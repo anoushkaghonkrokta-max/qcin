@@ -1067,6 +1067,13 @@ _SEED_BOARDS = ["NABH", "NABL", "NABCB", "NABET"]
 def migrate_data():
     """One-time migration: seeds boards, backfills board_id, renames admin→super_admin."""
     conn = get_db()
+    # 0. Rename programs.name → programme_name if the old column name exists
+    try:
+        conn.execute("ALTER TABLE programs RENAME COLUMN name TO programme_name")
+        conn.commit()
+    except Exception:
+        conn.rollback()  # column already named programme_name — skip
+
     # 1. Seed boards
     for b in _SEED_BOARDS:
         try:
