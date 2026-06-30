@@ -15,8 +15,8 @@ __pycache__/
 *.pyd
 
 # Environment files
-.env
-.env.*
+# .env
+# .env.*
 
 # Claude project config (local only)
 .claude/
