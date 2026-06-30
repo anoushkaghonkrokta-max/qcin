@@ -1,6 +1,7 @@
 """
 QCI Notification Engine — single-file Flask application
 """
+
 import csv
 import hashlib
 import hmac
@@ -24,13 +25,21 @@ from datetime import date, datetime, timedelta
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from functools import wraps
-
+from dotenv import load_dotenv
+load_dotenv()
 from cryptography.fernet import Fernet
 from flask import (Flask, flash, jsonify, redirect, render_template_string,
                    request, url_for, Response, session)
 from markupsafe import escape as _xe
 from werkzeug.security import check_password_hash as _check_pw
 
+SMTP_HOST = os.getenv("SMTP_HOST")
+SMTP_PORT = int(os.getenv("SMTP_PORT", 587))
+
+SMTP_USERNAME = os.getenv("SMTP_USERNAME")
+SMTP_PASSWORD = os.getenv("SMTP_PASSWORD")
+
+FROM_EMAIL = os.getenv("FROM_EMAIL")
 
 def _smtp_ipv4_host(hostname, port):
     """Resolve hostname to first IPv4 address to avoid IPv6 routing failures on Railway.
@@ -56,27 +65,69 @@ class _SMTP_SSL_IPv4(smtplib.SMTP_SSL):
         return self.context.wrap_socket(sock, server_hostname=self._tls_hostname)
 
 
-def _send_via_sendgrid(api_key: str, from_email: str, to_emails: list,
-                       subject: str, body_text: str) -> None:
-    """Send email via SendGrid v3 Mail Send API (HTTPS, no extra dependencies)."""
-    payload = json.dumps({
-        "personalizations": [{"to": [{"email": e} for e in to_emails if e]}],
-        "from": {"email": from_email},
-        "subject": subject,
-        "content": [{"type": "text/plain", "value": body_text}],
-    }).encode()
-    req = urllib.request.Request(
-        "https://api.sendgrid.com/v3/mail/send",
-        data=payload,
-        headers={"Authorization": f"Bearer {api_key}",
-                 "Content-Type": "application/json"},
-        method="POST",
+# def _send_via_sendgrid(api_key: str, from_email: str, to_emails: list,
+#                        subject: str, body_text: str) -> None:
+#     """Send email via SendGrid v3 Mail Send API (HTTPS, no extra dependencies)."""
+#     payload = json.dumps({
+#         "personalizations": [{"to": [{"email": e} for e in to_emails if e]}],
+#         "from": {"email": from_email},
+#         "subject": subject,
+#         "content": [{"type": "text/plain", "value": body_text}],
+#     }).encode()
+#     req = urllib.request.Request(
+#         "https://api.sendgrid.com/v3/mail/send",
+#         data=payload,
+#         headers={"Authorization": f"Bearer {api_key}",
+#                  "Content-Type": "application/json"},
+#         method="POST",
+#     )
+#     with urllib.request.urlopen(req, timeout=30) as resp:
+#         if resp.status not in (200, 202):
+#             raise RuntimeError(f"SendGrid API returned HTTP {resp.status}")
+
+def _send_via_sendgrid(
+    api_key: str,
+    from_email: str,
+    to_emails: list,
+    subject: str,
+    body_text: str
+) -> None:
+
+    msg = MIMEMultipart()
+
+    msg["From"] = FROM_EMAIL
+    msg["To"] = ", ".join([e for e in to_emails if e])
+    msg["Subject"] = subject
+
+    msg.attach(
+        MIMEText(body_text, "plain")
     )
-    with urllib.request.urlopen(req, timeout=30) as resp:
-        if resp.status not in (200, 202):
-            raise RuntimeError(f"SendGrid API returned HTTP {resp.status}")
 
+    with smtplib.SMTP(
+        SMTP_HOST,
+        SMTP_PORT,
+        timeout=30
+    ) as server:
 
+        server.ehlo()
+
+        server.starttls(
+            context=ssl.create_default_context()
+        )
+
+        server.ehlo()
+
+        server.login(
+            SMTP_USERNAME,
+            SMTP_PASSWORD
+        )
+
+        server.sendmail(
+            FROM_EMAIL,
+            [e for e in to_emails if e],
+            msg.as_string()
+        )
+        
 def h(v):
     """HTML-escape a value for safe injection into f-string HTML."""
     if v is None:
@@ -1289,7 +1340,7 @@ def _get_template(programme: str, ntype: str):
 
 def send_notification(programme: str, ntype: str, to_email: str, cc_email: str,
                       sender_email: str, sender_password: str, ph: dict,
-                      smtp_host: str = "smtp.gmail.com", smtp_port: int = 587):
+                      smtp_host: str = "smtp.mx18.com", smtp_port: int = 587):
     tmpl = _get_template(programme, ntype)
     subject = _fill(tmpl["subject_line"] if tmpl else _DEFAULT_SUBJECTS[ntype], ph)
     body    = _fill(tmpl["email_body"]    if tmpl else _DEFAULT_BODIES[ntype],    ph)
